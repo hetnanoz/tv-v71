@@ -29,13 +29,13 @@ Private Const VALUE_RIGHT_PADDING As Double = 8#
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-13
-' Parameters:    targetPath As String, wksSource As Excel.Worksheet
+' Parameters:    targetPath As String, wksSource As Excel.Worksheet, logoPath As String
 ' Returns:       Boolean
 ' Description:   Generates a parser-friendly PDF 1.4 with exactly one transaction
 '                per page and 25 fixed KEY/VALUE rows. The existing report
 '                worksheet remains the single source of business-calculated data.
 '-------------------------------------------------------------------------------
-Public Function GenerateKeyValuePdfFromWorksheet( ByVal targetPath As String, ByVal wksSource As Excel.Worksheet) As Boolean
+Public Function GenerateKeyValuePdfFromWorksheet(ByVal targetPath As String, ByVal wksSource As Excel.Worksheet, ByVal logoPath As String) As Boolean
 
     Const METHOD_NAME As String = "GenerateKeyValuePdfFromWorksheet"
     Dim arrBottomRows() As Long
@@ -71,7 +71,7 @@ Public Function GenerateKeyValuePdfFromWorksheet( ByVal targetPath As String, By
         Err.Raise 1001, METHOD_NAME, "No transaction row pairs were found in the report worksheet."
     End If
 
-    If Not PrepareLogoImage(wksSource, strLogoHex, lngLogoWidth, lngLogoHeight, lngLogoComponents) Then
+    If Not PrepareLogoImageFromPath(logoPath, strLogoHex, lngLogoWidth, lngLogoHeight, lngLogoComponents) Then
         Err.Raise 1013, METHOD_NAME, "The report logo could not be prepared as a JPEG image."
     End If
 
@@ -127,7 +127,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     GenerateKeyValuePdfFromWorksheet = False
 
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "targetPath;tradeCount", targetPath, lngTradeCount
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "targetPath;logoPath;tradeCount", targetPath, logoPath, lngTradeCount
     errorManager.save
     Resume ExitFunction
 End Function
@@ -204,7 +204,7 @@ Private Function BuildSingleTransactionPageContent( ByVal wksSource As Excel.Wor
 
     BuildSingleTransactionPageContent = vbNullString
 
-    arrKeys = Array( "Depotnr.", "Fondsbezeichnung", "Geschaeftsart", "Schlusstag", "Valutatag", "WKN", "ISIN", "Wertpapierbezeichnung", "Nominale/Stuecke", "Whg (Nominale/Stuecke)", "Kurs", "Stueckzinsen", "Transaktionsnr.", "Maklergebuehren", "Whg (Maklergebuehren)", "Steuern", "Whg (Steuern)", "Abwicklungsprovision", "Whg (Abwicklungsprovision)", "Spesen", "Whg (Spesen)", "ausm. Betrag in Whg", "ausm. Betrag in Abrech. Whg", "Whg (Abrechnung)", "Devisenkurs")
+    arrKeys = Array( "Depotnr.", "Fondsbezeichnung", "Geschaeftsart", "Schlusstag", "Valutatag", "WKN", "ISIN", "Wertpapierbezeichnung", "Nominale/Stuecke", "Whg (Nominale/Stuecke)", "Kurs", "Stueckzinsen", "Transaktionsnr.", "Maklergebuehren", "Whg (Maklergebuehren)", "Steuern", "Whg (Steuern)", "Abwicklungsprovision", "Whg (Abwicklungsprovision)", "Spesen", "Whg (Spesen)", "ausm. Betrag in Whg", "ausm. Betrag in Abrech. Whg", "Whg", "Devisenkurs")
 
     arrColumns = Array( 1, 2, 5, 7, 9, 10, 11, 13, 16, 18, 19, 20, 1, 2, 4, 5, 8, 9, 12, 13, 15, 16, 19, 20, 21)
 
@@ -543,155 +543,73 @@ ErrorHandler:
     Resume ExitFunction
 End Function
 
-\n'-------------------------------------------------------------------------------
-' Exports the already inserted worksheet logo to JPEG and prepares it as a PDF
-' image XObject. The same image object is reused on every transaction page.
 '-------------------------------------------------------------------------------
-Private Function PrepareLogoImage(ByVal wksSource As Excel.Worksheet, ByRef strLogoHex As String, ByRef lngLogoWidth As Long, ByRef lngLogoHeight As Long, ByRef lngLogoComponents As Long) As Boolean
-    Const METHOD_NAME As String = "PrepareLogoImage"
+' Reads the configured JPG/JPEG logo directly from logoPath and prepares it as a
+' PDF image XObject. No worksheet copy/paste or temporary Chart export is used.
+' The same image object is reused on every transaction page.
+'-------------------------------------------------------------------------------
+Private Function PrepareLogoImageFromPath(ByVal logoPath As String, ByRef strLogoHex As String, ByRef lngLogoWidth As Long, ByRef lngLogoHeight As Long, ByRef lngLogoComponents As Long) As Boolean
+    Const METHOD_NAME As String = "PrepareLogoImageFromPath"
     Dim arrBytes() As Byte
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
-    Dim strTempPath As String
+    Dim lngDotPosition As Long
+    Dim strExtension As String
 
     On Error GoTo ErrorHandler
 
-    PrepareLogoImage = False
+    PrepareLogoImageFromPath = False
     strLogoHex = vbNullString
     lngLogoWidth = 0
     lngLogoHeight = 0
     lngLogoComponents = 0
 
-    If wksSource Is Nothing Then
-        Err.Raise 1001, METHOD_NAME, "The report worksheet is required to prepare the logo."
+    If Len(Trim$(logoPath)) = 0 Then
+        Err.Raise 1001, METHOD_NAME, "The logo path is empty. Check bnp_logo and bnp_logo_name on the Tradeversand worksheet."
     End If
 
-    strTempPath = Environ$("TEMP") & "\\Tradeversand_KeyValueLogo_" & Format$(Now, "yyyymmdd_hhnnss") & "_" & Format$(CLng(Timer * 100), "00000000") & ".jpg"
-
-    If Not ExportWorksheetLogoToJpeg(wksSource, strTempPath) Then
-        Err.Raise 1013, METHOD_NAME, "The worksheet logo could not be exported to JPEG."
+    If Len(Dir$(logoPath)) = 0 Then
+        Err.Raise 1010, METHOD_NAME, "The configured logo file does not exist: " & logoPath
     End If
 
-    arrBytes = ReadFileBytes(strTempPath)
+    lngDotPosition = InStrRev(logoPath, ".")
+    If lngDotPosition > 0 Then
+        strExtension = LCase$(Mid$(logoPath, lngDotPosition + 1))
+    Else
+        strExtension = vbNullString
+    End If
+
+    If strExtension <> "jpg" And strExtension <> "jpeg" Then
+        Err.Raise 1013, METHOD_NAME, "The key-value RAW PDF logo must be a JPG or JPEG file. Configured file: " & logoPath
+    End If
+
+    arrBytes = ReadFileBytes(logoPath)
 
     If Not GetJpegInformation(arrBytes, lngLogoWidth, lngLogoHeight, lngLogoComponents) Then
-        Err.Raise 1013, METHOD_NAME, "The prepared logo is not a supported JPEG image."
+        Err.Raise 1013, METHOD_NAME, "The configured logo is not a supported JPEG image: " & logoPath
     End If
 
     strLogoHex = BytesToAsciiHex(arrBytes)
 
     If Len(strLogoHex) <= 1 Then
-        Err.Raise 1013, METHOD_NAME, "The prepared logo contains no image data."
+        Err.Raise 1013, METHOD_NAME, "The configured logo contains no image data: " & logoPath
     End If
 
-    PrepareLogoImage = True
+    PrepareLogoImageFromPath = True
 
 ExitFunction:
-    If Len(strTempPath) > 0 Then
-        DeleteFileIfPresent strTempPath
-    End If
-    Set wksSource = Nothing
     Exit Function
 
 ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
-    PrepareLogoImage = False
+    PrepareLogoImageFromPath = False
 
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "tempPath", strTempPath
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "logoPath", logoPath
     errorManager.save
     Resume ExitFunction
 End Function
-
-'-------------------------------------------------------------------------------
-' Exports the first picture shape from wsOut to a temporary JPEG. processFundZeroTemplate
-' inserts the same Tradeversand logo into this worksheet before PDF generation.
-'-------------------------------------------------------------------------------
-Private Function ExportWorksheetLogoToJpeg(ByVal wksSource As Excel.Worksheet, ByVal targetJpegPath As String) As Boolean
-    Const METHOD_NAME As String = "ExportWorksheetLogoToJpeg"
-    Dim chartLogo As Excel.ChartObject
-    Dim errorManager As New ErrorManager
-    Dim errDescription As String
-    Dim errNumber As Long
-    Dim lngShape As Long
-    Dim shpLogo As Excel.Shape
-
-    On Error GoTo ErrorHandler
-
-    ExportWorksheetLogoToJpeg = False
-
-    If wksSource Is Nothing Then
-        Err.Raise 1001, METHOD_NAME, "The report worksheet is required."
-    End If
-
-    For lngShape = 1 To wksSource.Shapes.Count
-        If wksSource.Shapes(lngShape).Type = 13 Or wksSource.Shapes(lngShape).Type = 11 Then
-            Set shpLogo = wksSource.Shapes(lngShape)
-            Exit For
-        End If
-    Next lngShape
-
-    If shpLogo Is Nothing Then
-        Err.Raise 1013, METHOD_NAME, "No picture shape was found on the report worksheet."
-    End If
-
-    Set chartLogo = wksSource.ChartObjects.Add(Left:=shpLogo.Left, Top:=shpLogo.Top, Width:=shpLogo.Width, Height:=shpLogo.Height)
-    shpLogo.CopyPicture Appearance:=xlScreen, Format:=xlPicture
-    DoEvents
-    chartLogo.Chart.Paste
-    DoEvents
-    ExportWorksheetLogoToJpeg = chartLogo.Chart.Export(Filename:=targetJpegPath, FilterName:="JPG")
-
-    If Not ExportWorksheetLogoToJpeg Then
-        Err.Raise 1013, METHOD_NAME, "Excel could not export the worksheet logo to JPEG."
-    End If
-
-ExitFunction:
-    If Not chartLogo Is Nothing Then
-        DeleteChartObjectSafe chartLogo
-    End If
-    Set shpLogo = Nothing
-    Set chartLogo = Nothing
-    Set wksSource = Nothing
-    Exit Function
-
-ErrorHandler:
-    errNumber = VBA.Err.Number
-    errDescription = VBA.Err.Description
-    ExportWorksheetLogoToJpeg = False
-
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "targetJpegPath", targetJpegPath
-    errorManager.save
-    Resume ExitFunction
-End Function
-
-'-------------------------------------------------------------------------------
-' Deletes the temporary chart used for picture export without error suppression.
-'-------------------------------------------------------------------------------
-Private Sub DeleteChartObjectSafe(ByRef chartLogo As Excel.ChartObject)
-    Const METHOD_NAME As String = "DeleteChartObjectSafe"
-    Dim errorManager As New ErrorManager
-    Dim errDescription As String
-    Dim errNumber As Long
-
-    On Error GoTo ErrorHandler
-
-    If Not chartLogo Is Nothing Then
-        chartLogo.Delete
-    End If
-
-ExitSub:
-    Exit Sub
-
-ErrorHandler:
-    errNumber = VBA.Err.Number
-    errDescription = VBA.Err.Description
-
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
-    errorManager.save
-    Resume ExitSub
-End Sub
 
 '-------------------------------------------------------------------------------
 ' Reads a complete binary file into a byte array.
