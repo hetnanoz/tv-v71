@@ -1,3 +1,4 @@
+Attribute VB_Name = "modKeyValuePdfExport"
 Option Explicit
 
 Private Const CLASS_NAME As String = "modKeyValuePdfExport"
