@@ -1,4 +1,3 @@
-Attribute VB_Name = "modKeyValuePdfExport"
 Option Explicit
 
 Private Const CLASS_NAME As String = "modKeyValuePdfExport"
@@ -32,9 +31,7 @@ Private Const VALUE_RIGHT_PADDING As Double = 8#
 '                per page and 25 fixed KEY/VALUE rows. The existing report
 '                worksheet remains the single source of business-calculated data.
 '-------------------------------------------------------------------------------
-Public Function GenerateKeyValuePdfFromWorksheet( _
-    ByVal targetPath As String, _
-    ByVal wksSource As Excel.Worksheet) As Boolean
+Public Function GenerateKeyValuePdfFromWorksheet( ByVal targetPath As String, ByVal wksSource As Excel.Worksheet) As Boolean
 
     Const METHOD_NAME As String = "GenerateKeyValuePdfFromWorksheet"
     Dim arrBottomRows() As Long
@@ -66,12 +63,7 @@ Public Function GenerateKeyValuePdfFromWorksheet( _
         Err.Raise 1001, METHOD_NAME, "No transaction row pairs were found in the report worksheet."
     End If
 
-    If Not BuildAllPageContents( _
-        wksSource, _
-        arrTopRows, _
-        arrBottomRows, _
-        lngTradeCount, _
-        colPageContents) Then
+    If Not BuildAllPageContents( wksSource, arrTopRows, arrBottomRows, lngTradeCount, colPageContents) Then
 
         Err.Raise 1024, METHOD_NAME, "The key-value PDF page contents could not be built."
     End If
@@ -107,23 +99,15 @@ Public Function GenerateKeyValuePdfFromWorksheet( _
 
 ExitFunction:
     If blnFileOpened Then
-        On Error Resume Next
-        Close #lngFileNumber
-        On Error GoTo 0
+        CloseFileHandle lngFileNumber
     End If
 
     If Not GenerateKeyValuePdfFromWorksheet Then
-        On Error Resume Next
-        If Len(Dir$(targetPath)) > 0 Then Kill targetPath
-        On Error GoTo 0
+        DeleteFileIfPresent targetPath
     End If
 
     Set colPageContents = Nothing
     Set wksSource = Nothing
-
-    If errNumber <> 0 Then
-        On Error GoTo 0
-    End If
     Exit Function
 
 ErrorHandler:
@@ -131,14 +115,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     GenerateKeyValuePdfFromWorksheet = False
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "targetPath;tradeCount", _
-        targetPath, _
-        lngTradeCount
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "targetPath;tradeCount", targetPath, lngTradeCount
     errorManager.save
     Resume ExitFunction
 End Function
@@ -146,12 +123,7 @@ End Function
 '-------------------------------------------------------------------------------
 ' Builds one content stream per transaction. No page contains more than one trade.
 '-------------------------------------------------------------------------------
-Private Function BuildAllPageContents( _
-    ByVal wksSource As Excel.Worksheet, _
-    ByRef arrTopRows() As Long, _
-    ByRef arrBottomRows() As Long, _
-    ByVal lngTradeCount As Long, _
-    ByRef colPageContents As Collection) As Boolean
+Private Function BuildAllPageContents( ByVal wksSource As Excel.Worksheet, ByRef arrTopRows() As Long, ByRef arrBottomRows() As Long, ByVal lngTradeCount As Long, ByRef colPageContents As Collection) As Boolean
 
     Const METHOD_NAME As String = "BuildAllPageContents"
     Dim errorManager As New ErrorManager
@@ -170,14 +142,10 @@ Private Function BuildAllPageContents( _
     End If
 
     For lngTradeIndex = 1 To lngTradeCount
-        strPageContent = BuildSingleTransactionPageContent( _
-            wksSource, _
-            arrTopRows(lngTradeIndex), _
-            arrBottomRows(lngTradeIndex))
+        strPageContent = BuildSingleTransactionPageContent( wksSource, arrTopRows(lngTradeIndex), arrBottomRows(lngTradeIndex))
 
         If Len(strPageContent) = 0 Then
-            Err.Raise 1024, METHOD_NAME, _
-                "A key-value page content stream was empty for transaction " & CStr(lngTradeIndex) & "."
+            Err.Raise 1024, METHOD_NAME, "A key-value page content stream was empty for transaction " & CStr(lngTradeIndex) & "."
         End If
 
         colPageContents.Add strPageContent
@@ -193,14 +161,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     BuildAllPageContents = False
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "tradeCount;tradeIndex", _
-        lngTradeCount, _
-        lngTradeIndex
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "tradeCount;tradeIndex", lngTradeCount, lngTradeIndex
     errorManager.save
     Resume ExitFunction
 End Function
@@ -208,10 +169,7 @@ End Function
 '-------------------------------------------------------------------------------
 ' Builds a single fixed 25-row KEY/VALUE page. Lines are emitted once using m/l/S.
 '-------------------------------------------------------------------------------
-Private Function BuildSingleTransactionPageContent( _
-    ByVal wksSource As Excel.Worksheet, _
-    ByVal lngTopRow As Long, _
-    ByVal lngBottomRow As Long) As String
+Private Function BuildSingleTransactionPageContent( ByVal wksSource As Excel.Worksheet, ByVal lngTopRow As Long, ByVal lngBottomRow As Long) As String
 
     Const METHOD_NAME As String = "BuildSingleTransactionPageContent"
     Dim arrKeys As Variant
@@ -234,68 +192,28 @@ Private Function BuildSingleTransactionPageContent( _
 
     BuildSingleTransactionPageContent = vbNullString
 
-    arrKeys = Array( _
-        "Depotnr.", _
-        "Fondsbezeichnung", _
-        "Geschaeftsart", _
-        "Schlusstag", _
-        "Valutatag", _
-        "WKN", _
-        "ISIN", _
-        "Wertpapierbezeichnung", _
-        "Nominale/Stuecke", _
-        "Whg (Nominale/Stuecke)", _
-        "Kurs", _
-        "Stueckzinsen", _
-        "Transaktionsnr.", _
-        "Maklergebuehren", _
-        "Whg (Maklergebuehren)", _
-        "Steuern", _
-        "Whg (Steuern)", _
-        "Abwicklungsprovision", _
-        "Whg (Abwicklungsprovision)", _
-        "Spesen", _
-        "Whg (Spesen)", _
-        "ausm. Betrag in Whg", _
-        "ausm. Betrag in Abrech. Whg", _
-        "Whg (Abrechnung)", _
-        "Devisenkurs")
+    arrKeys = Array( "Depotnr.", "Fondsbezeichnung", "Geschaeftsart", "Schlusstag", "Valutatag", "WKN", "ISIN", "Wertpapierbezeichnung", "Nominale/Stuecke", "Whg (Nominale/Stuecke)", "Kurs", "Stueckzinsen", "Transaktionsnr.", "Maklergebuehren", "Whg (Maklergebuehren)", "Steuern", "Whg (Steuern)", "Abwicklungsprovision", "Whg (Abwicklungsprovision)", "Spesen", "Whg (Spesen)", "ausm. Betrag in Whg", "ausm. Betrag in Abrech. Whg", "Whg (Abrechnung)", "Devisenkurs")
 
-    arrColumns = Array( _
-        1, 2, 5, 7, 9, 10, 11, 13, 16, 18, 19, 20, _
-        1, 2, 4, 5, 8, 9, 12, 13, 15, 16, 19, 20, 21)
+    arrColumns = Array( 1, 2, 5, 7, 9, 10, 11, 13, 16, 18, 19, 20, 1, 2, 4, 5, 8, 9, 12, 13, 15, 16, 19, 20, 21)
 
-    arrRowOffsets = Array( _
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, _
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+    arrRowOffsets = Array( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
 
     If UBound(arrKeys) - LBound(arrKeys) + 1 <> ROW_COUNT Then
         Err.Raise 1024, METHOD_NAME, "The fixed KEY list does not contain exactly 25 rows."
     End If
 
-    strContent = "0 g" & vbCrLf & _
-                 "0 G" & vbCrLf & _
-                 PdfNumber(LINE_WIDTH) & " w" & vbCrLf
+    strContent = "0 g" & vbCrLf & "0 G" & vbCrLf & PdfNumber(LINE_WIDTH) & " w" & vbCrLf
 
     ' Horizontal boundaries: 26 lines for 25 rows.
     For lngIndex = 0 To ROW_COUNT
         dblCurrentY = TABLE_TOP_Y - (CDbl(lngIndex) * ROW_HEIGHT)
-        strContent = strContent & _
-            PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(dblCurrentY) & " m " & _
-            PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(dblCurrentY) & " l S" & vbCrLf
+        strContent = strContent & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(dblCurrentY) & " m " & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(dblCurrentY) & " l S" & vbCrLf
     Next lngIndex
 
     ' Three vertical rules. Each is drawn once, so there are no overlapping cell borders.
-    strContent = strContent & _
-        PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & _
-        PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf & _
-        PdfNumber(TABLE_DIVIDER_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & _
-        PdfNumber(TABLE_DIVIDER_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf & _
-        PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & _
-        PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf
+    strContent = strContent & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf & PdfNumber(TABLE_DIVIDER_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & PdfNumber(TABLE_DIVIDER_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf
 
-    dblValueAvailableWidth = TABLE_RIGHT_X - TABLE_DIVIDER_X - _
-                             TEXT_LEFT_PADDING - VALUE_RIGHT_PADDING
+    dblValueAvailableWidth = TABLE_RIGHT_X - TABLE_DIVIDER_X - TEXT_LEFT_PADDING - VALUE_RIGHT_PADDING
 
     For lngIndex = 0 To ROW_COUNT - 1
         strKey = CStr(arrKeys(lngIndex))
@@ -306,27 +224,15 @@ Private Function BuildSingleTransactionPageContent( _
             lngSourceRow = lngBottomRow
         End If
 
-        strValue = GetWorksheetDisplayText( _
-            wksSource.Cells(lngSourceRow, CLng(arrColumns(lngIndex))))
+        strValue = GetWorksheetDisplayText( wksSource.Cells(lngSourceRow, CLng(arrColumns(lngIndex))))
 
-        dblBaselineY = TABLE_TOP_Y - (CDbl(lngIndex + 1) * ROW_HEIGHT) + _
-                       TEXT_BASELINE_FROM_BOTTOM
+        dblBaselineY = TABLE_TOP_Y - (CDbl(lngIndex + 1) * ROW_HEIGHT) + TEXT_BASELINE_FROM_BOTTOM
 
-        strContent = strContent & BuildTextCommand( _
-            "/F0", _
-            KEY_FONT_SIZE, _
-            TABLE_LEFT_X + TEXT_LEFT_PADDING, _
-            dblBaselineY, _
-            strKey)
+        strContent = strContent & BuildTextCommand( "/F0", KEY_FONT_SIZE, TABLE_LEFT_X + TEXT_LEFT_PADDING, dblBaselineY, strKey)
 
         dblFontSize = ResolveValueFontSize(strValue, dblValueAvailableWidth)
 
-        strContent = strContent & BuildTextCommand( _
-            "/F1", _
-            dblFontSize, _
-            TABLE_DIVIDER_X + TEXT_LEFT_PADDING, _
-            dblBaselineY, _
-            strValue)
+        strContent = strContent & BuildTextCommand( "/F1", dblFontSize, TABLE_DIVIDER_X + TEXT_LEFT_PADDING, dblBaselineY, strValue)
     Next lngIndex
 
     BuildSingleTransactionPageContent = strContent
@@ -339,15 +245,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     BuildSingleTransactionPageContent = vbNullString
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "topRow;bottomRow;keyIndex", _
-        lngTopRow, _
-        lngBottomRow, _
-        lngIndex
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "topRow;bottomRow;keyIndex", lngTopRow, lngBottomRow, lngIndex
     errorManager.save
     Resume ExitFunction
 End Function
@@ -397,9 +295,7 @@ End Function
 ' Keeps VALUE on one physical text line. With the very wide value column this is
 ' normally 11 pt; long descriptions are reduced only as much as necessary.
 '-------------------------------------------------------------------------------
-Private Function ResolveValueFontSize( _
-    ByVal strText As String, _
-    ByVal dblAvailableWidth As Double) As Double
+Private Function ResolveValueFontSize( ByVal strText As String, ByVal dblAvailableWidth As Double) As Double
 
     Const METHOD_NAME As String = "ResolveValueFontSize"
     Dim dblEstimatedWidth As Double
@@ -433,14 +329,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     ResolveValueFontSize = VALUE_FONT_SIZE
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "textLength;availableWidth", _
-        Len(strText), _
-        dblAvailableWidth
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "textLength;availableWidth", Len(strText), dblAvailableWidth
     errorManager.save
     Resume ExitFunction
 End Function
@@ -448,12 +337,7 @@ End Function
 '-------------------------------------------------------------------------------
 ' One text show per KEY and one per VALUE. Hex text keeps the full PDF ASCII-only.
 '-------------------------------------------------------------------------------
-Private Function BuildTextCommand( _
-    ByVal strFont As String, _
-    ByVal dblFontSize As Double, _
-    ByVal dblX As Double, _
-    ByVal dblY As Double, _
-    ByVal strText As String) As String
+Private Function BuildTextCommand( ByVal strFont As String, ByVal dblFontSize As Double, ByVal dblX As Double, ByVal dblY As Double, ByVal strText As String) As String
 
     Const METHOD_NAME As String = "BuildTextCommand"
     Dim errorManager As New ErrorManager
@@ -462,10 +346,7 @@ Private Function BuildTextCommand( _
 
     On Error GoTo ErrorHandler
 
-    BuildTextCommand = _
-        "BT " & strFont & " " & PdfNumber(dblFontSize) & " Tf " & _
-        "1 0 0 1 " & PdfNumber(dblX) & " " & PdfNumber(dblY) & " Tm " & _
-        "<" & EncodePdfHex(strText) & "> Tj ET" & vbCrLf
+    BuildTextCommand = "BT " & strFont & " " & PdfNumber(dblFontSize) & " Tf " & "1 0 0 1 " & PdfNumber(dblX) & " " & PdfNumber(dblY) & " Tm " & "<" & EncodePdfHex(strText) & "> Tj ET" & vbCrLf
 
 ExitFunction:
     Exit Function
@@ -475,16 +356,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     BuildTextCommand = vbNullString
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "font;fontSize;x;y", _
-        strFont, _
-        dblFontSize, _
-        dblX, _
-        dblY
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "font;fontSize;x;y", strFont, dblFontSize, dblX, dblY
     errorManager.save
     Resume ExitFunction
 End Function
@@ -526,13 +398,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     EncodePdfHex = vbNullString
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "textLength", _
-        Len(strText)
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "textLength", Len(strText)
     errorManager.save
     Resume ExitFunction
 End Function
@@ -541,11 +407,7 @@ End Function
 ' Collects the same two-row transaction blocks already built by modTradeversand.
 ' Separator rows and the footer are ignored.
 '-------------------------------------------------------------------------------
-Private Function CollectTransactionRows( _
-    ByVal wksSource As Excel.Worksheet, _
-    ByRef arrTopRows() As Long, _
-    ByRef arrBottomRows() As Long, _
-    ByRef lngTradeCount As Long) As Boolean
+Private Function CollectTransactionRows( ByVal wksSource As Excel.Worksheet, ByRef arrTopRows() As Long, ByRef arrBottomRows() As Long, ByRef lngTradeCount As Long) As Boolean
 
     Const METHOD_NAME As String = "CollectTransactionRows"
     Dim errorManager As New ErrorManager
@@ -601,22 +463,12 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     CollectTransactionRows = False
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "lastRow;tradeCount", _
-        lngLastRow, _
-        lngTradeCount
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "lastRow;tradeCount", lngLastRow, lngTradeCount
     errorManager.save
     Resume ExitFunction
 End Function
 
-Private Function IsTransactionRowPair( _
-    ByVal wksSource As Excel.Worksheet, _
-    ByVal lngTopRow As Long, _
-    ByVal lngLastRow As Long) As Boolean
+Private Function IsTransactionRowPair( ByVal wksSource As Excel.Worksheet, ByVal lngTopRow As Long, ByVal lngLastRow As Long) As Boolean
 
     Const METHOD_NAME As String = "IsTransactionRowPair"
     Dim errorManager As New ErrorManager
@@ -644,14 +496,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     IsTransactionRowPair = False
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "topRow;lastRow", _
-        lngTopRow, _
-        lngLastRow
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "topRow;lastRow", lngTopRow, lngLastRow
     errorManager.save
     Resume ExitFunction
 End Function
@@ -667,14 +512,7 @@ Private Function GetLastUsedRow(ByVal wksSource As Excel.Worksheet) As Long
 
     GetLastUsedRow = 0
 
-    Set rngLast = wksSource.Cells.Find( _
-        What:="*", _
-        After:=wksSource.Cells(1, 1), _
-        LookIn:=xlFormulas, _
-        LookAt:=xlPart, _
-        SearchOrder:=xlByRows, _
-        SearchDirection:=xlPrevious, _
-        MatchCase:=False)
+    Set rngLast = wksSource.Cells.Find( What:="*", After:=wksSource.Cells(1, 1), LookIn:=xlFormulas, LookAt:=xlPart, SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False)
 
     If Not rngLast Is Nothing Then GetLastUsedRow = rngLast.Row
 
@@ -696,9 +534,7 @@ End Function
 ' Creates a classic PDF 1.4 object/xref structure. Every stream is ASCII only,
 ' so VBA Len() equals the byte offset used in the xref table.
 '-------------------------------------------------------------------------------
-Private Function BuildPdfDocument( _
-    ByVal colPageContents As Collection, _
-    ByRef strDocument As String) As Boolean
+Private Function BuildPdfDocument( ByVal colPageContents As Collection, ByRef strDocument As String) As Boolean
 
     Const METHOD_NAME As String = "BuildPdfDocument"
     Dim arrOffsets() As Long
@@ -738,38 +574,26 @@ Private Function BuildPdfDocument( _
         strKids = strKids & CStr(lngPageObject) & " 0 R "
     Next lngPage
 
-    strDocument = PDF_HEADER & vbCrLf & _
-                  "% Tradeversand key-value parser-safe PDF" & vbCrLf
+    strDocument = PDF_HEADER & vbCrLf & "% Tradeversand key-value parser-safe PDF" & vbCrLf
 
     lngObject = 1
     arrOffsets(lngObject) = Len(strDocument)
-    strObject = "1 0 obj" & vbCrLf & _
-                "<< /Type /Catalog /Pages 2 0 R >>" & vbCrLf & _
-                "endobj" & vbCrLf
+    strObject = "1 0 obj" & vbCrLf & "<< /Type /Catalog /Pages 2 0 R >>" & vbCrLf & "endobj" & vbCrLf
     strDocument = strDocument & strObject
 
     lngObject = 2
     arrOffsets(lngObject) = Len(strDocument)
-    strObject = "2 0 obj" & vbCrLf & _
-                "<< /Type /Pages /Count " & CStr(colPageContents.Count) & _
-                " /Kids [" & Trim$(strKids) & "] >>" & vbCrLf & _
-                "endobj" & vbCrLf
+    strObject = "2 0 obj" & vbCrLf & "<< /Type /Pages /Count " & CStr(colPageContents.Count) & " /Kids [" & Trim$(strKids) & "] >>" & vbCrLf & "endobj" & vbCrLf
     strDocument = strDocument & strObject
 
     lngObject = 3
     arrOffsets(lngObject) = Len(strDocument)
-    strObject = "3 0 obj" & vbCrLf & _
-                "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold " & _
-                "/Encoding /WinAnsiEncoding >>" & vbCrLf & _
-                "endobj" & vbCrLf
+    strObject = "3 0 obj" & vbCrLf & "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold " & "/Encoding /WinAnsiEncoding >>" & vbCrLf & "endobj" & vbCrLf
     strDocument = strDocument & strObject
 
     lngObject = 4
     arrOffsets(lngObject) = Len(strDocument)
-    strObject = "4 0 obj" & vbCrLf & _
-                "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman " & _
-                "/Encoding /WinAnsiEncoding >>" & vbCrLf & _
-                "endobj" & vbCrLf
+    strObject = "4 0 obj" & vbCrLf & "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman " & "/Encoding /WinAnsiEncoding >>" & vbCrLf & "endobj" & vbCrLf
     strDocument = strDocument & strObject
 
     For lngPage = 1 To colPageContents.Count
@@ -778,42 +602,22 @@ Private Function BuildPdfDocument( _
         strStream = CStr(colPageContents(lngPage))
 
         arrOffsets(lngPageObject) = Len(strDocument)
-        strObject = CStr(lngPageObject) & " 0 obj" & vbCrLf & _
-                    "<< /Type /Page /Parent 2 0 R " & _
-                    "/MediaBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & _
-                    "/CropBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & _
-                    "/Resources << /Font << /F0 3 0 R /F1 4 0 R >> >> " & _
-                    "/Contents " & CStr(lngContentObject) & " 0 R >>" & vbCrLf & _
-                    "endobj" & vbCrLf
+        strObject = CStr(lngPageObject) & " 0 obj" & vbCrLf & "<< /Type /Page /Parent 2 0 R " & "/MediaBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & "/CropBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & "/Resources << /Font << /F0 3 0 R /F1 4 0 R >> >> " & "/Contents " & CStr(lngContentObject) & " 0 R >>" & vbCrLf & "endobj" & vbCrLf
         strDocument = strDocument & strObject
 
         arrOffsets(lngContentObject) = Len(strDocument)
-        strObject = CStr(lngContentObject) & " 0 obj" & vbCrLf & _
-                    "<< /Length " & CStr(Len(strStream)) & " >>" & vbCrLf & _
-                    "stream" & vbCrLf & _
-                    strStream & _
-                    "endstream" & vbCrLf & _
-                    "endobj" & vbCrLf
+        strObject = CStr(lngContentObject) & " 0 obj" & vbCrLf & "<< /Length " & CStr(Len(strStream)) & " >>" & vbCrLf & "stream" & vbCrLf & strStream & "endstream" & vbCrLf & "endobj" & vbCrLf
         strDocument = strDocument & strObject
     Next lngPage
 
     lngStartXref = Len(strDocument)
-    strDocument = strDocument & _
-        "xref" & vbCrLf & _
-        "0 " & CStr(lngObjectCount + 1) & vbCrLf & _
-        "0000000000 65535 f " & vbCrLf
+    strDocument = strDocument & "xref" & vbCrLf & "0 " & CStr(lngObjectCount + 1) & vbCrLf & "0000000000 65535 f " & vbCrLf
 
     For lngObject = 1 To lngObjectCount
-        strDocument = strDocument & _
-            Format$(arrOffsets(lngObject), "0000000000") & " 00000 n " & vbCrLf
+        strDocument = strDocument & Format$(arrOffsets(lngObject), "0000000000") & " 00000 n " & vbCrLf
     Next lngObject
 
-    strDocument = strDocument & _
-        "trailer" & vbCrLf & _
-        "<< /Size " & CStr(lngObjectCount + 1) & " /Root 1 0 R >>" & vbCrLf & _
-        "startxref" & vbCrLf & _
-        CStr(lngStartXref) & vbCrLf & _
-        "%%EOF" & vbCrLf
+    strDocument = strDocument & "trailer" & vbCrLf & "<< /Size " & CStr(lngObjectCount + 1) & " /Root 1 0 R >>" & vbCrLf & "startxref" & vbCrLf & CStr(lngStartXref) & vbCrLf & "%%EOF" & vbCrLf
 
     BuildPdfDocument = True
 
@@ -826,14 +630,7 @@ ErrorHandler:
     BuildPdfDocument = False
     strDocument = vbNullString
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "pageCount;object", _
-        lngPageCount, _
-        lngObject
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "pageCount;object", lngPageCount, lngObject
     errorManager.save
     Resume ExitFunction
 End Function
@@ -880,13 +677,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     ValidateTargetPath = False
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "targetPath", _
-        targetPath
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "targetPath", targetPath
     errorManager.save
     Resume ExitFunction
 End Function
@@ -896,6 +687,7 @@ Private Function HasPdf14Header(ByVal targetPath As String) As Boolean
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
+    Dim blnFileOpened As Boolean
     Dim lngFileNumber As Long
     Dim strHeader As String
 
@@ -907,18 +699,17 @@ Private Function HasPdf14Header(ByVal targetPath As String) As Boolean
 
     lngFileNumber = FreeFile
     Open targetPath For Binary Access Read As #lngFileNumber
+    blnFileOpened = True
     strHeader = Space$(8)
     Get #lngFileNumber, 1, strHeader
     Close #lngFileNumber
-    lngFileNumber = 0
+    blnFileOpened = False
 
     HasPdf14Header = (Left$(strHeader, Len(PDF_HEADER)) = PDF_HEADER)
 
 ExitFunction:
-    If lngFileNumber <> 0 Then
-        On Error Resume Next
-        Close #lngFileNumber
-        On Error GoTo 0
+    If blnFileOpened Then
+        CloseFileHandle lngFileNumber
     End If
     Exit Function
 
@@ -927,13 +718,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     HasPdf14Header = False
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "targetPath", _
-        targetPath
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "targetPath", targetPath
     errorManager.save
     Resume ExitFunction
 End Function
@@ -967,13 +752,65 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     PdfNumber = "0"
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "value", _
-        dblValue
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "value", dblValue
     errorManager.save
     Resume ExitFunction
 End Function
+
+'-------------------------------------------------------------------------------
+' Description:   Closes a VBA file handle without using Resume Next suppression.
+'-------------------------------------------------------------------------------
+Private Sub CloseFileHandle(ByVal lngFileNumber As Long)
+    Const METHOD_NAME As String = "CloseFileHandle"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If lngFileNumber > 0 Then
+        Close #lngFileNumber
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "fileNumber", lngFileNumber
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Description:   Deletes a generated file when present, with standard BAT error
+'                handling and without suppressing runtime errors.
+'-------------------------------------------------------------------------------
+Private Sub DeleteFileIfPresent(ByVal targetPath As String)
+    Const METHOD_NAME As String = "DeleteFileIfPresent"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If Len(targetPath) = 0 Then GoTo ExitSub
+
+    If Len(Dir$(targetPath)) > 0 Then
+        Kill targetPath
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "targetPath", targetPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
