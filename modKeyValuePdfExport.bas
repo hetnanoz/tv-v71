@@ -25,6 +25,14 @@ Private Const LINE_WIDTH As Double = 0.6
 Private Const FIRST_DATA_ROW As Long = 7
 Private Const VALUE_WIDTH_FACTOR As Double = 0.55
 Private Const VALUE_RIGHT_PADDING As Double = 8#
+Private Const PAGE_NUMBER_FONT_SIZE As Double = 9#
+Private Const PAGE_NUMBER_Y As Double = 40#
+Private Const PAGE_NUMBER_RIGHT_X As Double = 1323.04
+Private Const PAGE_NUMBER_WIDTH_FACTOR As Double = 0.5
+Private Const FOOTER_X As Double = 40.52
+Private Const FOOTER_Y As Double = 40#
+Private Const FOOTER_FONT_SIZE As Double = 9#
+Private Const FOOTER_TEXT As String = "Diese Abrechnung wurde maschinell erstellt und ist ohne eigenhaendige Unterschrift gueltig"
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
@@ -154,7 +162,7 @@ Private Function BuildAllPageContents( ByVal wksSource As Excel.Worksheet, ByRef
     End If
 
     For lngTradeIndex = 1 To lngTradeCount
-        strPageContent = BuildSingleTransactionPageContent( wksSource, arrTopRows(lngTradeIndex), arrBottomRows(lngTradeIndex))
+        strPageContent = BuildSingleTransactionPageContent(wksSource, arrTopRows(lngTradeIndex), arrBottomRows(lngTradeIndex), lngTradeIndex, lngTradeCount)
 
         If Len(strPageContent) = 0 Then
             Err.Raise 1024, METHOD_NAME, "A key-value page content stream was empty for transaction " & CStr(lngTradeIndex) & "."
@@ -181,7 +189,7 @@ End Function
 '-------------------------------------------------------------------------------
 ' Builds a single fixed 25-row KEY/VALUE page. Lines are emitted once using m/l/S.
 '-------------------------------------------------------------------------------
-Private Function BuildSingleTransactionPageContent( ByVal wksSource As Excel.Worksheet, ByVal lngTopRow As Long, ByVal lngBottomRow As Long) As String
+Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Worksheet, ByVal lngTopRow As Long, ByVal lngBottomRow As Long, ByVal lngPageNumber As Long, ByVal lngPageCount As Long) As String
 
     Const METHOD_NAME As String = "BuildSingleTransactionPageContent"
     Dim arrKeys As Variant
@@ -196,7 +204,9 @@ Private Function BuildSingleTransactionPageContent( ByVal wksSource As Excel.Wor
     Dim errNumber As Long
     Dim lngIndex As Long
     Dim lngSourceRow As Long
+    Dim dblPageNumberX As Double
     Dim strContent As String
+    Dim strPageNumber As String
     Dim strKey As String
     Dim strValue As String
 
@@ -248,6 +258,14 @@ Private Function BuildSingleTransactionPageContent( ByVal wksSource As Excel.Wor
         strContent = strContent & BuildTextCommand( "/F1", dblFontSize, TABLE_DIVIDER_X + TEXT_LEFT_PADDING, dblBaselineY, strValue)
     Next lngIndex
 
+    If lngPageNumber = lngPageCount Then
+        strContent = strContent & BuildTextCommand("/F0", FOOTER_FONT_SIZE, FOOTER_X, FOOTER_Y, FOOTER_TEXT)
+    End If
+
+    strPageNumber = CStr(lngPageNumber) & "/" & CStr(lngPageCount)
+    dblPageNumberX = PAGE_NUMBER_RIGHT_X - (CDbl(Len(strPageNumber)) * PAGE_NUMBER_FONT_SIZE * PAGE_NUMBER_WIDTH_FACTOR)
+    strContent = strContent & BuildTextCommand("/F1", PAGE_NUMBER_FONT_SIZE, dblPageNumberX, PAGE_NUMBER_Y, strPageNumber)
+
     BuildSingleTransactionPageContent = strContent
 
 ExitFunction:
@@ -258,7 +276,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     BuildSingleTransactionPageContent = vbNullString
 
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "topRow;bottomRow;keyIndex", lngTopRow, lngBottomRow, lngIndex
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "topRow;bottomRow;pageNumber;pageCount;keyIndex", lngTopRow, lngBottomRow, lngPageNumber, lngPageCount, lngIndex
     errorManager.save
     Resume ExitFunction
 End Function
