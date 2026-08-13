@@ -1,0 +1,825 @@
+Option Explicit
+
+Private Const CLASS_NAME As String = "ErrorManager"
+Private Const ERROR_LOG_SHEET_NAME As String = "Error_Log"
+
+Private mConnection As Object
+Private mConnectionPassword As String
+Private mConnectionUrl As String
+Private mDetailsTable As String
+Private mErrors As Collection
+Private mFixedMessage As String
+Private mLogFolderPath As String
+Private mLogToDbMode As Boolean
+Private mLogToTextFileMode As Boolean
+Private mStackTable As String
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       ---
+' Description:   Initializes the internal error collection.
+'-------------------------------------------------------------------------------
+Private Sub Class_Initialize()
+    Const METHOD_NAME As String = "Class_Initialize"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Set mErrors = New Collection
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Debug.Print Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbTab & CLASS_NAME & vbTab & METHOD_NAME & vbTab & CStr(errNumber) & vbTab & errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    strPath As String
+' Returns:       ErrorManager
+' Description:   Stores the folder used when text-file logging is enabled.
+'-------------------------------------------------------------------------------
+Public Function setLogFolderPath(ByVal strPath As String) As ErrorManager
+    Const METHOD_NAME As String = "setLogFolderPath"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mLogFolderPath = Trim$(strPath)
+    Set setLogFolderPath = Me
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Set setLogFolderPath = Me
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    objConnection As Object
+' Returns:       ErrorManager
+' Description:   Stores an existing project-specific database connection.
+'-------------------------------------------------------------------------------
+Public Function setConnection(ByVal objConnection As Object) As ErrorManager
+    Const METHOD_NAME As String = "setConnection"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Set mConnection = objConnection
+    Set setConnection = Me
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Set setConnection = Me
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    strUrl As String, strPassword As String
+' Returns:       ErrorManager
+' Description:   Stores project-specific connection information without opening a connection.
+'-------------------------------------------------------------------------------
+Public Function setConnectionUrl(ByVal strUrl As String, ByVal strPassword As String) As ErrorManager
+    Const METHOD_NAME As String = "setConnectionUrl"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mConnectionUrl = strUrl
+    mConnectionPassword = strPassword
+    Set setConnectionUrl = Me
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Set setConnectionUrl = Me
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    strStackTable As String, strDetailsTable As String
+' Returns:       ErrorManager
+' Description:   Stores project-specific database table names.
+'-------------------------------------------------------------------------------
+Public Function setTableNames(ByVal strStackTable As String, ByVal strDetailsTable As String) As ErrorManager
+    Const METHOD_NAME As String = "setTableNames"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mStackTable = strStackTable
+    mDetailsTable = strDetailsTable
+    Set setTableNames = Me
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Set setTableNames = Me
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    blnEnabled As Boolean
+' Returns:       ErrorManager
+' Description:   Enables or disables project-specific database logging.
+'-------------------------------------------------------------------------------
+Public Function setLogToDbMode(ByVal blnEnabled As Boolean) As ErrorManager
+    Const METHOD_NAME As String = "setLogToDbMode"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mLogToDbMode = blnEnabled
+    Set setLogToDbMode = Me
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Set setLogToDbMode = Me
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    blnEnabled As Boolean
+' Returns:       ErrorManager
+' Description:   Enables or disables text-file logging.
+'-------------------------------------------------------------------------------
+Public Function setLogToTextFileMode(ByVal blnEnabled As Boolean) As ErrorManager
+    Const METHOD_NAME As String = "setLogToTextFileMode"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mLogToTextFileMode = blnEnabled
+    Set setLogToTextFileMode = Me
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Set setLogToTextFileMode = Me
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    strMessage As String
+' Returns:       ErrorManager
+' Description:   Stores the default user-facing error message.
+'-------------------------------------------------------------------------------
+Public Function setFixedMessage(ByVal strMessage As String) As ErrorManager
+    Const METHOD_NAME As String = "setFixedMessage"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mFixedMessage = strMessage
+    Set setFixedMessage = Me
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Set setFixedMessage = Me
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    strClassName As String, strMethodName As String, lngNumber As Long, strDescription As String, varContext As ParamArray
+' Returns:       Boolean
+' Description:   Adds an error and optional contextual values to the internal collection.
+'-------------------------------------------------------------------------------
+Public Function addError(ByVal strClassName As String, _
+                         ByVal strMethodName As String, _
+                         ByVal lngNumber As Long, _
+                         ByVal strDescription As String, _
+                         ParamArray varContext() As Variant) As Boolean
+    Const METHOD_NAME As String = "addError"
+    Dim blnHasContext As Boolean
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngContextUpper As Long
+    Dim strContext As String
+    Dim strEntry As String
+    Dim varContextCopy As Variant
+
+    On Error GoTo ErrorHandler
+
+    EnsureErrors
+    On Error Resume Next
+    lngContextUpper = UBound(varContext)
+    blnHasContext = (VBA.Err.Number = 0)
+    VBA.Err.Clear
+    On Error GoTo ErrorHandler
+    If blnHasContext Then
+        varContextCopy = varContext
+        strContext = BuildContextText(varContextCopy)
+    End If
+    strEntry = Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbTab & _
+               strClassName & vbTab & _
+               strMethodName & vbTab & _
+               CStr(lngNumber) & vbTab & _
+               ReplaceLineBreaks(strDescription) & _
+               strContext
+    mErrors.Add strEntry
+    addError = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    addError = False
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       ---
+' Description:   Writes stored errors to enabled destinations and clears the collection.
+'-------------------------------------------------------------------------------
+Public Sub save()
+    Const METHOD_NAME As String = "save"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    EnsureErrors
+    toImmediate
+    logToWorksheet
+    If mLogToTextFileMode Then
+        logToTextFile
+    End If
+    If mLogToDbMode Then
+        logToDatabase
+    End If
+    clear
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    strMessage As String, optional
+' Returns:       ---
+' Description:   Displays one user-facing message for an entry-point failure.
+'-------------------------------------------------------------------------------
+Public Sub display(Optional ByVal strMessage As String = vbNullString)
+    Const METHOD_NAME As String = "display"
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strEffectiveMessage As String
+
+    On Error GoTo ErrorHandler
+
+    strEffectiveMessage = strMessage
+    If Len(strEffectiveMessage) = 0 Then
+        strEffectiveMessage = mFixedMessage
+    End If
+    If Len(strEffectiveMessage) = 0 Then
+        strEffectiveMessage = "Operation failed. Please contact support."
+    End If
+    MsgBox strEffectiveMessage, vbCritical
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitSub
+End Sub
+
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Appends stored errors to a dedicated worksheet in this workbook.
+'-------------------------------------------------------------------------------
+Public Sub logToWorksheet()
+    Const METHOD_NAME As String = "logToWorksheet"
+    Dim arrEntry As Variant
+    Dim arrOutput(1 To 1, 1 To 6) As Variant
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngIndex As Long
+    Dim lngNextRow As Long
+    Dim lngPart As Long
+    Dim strContext As String
+    Dim wksLog As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    EnsureErrors
+    If mErrors.Count = 0 Then GoTo ExitSub
+
+    Set wksLog = GetOrCreateErrorLogWorksheet()
+    If wksLog Is Nothing Then GoTo ExitSub
+
+    For lngIndex = 1 To mErrors.Count
+        arrEntry = Split(CStr(mErrors(lngIndex)), vbTab)
+        strContext = vbNullString
+
+        If UBound(arrEntry) >= 5 Then
+            For lngPart = 5 To UBound(arrEntry)
+                If Len(strContext) > 0 Then
+                    strContext = strContext & " | "
+                End If
+                strContext = strContext & CStr(arrEntry(lngPart))
+            Next lngPart
+        End If
+
+        lngNextRow = wksLog.Cells(wksLog.Rows.Count, 1).End(xlUp).Row + 1
+        If lngNextRow < 2 Then lngNextRow = 2
+
+        arrOutput(1, 1) = GetArrayValue(arrEntry, 0)
+        arrOutput(1, 2) = GetArrayValue(arrEntry, 1)
+        arrOutput(1, 3) = GetArrayValue(arrEntry, 2)
+        arrOutput(1, 4) = GetArrayValue(arrEntry, 3)
+        arrOutput(1, 5) = GetArrayValue(arrEntry, 4)
+        arrOutput(1, 6) = strContext
+
+        wksLog.Cells(lngNextRow, 1).Resize(1, 6).Value = arrOutput
+    Next lngIndex
+
+ExitSub:
+    Set wksLog = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       Excel.Worksheet
+' Description:   Returns the error-log worksheet and creates it when it does not exist.
+'-------------------------------------------------------------------------------
+Private Function GetOrCreateErrorLogWorksheet() As Excel.Worksheet
+    Const METHOD_NAME As String = "GetOrCreateErrorLogWorksheet"
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim wksLog As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    On Error Resume Next
+    Set wksLog = ThisWorkbook.Worksheets(ERROR_LOG_SHEET_NAME)
+    VBA.Err.Clear
+    On Error GoTo ErrorHandler
+
+    If wksLog Is Nothing Then
+        Set wksLog = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        wksLog.Name = ERROR_LOG_SHEET_NAME
+        wksLog.Cells(1, 1).Value = "Timestamp"
+        wksLog.Cells(1, 2).Value = "Module/Class"
+        wksLog.Cells(1, 3).Value = "Procedure"
+        wksLog.Cells(1, 4).Value = "Error Number"
+        wksLog.Cells(1, 5).Value = "Description"
+        wksLog.Cells(1, 6).Value = "Context"
+        wksLog.Range("A1:F1").Font.Bold = True
+        wksLog.Range("A1:F1").AutoFilter
+        wksLog.Columns("A").ColumnWidth = 20
+        wksLog.Columns("B:C").ColumnWidth = 28
+        wksLog.Columns("D").ColumnWidth = 14
+        wksLog.Columns("E:F").ColumnWidth = 50
+        wksLog.Columns("E:F").WrapText = True
+    End If
+
+    Set GetOrCreateErrorLogWorksheet = wksLog
+
+ExitFunction:
+    Set wksLog = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set GetOrCreateErrorLogWorksheet = Nothing
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    arrValues As Variant, lngIndex As Long
+' Returns:       String
+' Description:   Returns one split-array value without raising an index error.
+'-------------------------------------------------------------------------------
+Private Function GetArrayValue(ByVal arrValues As Variant, ByVal lngIndex As Long) As String
+    Const METHOD_NAME As String = "GetArrayValue"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If IsArray(arrValues) Then
+        If lngIndex >= LBound(arrValues) And lngIndex <= UBound(arrValues) Then
+            GetArrayValue = CStr(arrValues(lngIndex))
+        End If
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetArrayValue = vbNullString
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       ---
+' Description:   Appends stored errors to the configured text log folder.
+'-------------------------------------------------------------------------------
+Public Sub logToTextFile()
+    Const METHOD_NAME As String = "logToTextFile"
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnWriteHeader As Boolean
+    Dim fileNumber As Long
+    Dim fso As Object
+    Dim lngIndex As Long
+    Dim strFilePath As String
+    Dim strFolderPath As String
+
+    On Error GoTo ErrorHandler
+
+    EnsureErrors
+    If mErrors.Count = 0 Then GoTo ExitSub
+    If Len(mLogFolderPath) = 0 Then GoTo ExitSub
+
+    strFolderPath = mLogFolderPath
+    If Right$(strFolderPath, 1) <> "\" Then
+        strFolderPath = strFolderPath & "\"
+    End If
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(strFolderPath) Then
+        Err.Raise 1020, METHOD_NAME, "Configured error log folder does not exist."
+    End If
+
+    strFilePath = strFolderPath & "VBA_Error_Log_" & Format$(Date, "yyyymmdd") & ".log"
+    blnWriteHeader = Not fso.FileExists(strFilePath)
+    If Not blnWriteHeader Then
+        blnWriteHeader = (fso.GetFile(strFilePath).Size = 0)
+    End If
+    fileNumber = FreeFile
+    Open strFilePath For Append As #fileNumber
+    If blnWriteHeader Then
+        Print #fileNumber, "Timestamp" & vbTab & "Class" & vbTab & "Method" & vbTab & "ErrorNumber" & vbTab & "Description" & vbTab & "Context"
+    End If
+    For lngIndex = 1 To mErrors.Count
+        Print #fileNumber, CStr(mErrors(lngIndex))
+    Next lngIndex
+
+ExitSub:
+    On Error Resume Next
+    If fileNumber > 0 Then Close #fileNumber
+    On Error GoTo 0
+    Set fso = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       ---
+' Description:   Preserves the database logging API without inventing a project schema.
+'-------------------------------------------------------------------------------
+Public Sub logToDatabase()
+    Const METHOD_NAME As String = "logToDatabase"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If mConnection Is Nothing Then GoTo ExitSub
+    If Len(mStackTable) = 0 And Len(mDetailsTable) = 0 Then GoTo ExitSub
+    Debug.Print Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbTab & CLASS_NAME & vbTab & METHOD_NAME & vbTab & "Database destination requires the project-specific corporate schema implementation."
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       ---
+' Description:   Writes stored errors to the Immediate Window.
+'-------------------------------------------------------------------------------
+Public Sub toImmediate()
+    Const METHOD_NAME As String = "toImmediate"
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngIndex As Long
+
+    On Error GoTo ErrorHandler
+
+    EnsureErrors
+    For lngIndex = 1 To mErrors.Count
+        Debug.Print CStr(mErrors(lngIndex))
+    Next lngIndex
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       ---
+' Description:   Clears all stored errors.
+'-------------------------------------------------------------------------------
+Public Sub clear()
+    Const METHOD_NAME As String = "clear"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Set mErrors = New Collection
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       ---
+' Description:   Ensures that the internal error collection exists.
+'-------------------------------------------------------------------------------
+Private Sub EnsureErrors()
+    Const METHOD_NAME As String = "EnsureErrors"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If mErrors Is Nothing Then
+        Set mErrors = New Collection
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    arrContext As Variant
+' Returns:       String
+' Description:   Formats context names and values supplied through ParamArray.
+'-------------------------------------------------------------------------------
+Private Function BuildContextText(ByVal arrContext As Variant) As String
+    Const METHOD_NAME As String = "BuildContextText"
+    Dim arrNames As Variant
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngIndex As Long
+    Dim strContext As String
+    Dim strName As String
+    Dim varItem As Variant
+
+    On Error GoTo ErrorHandler
+
+    lngIndex = 0
+    For Each varItem In arrContext
+        If lngIndex = 0 Then
+            arrNames = Split(CStr(varItem), ";")
+        Else
+            strName = "ContextValue" & CStr(lngIndex)
+            If IsArray(arrNames) Then
+                If lngIndex - 1 <= UBound(arrNames) Then
+                    strName = Trim$(CStr(arrNames(lngIndex - 1)))
+                End If
+            End If
+            strContext = strContext & vbTab & strName & "=" & SafeValueToString(varItem)
+        End If
+        lngIndex = lngIndex + 1
+    Next varItem
+    BuildContextText = strContext
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    BuildContextText = vbNullString
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    varValue As Variant
+' Returns:       String
+' Description:   Converts a context value to a safe single-line representation.
+'-------------------------------------------------------------------------------
+Private Function SafeValueToString(ByVal varValue As Variant) As String
+    Const METHOD_NAME As String = "SafeValueToString"
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strValue As String
+
+    On Error GoTo ErrorHandler
+
+    If IsError(varValue) Then
+        strValue = "#ERROR"
+    ElseIf IsObject(varValue) Then
+        strValue = "[Object:" & TypeName(varValue) & "]"
+    ElseIf IsArray(varValue) Then
+        strValue = "[Array]"
+    ElseIf IsEmpty(varValue) Then
+        strValue = vbNullString
+    Else
+        strValue = CStr(varValue)
+    End If
+    SafeValueToString = ReplaceLineBreaks(strValue)
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    SafeValueToString = "[Unavailable]"
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    strValue As String
+' Returns:       String
+' Description:   Replaces line breaks and tabs with spaces.
+'-------------------------------------------------------------------------------
+Private Function ReplaceLineBreaks(ByVal strValue As String) As String
+    Const METHOD_NAME As String = "ReplaceLineBreaks"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    strValue = Replace$(strValue, vbCrLf, " ")
+    strValue = Replace$(strValue, vbCr, " ")
+    strValue = Replace$(strValue, vbLf, " ")
+    strValue = Replace$(strValue, vbTab, " ")
+    ReplaceLineBreaks = strValue
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ReplaceLineBreaks = strValue
+    HandleInternalFailure METHOD_NAME, errNumber, errDescription
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    strMethodName As String, lngNumber As Long, strDescription As String
+' Returns:       ---
+' Description:   Writes bootstrap failures from the logging class to the Immediate Window.
+'-------------------------------------------------------------------------------
+Private Sub HandleInternalFailure(ByVal strMethodName As String, ByVal lngNumber As Long, ByVal strDescription As String)
+    Const METHOD_NAME As String = "HandleInternalFailure"
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Debug.Print Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbTab & CLASS_NAME & vbTab & strMethodName & vbTab & CStr(lngNumber) & vbTab & strDescription
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Debug.Print Format$(Now, "yyyy-mm-dd hh:nn:ss") & vbTab & CLASS_NAME & vbTab & METHOD_NAME & vbTab & CStr(errNumber) & vbTab & errDescription
+    Resume ExitSub
+End Sub

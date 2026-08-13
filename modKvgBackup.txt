@@ -1,0 +1,1476 @@
+Option Explicit
+
+Private Const CLASS_NAME As String = "modKvgBackup"
+
+Private Const MAPPING_SHEET_NAME As String = "KVG_Backup"
+Private Const CONFIG_SHEET_NAME As String = "Tradeversand"
+Private Const MAPPING_FIRST_ROW As Long = 2
+Private Const MAPPING_LAST_COL As Long = 4
+
+Private Const COL_KVG_NAME As Long = 1
+Private Const COL_LABEL As Long = 2
+Private Const COL_MERGE_WITH As Long = 3
+Private Const COL_ACTIVE As Long = 4
+
+Private Const ROOT_FOLDER_RANGE As String = "root_kvg_backup"
+Private Const UNMATCHED_KEY As String = "#UNMATCHED"
+
+Private Const INPUT_SHEET_NAME As String = "Sheet1"
+Private Const INPUT_FUND_COL As Long = 4
+Private Const INPUT_LABEL_COL As Long = 1
+Private Const FUND_KEY_LEN As Long = 11
+Private Const SKIPPED_ROW As Long = 2
+Private Const SKIPPED_ROW_MARKER As String = "PARBDE"
+Private Const SKIPPED_KVG_INDEX As Long = -1
+
+Private Const FL_STATUS_COL As Long = 2
+Private Const FL_KVG_COL As Long = 9
+Private Const FL_FUND_ID_COL As Long = 14
+Private Const FL_LAST_COL As String = "N"
+Private Const FL_ROOT_RANGE As String = "root_Fondsliste"
+Private Const FL_NAME_RANGE As String = "file_name_Fondsliste"
+
+Private Const SENSITIVITY_LABEL_ID As String = "8ffbc0b8-e97b-47d1-beac-cb0955d66f3b"
+Private Const SENSITIVITY_SITE_ID As String = "614f9c25-bffa-42c7-86d8-964101f55fa2"
+Private Const SENSITIVITY_ASSIGNMENT As Long = 1
+Private Const SENSITIVITY_CONTENT_BITS As Long = 2
+
+Private Const MAX_PATH_LEN As Long = 240
+Private Const MAX_LABEL_LEN As Long = 20
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Button entry point - splits the selected input report into per-KVG backup workbooks.
+'-------------------------------------------------------------------------------
+Public Sub runKvgBackupSplit()
+    Const METHOD_NAME As String = "runKvgBackupSplit"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strInputPath As String
+    Dim strSummary As String
+    Dim strShortSummary As String
+    Dim calculationPrevious As Excel.XlCalculation
+    Dim blnOriginalScreenUpdating As Boolean
+    Dim blnOriginalDisplayAlerts As Boolean
+    Dim blnSettingsCaptured As Boolean
+    Dim varPreviousStatusBar As Variant
+
+    On Error GoTo ErrorHandler
+
+    calculationPrevious = Application.Calculation
+    blnOriginalScreenUpdating = Application.ScreenUpdating
+    blnOriginalDisplayAlerts = Application.DisplayAlerts
+    varPreviousStatusBar = Application.StatusBar
+    blnSettingsCaptured = True
+
+    strInputPath = pickInputFile()
+    If strInputPath = vbNullString Then Err.Raise 1001, METHOD_NAME, "No input file selected."
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.DisplayAlerts = False
+
+    strSummary = executeKvgBackup(strInputPath, strShortSummary)
+    Debug.Print strSummary
+    Call showSummaryMessage("KVG backup finished.", strShortSummary)
+
+ExitSub:
+    If blnSettingsCaptured Then
+        Application.StatusBar = varPreviousStatusBar
+        Application.ScreenUpdating = blnOriginalScreenUpdating
+        Application.Calculation = calculationPrevious
+        Application.DisplayAlerts = blnOriginalDisplayAlerts
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Call showErrorMessage(METHOD_NAME, errNumber, errDescription)
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strInputPath As String, ByRef strShortSummary As String
+' Returns:       String
+' Description:   Orchestrates configuration load, routing and workbook generation.
+'-------------------------------------------------------------------------------
+Private Function executeKvgBackup(ByVal strInputPath As String, ByRef strShortSummary As String) As String
+    Const METHOD_NAME As String = "executeKvgBackup"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim wksMapping As Excel.Worksheet
+    Dim wksConfig As Excel.Worksheet
+    Dim fso As Object
+    Dim dictMapping As Object
+    Dim dictFundKvg As Object
+    Dim dictUniqueKvg As Object
+    Dim dictKvgToIndex As Object
+    Dim dictIndexToName As Object
+    Dim arrInput As Variant
+    Dim arrRowKvg() As Long
+    Dim arrKvgCount() As Long
+    Dim varFund As Variant
+    Dim strRootPath As String
+    Dim strFolderName As String
+    Dim strFolder As String
+    Dim strBaseName As String
+    Dim strFilePath As String
+    Dim strSummary As String
+    Dim lngBucketCount As Long
+    Dim lngLastRow As Long
+    Dim lngLastCol As Long
+    Dim lngSkippedRows As Long
+    Dim lngIndex As Long
+    Dim dblStart As Double
+
+    On Error GoTo ErrorHandler
+
+    dblStart = Timer
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set wksMapping = ThisWorkbook.Worksheets(MAPPING_SHEET_NAME)
+    Set wksConfig = ThisWorkbook.Worksheets(CONFIG_SHEET_NAME)
+    Set dictKvgToIndex = CreateObject("Scripting.Dictionary")
+    Set dictIndexToName = CreateObject("Scripting.Dictionary")
+
+    strRootPath = withTrailingSeparator(toSafeString(wksConfig.Range(ROOT_FOLDER_RANGE).Value))
+    If strRootPath = "\" Or strRootPath = vbNullString Then Err.Raise 1020, METHOD_NAME, "Root folder path is empty in range " & ROOT_FOLDER_RANGE
+
+    Application.StatusBar = "Loading configuration and mapping..."
+    Set dictMapping = loadMappingRules(wksMapping)
+    Set dictFundKvg = buildFundKvgDictionary(wksConfig)
+
+    Set dictUniqueKvg = CreateObject("Scripting.Dictionary")
+    For Each varFund In dictFundKvg.Keys
+        dictUniqueKvg.Item(UCase$(CStr(dictFundKvg.Item(varFund)))) = CStr(dictFundKvg.Item(varFund))
+    Next varFund
+
+    Call resolveBuckets(strRootPath, dictUniqueKvg, dictMapping, dictKvgToIndex, dictIndexToName, lngBucketCount)
+
+    Application.StatusBar = "Loading input report..."
+    Call loadInputReport(strInputPath, arrInput, lngLastRow, lngLastCol)
+
+    Application.StatusBar = "Routing rows to KVG folders..."
+    Call assignRowsToKvg(arrInput, lngLastRow, dictFundKvg, dictKvgToIndex, lngBucketCount, arrRowKvg, arrKvgCount, lngSkippedRows)
+
+    For lngIndex = 1 To lngBucketCount
+        If arrKvgCount(lngIndex) > 0 Then
+            Application.StatusBar = "Creating backup " & CStr(lngIndex) & " of " & CStr(lngBucketCount)
+            strFolderName = CStr(dictIndexToName.Item(lngIndex))
+
+            strFolder = buildMonthlyFolder(strRootPath, strFolderName)
+            strBaseName = strFolderName & "_" & Format(Date, "yyyymmdd")
+
+            Call ensureFolderPath(fso, strFolder)
+            If Not fso.FolderExists(strFolder) Then Err.Raise 1021, METHOD_NAME, "Cannot create folder: " & strFolder
+
+            strFilePath = buildTargetFilePath(strFolder, strBaseName)
+            Call saveTargetWorkbook(arrInput, lngLastRow, lngLastCol, arrRowKvg, lngIndex, arrKvgCount(lngIndex), lngSkippedRows, strFilePath)
+
+            strSummary = strSummary & strFolderName & " | " & CStr(arrKvgCount(lngIndex)) & " rows | " & strFilePath & vbCrLf
+        End If
+    Next lngIndex
+
+    If arrKvgCount(0) > 0 Then
+        strFolder = buildMonthlyFolder(strRootPath, "Unmatched")
+        strBaseName = "Unmatched_" & Format(Date, "yyyymmdd")
+
+        Call ensureFolderPath(fso, strFolder)
+        If Not fso.FolderExists(strFolder) Then Err.Raise 1021, METHOD_NAME, "Cannot create Unmatched folder."
+        strFilePath = buildTargetFilePath(strFolder, strBaseName)
+
+        Call saveTargetWorkbook(arrInput, lngLastRow, lngLastCol, arrRowKvg, 0, arrKvgCount(0), lngSkippedRows, strFilePath)
+        strSummary = strSummary & "Unmatched | #UNMATCHED | " & CStr(arrKvgCount(0)) & " rows | " & strFilePath & vbCrLf
+    End If
+
+    strShortSummary = "KVG backup successfully generated." & vbCrLf & vbCrLf & _
+                      "Input rows: " & CStr(lngLastRow - 1) & vbCrLf & _
+                      "Buckets created: " & CStr(lngBucketCount) & vbCrLf & _
+                      "Unmatched rows: " & CStr(arrKvgCount(0)) & vbCrLf & _
+                      "Total time: " & Format(Timer - dblStart, "0.00") & " s"
+
+    executeKvgBackup = strSummary & vbCrLf & strShortSummary
+
+ExitFunction:
+    If IsArray(arrInput) Then Erase arrInput
+    Set dictIndexToName = Nothing
+    Set dictKvgToIndex = Nothing
+    Set dictUniqueKvg = Nothing
+    Set dictFundKvg = Nothing
+    Set dictMapping = Nothing
+    Set fso = Nothing
+    Set wksConfig = Nothing
+    Set wksMapping = Nothing
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "strInputPath", _
+        strInputPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef wksMapping As Excel.Worksheet
+' Returns:       Object
+' Description:   Loads manual override rules from the mapping sheet.
+'-------------------------------------------------------------------------------
+Private Function loadMappingRules(ByRef wksMapping As Excel.Worksheet) As Object
+    Const METHOD_NAME As String = "loadMappingRules"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dictResult As Object
+    Dim arrMapping As Variant
+    Dim strKvg As String
+    Dim strLabel As String
+    Dim strMergeWith As String
+    Dim blnActive As Boolean
+    Dim lngLastRow As Long
+    Dim lngRow As Long
+
+    On Error GoTo ErrorHandler
+
+    Set dictResult = CreateObject("Scripting.Dictionary")
+    lngLastRow = wksMapping.Cells(wksMapping.Rows.Count, COL_KVG_NAME).End(xlUp).Row
+
+    If lngLastRow >= MAPPING_FIRST_ROW Then
+        arrMapping = wksMapping.Range(wksMapping.Cells(1, 1), wksMapping.Cells(lngLastRow, MAPPING_LAST_COL)).Value
+        For lngRow = MAPPING_FIRST_ROW To lngLastRow
+            strKvg = toSafeString(arrMapping(lngRow, COL_KVG_NAME))
+            If strKvg <> vbNullString Then
+                strLabel = toSafeString(arrMapping(lngRow, COL_LABEL))
+                strMergeWith = toSafeString(arrMapping(lngRow, COL_MERGE_WITH))
+                blnActive = isFlagTrue(arrMapping(lngRow, COL_ACTIVE))
+
+                If Not dictResult.Exists(UCase$(strKvg)) Then
+                    dictResult.Add UCase$(strKvg), Array(strLabel, strMergeWith, blnActive)
+                End If
+            End If
+        Next lngRow
+    End If
+
+    Set loadMappingRules = dictResult
+
+ExitFunction:
+    If IsArray(arrMapping) Then Erase arrMapping
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strRootPath As String, ByRef dictUniqueKvg As Object, ByRef dictMapping As Object, ByRef dictKvgToIndex As Object, ByRef dictIndexToName As Object, ByRef lngBucketCount As Long
+' Returns:       ---
+' Description:   Resolves merge logic, checks max path length, and assigns bucket IDs.
+'-------------------------------------------------------------------------------
+Private Sub resolveBuckets(ByVal strRootPath As String, _
+                           ByRef dictUniqueKvg As Object, _
+                           ByRef dictMapping As Object, _
+                           ByRef dictKvgToIndex As Object, _
+                           ByRef dictIndexToName As Object, _
+                           ByRef lngBucketCount As Long)
+    Const METHOD_NAME As String = "resolveBuckets"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dictBuckets As Object
+    Dim colKvg As Collection
+    Dim varKvg As Variant
+    Dim varBucketKvg As Variant
+    Dim varMappedTarget As Variant
+    Dim strKvg As String
+    Dim strTarget As String
+    Dim strBucket As String
+    Dim strCombinedName As String
+    Dim strLabel As String
+    Dim strSanitized As String
+    Dim blnActive As Boolean
+    Dim lngIndex As Long
+    Dim lngEstLen As Long
+
+    On Error GoTo ErrorHandler
+
+    Set dictBuckets = CreateObject("Scripting.Dictionary")
+
+    For Each varKvg In dictUniqueKvg.Keys
+        strKvg = CStr(varKvg)
+        strTarget = strKvg
+        blnActive = True
+
+        If dictMapping.Exists(UCase$(strKvg)) Then
+            blnActive = CBool(dictMapping.Item(UCase$(strKvg))(2))
+            varMappedTarget = dictMapping.Item(UCase$(strKvg))(1)
+            If CStr(varMappedTarget) <> vbNullString Then
+                strTarget = CStr(varMappedTarget)
+            End If
+        End If
+
+        If Not blnActive Then strTarget = UNMATCHED_KEY
+
+        If Not dictBuckets.Exists(UCase$(strTarget)) Then
+            Set colKvg = New Collection
+            dictBuckets.Add UCase$(strTarget), colKvg
+        End If
+        dictBuckets.Item(UCase$(strTarget)).Add dictUniqueKvg.Item(varKvg)
+    Next varKvg
+
+    lngIndex = 0
+    For Each varKvg In dictBuckets.Keys
+        strBucket = CStr(varKvg)
+        If strBucket <> UCase$(UNMATCHED_KEY) Then
+            lngIndex = lngIndex + 1
+            strCombinedName = vbNullString
+
+            For Each varBucketKvg In dictBuckets.Item(strBucket)
+                strKvg = CStr(varBucketKvg)
+                strLabel = strKvg
+                If dictMapping.Exists(UCase$(strKvg)) Then
+                    If CStr(dictMapping.Item(UCase$(strKvg))(0)) <> vbNullString Then
+                        strLabel = CStr(dictMapping.Item(UCase$(strKvg))(0))
+                    End If
+                End If
+
+                If strCombinedName = vbNullString Then
+                    strCombinedName = strLabel
+                Else
+                    strCombinedName = strCombinedName & "_and_" & strLabel
+                End If
+            Next varBucketKvg
+
+            strSanitized = sanitizeFileName(strCombinedName)
+            lngEstLen = Len(strRootPath) + (Len(strSanitized) * 2) + 23
+
+            If lngEstLen > MAX_PATH_LEN Then
+                strCombinedName = vbNullString
+                For Each varBucketKvg In dictBuckets.Item(strBucket)
+                    strKvg = CStr(varBucketKvg)
+                    strLabel = strKvg
+                    If dictMapping.Exists(UCase$(strKvg)) Then
+                        If CStr(dictMapping.Item(UCase$(strKvg))(0)) <> vbNullString Then
+                            strLabel = CStr(dictMapping.Item(UCase$(strKvg))(0))
+                        End If
+                    End If
+
+                    strLabel = Left$(strLabel, MAX_LABEL_LEN)
+
+                    If strCombinedName = vbNullString Then
+                        strCombinedName = strLabel
+                    Else
+                        strCombinedName = strCombinedName & "_and_" & strLabel
+                    End If
+                Next varBucketKvg
+                strSanitized = sanitizeFileName(strCombinedName)
+            End If
+
+            dictIndexToName.Add lngIndex, strSanitized
+            For Each varBucketKvg In dictBuckets.Item(strBucket)
+                dictKvgToIndex.Add UCase$(CStr(varBucketKvg)), lngIndex
+            Next varBucketKvg
+        Else
+            For Each varBucketKvg In dictBuckets.Item(strBucket)
+                dictKvgToIndex.Add UCase$(CStr(varBucketKvg)), 0
+            Next varBucketKvg
+        End If
+    Next varKvg
+
+    lngBucketCount = lngIndex
+
+ExitSub:
+    Set dictBuckets = Nothing
+    Set colKvg = Nothing
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "strRootPath;bucketCount", _
+        strRootPath, _
+        lngBucketCount
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef wksConfig As Excel.Worksheet
+' Returns:       Object
+' Description:   Builds a fund-to-KVG dictionary exclusively for OPEN status funds.
+'-------------------------------------------------------------------------------
+Private Function buildFundKvgDictionary(ByRef wksConfig As Excel.Worksheet) As Object
+    Const METHOD_NAME As String = "buildFundKvgDictionary"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dictResult As Object
+    Dim wkbFondsliste As Excel.Workbook
+    Dim wksFondsliste As Excel.Worksheet
+    Dim arrFondsliste As Variant
+    Dim strFolderPath As String
+    Dim strBaseName As String
+    Dim strFileName As String
+    Dim strRawId As String
+    Dim strCleanId As String
+    Dim strKvgName As String
+    Dim strStatus As String
+    Dim lngLastRow As Long
+    Dim lngRow As Long
+    Dim blnAlreadyOpen As Boolean
+
+    On Error GoTo ErrorHandler
+
+    Set dictResult = CreateObject("Scripting.Dictionary")
+
+    strFolderPath = withTrailingSeparator(toSafeString(wksConfig.Range(FL_ROOT_RANGE).Value))
+    strBaseName = toSafeString(wksConfig.Range(FL_NAME_RANGE).Value)
+    If strFolderPath = vbNullString Or strBaseName = vbNullString Then
+        Err.Raise 1026, METHOD_NAME, "Named range " & FL_ROOT_RANGE & " or " & FL_NAME_RANGE & " is empty."
+    End If
+
+    strFileName = findLatestFondsliste(strFolderPath, strBaseName)
+    If strFileName = vbNullString Then Err.Raise 1010, METHOD_NAME, "Fondsliste file not found in " & strFolderPath
+
+    blnAlreadyOpen = isWorkbookOpen(strFileName)
+    If blnAlreadyOpen Then
+        Set wkbFondsliste = Application.Workbooks(strFileName)
+    Else
+        Set wkbFondsliste = Application.Workbooks.Open(strFolderPath & strFileName, ReadOnly:=True)
+    End If
+
+    Set wksFondsliste = wkbFondsliste.Worksheets(1)
+    lngLastRow = wksFondsliste.Cells(wksFondsliste.Rows.Count, FL_LAST_COL).End(xlUp).Row
+    If lngLastRow < 2 Then Err.Raise 1011, METHOD_NAME, "Fondsliste contains no data rows: " & strFileName
+
+    arrFondsliste = wksFondsliste.Range("A1:" & FL_LAST_COL & CStr(lngLastRow)).Value
+
+    Set wksFondsliste = Nothing
+    If Not blnAlreadyOpen Then wkbFondsliste.Close SaveChanges:=False
+    Set wkbFondsliste = Nothing
+
+    For lngRow = 2 To lngLastRow
+        strRawId = Replace(toSafeString(arrFondsliste(lngRow, FL_FUND_ID_COL)), " ", vbNullString)
+        strKvgName = toSafeString(arrFondsliste(lngRow, FL_KVG_COL))
+        strStatus = UCase$(toSafeString(arrFondsliste(lngRow, FL_STATUS_COL)))
+
+        If Len(strRawId) >= FUND_KEY_LEN And strKvgName <> vbNullString And strStatus = "OPEN" Then
+            strCleanId = Right$(strRawId, FUND_KEY_LEN)
+            If Not dictResult.Exists(strCleanId) Then
+                dictResult.Add strCleanId, strKvgName
+            End If
+        End If
+    Next lngRow
+
+    Set buildFundKvgDictionary = dictResult
+
+ExitFunction:
+    If IsArray(arrFondsliste) Then Erase arrFondsliste
+    Set wksFondsliste = Nothing
+    If Not wkbFondsliste Is Nothing Then
+        If Not blnAlreadyOpen Then wkbFondsliste.Close SaveChanges:=False
+        Set wkbFondsliste = Nothing
+    End If
+    Set dictResult = Nothing
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strInputPath As String, ByRef arrInput As Variant, ByRef lngLastRow As Long, ByRef lngLastCol As Long
+' Returns:       ---
+' Description:   Loads the input report into a memory array.
+'-------------------------------------------------------------------------------
+Private Sub loadInputReport(ByVal strInputPath As String, _
+                            ByRef arrInput As Variant, _
+                            ByRef lngLastRow As Long, _
+                            ByRef lngLastCol As Long)
+    Const METHOD_NAME As String = "loadInputReport"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim wkbInput As Excel.Workbook
+    Dim wksInput As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    lngLastRow = 0
+    lngLastCol = 0
+
+    Set wkbInput = Application.Workbooks.Open(strInputPath, ReadOnly:=True)
+    Set wksInput = inputWorksheet(wkbInput)
+    Call clearWorksheetFilters(wksInput)
+
+    lngLastRow = wksInput.Cells(wksInput.Rows.Count, INPUT_FUND_COL).End(xlUp).Row
+    lngLastCol = wksInput.Cells(1, wksInput.Columns.Count).End(xlToLeft).Column
+
+    If lngLastRow < 2 Then Err.Raise 1001, METHOD_NAME, "Input report contains no data rows: " & strInputPath
+    If lngLastCol < INPUT_FUND_COL Then Err.Raise 1001, METHOD_NAME, "Input report has fewer columns than expected."
+
+    arrInput = wksInput.Range(wksInput.Cells(1, 1), wksInput.Cells(lngLastRow, lngLastCol)).Value
+
+ExitSub:
+    Set wksInput = Nothing
+    If Not wkbInput Is Nothing Then
+        wkbInput.Close SaveChanges:=False
+        Set wkbInput = Nothing
+    End If
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "strInputPath", _
+        strInputPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef arrInput As Variant, ByVal lngLastRow As Long, ByRef dictFundKvg As Object, ByRef dictKvgToIndex As Object, ByVal lngBucketCount As Long, ByRef arrRowKvg() As Long, ByRef arrKvgCount() As Long, ByRef lngSkippedRows As Long
+' Returns:       ---
+' Description:   Assigns every input row to a resolved Bucket index.
+'-------------------------------------------------------------------------------
+Private Sub assignRowsToKvg(ByRef arrInput As Variant, _
+                            ByVal lngLastRow As Long, _
+                            ByRef dictFundKvg As Object, _
+                            ByRef dictKvgToIndex As Object, _
+                            ByVal lngBucketCount As Long, _
+                            ByRef arrRowKvg() As Long, _
+                            ByRef arrKvgCount() As Long, _
+                            ByRef lngSkippedRows As Long)
+    Const METHOD_NAME As String = "assignRowsToKvg"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strFundKey As String
+    Dim strKvgName As String
+    Dim lngRow As Long
+    Dim lngIndex As Long
+
+    On Error GoTo ErrorHandler
+
+    lngSkippedRows = 0
+    ReDim arrRowKvg(1 To lngLastRow)
+    ReDim arrKvgCount(0 To lngBucketCount)
+
+    For lngRow = 2 To lngLastRow
+        If isSkippedLabelRow(arrInput, lngRow) Then
+            arrRowKvg(lngRow) = SKIPPED_KVG_INDEX
+            lngSkippedRows = lngSkippedRows + 1
+        Else
+            strFundKey = Right$(toSafeString(arrInput(lngRow, INPUT_FUND_COL)), FUND_KEY_LEN)
+            strKvgName = vbNullString
+            lngIndex = 0
+
+            If dictFundKvg.Exists(strFundKey) Then strKvgName = CStr(dictFundKvg.Item(strFundKey))
+
+            If strKvgName <> vbNullString Then
+                If dictKvgToIndex.Exists(UCase$(strKvgName)) Then lngIndex = CLng(dictKvgToIndex.Item(UCase$(strKvgName)))
+            End If
+
+            arrRowKvg(lngRow) = lngIndex
+            arrKvgCount(lngIndex) = arrKvgCount(lngIndex) + 1
+        End If
+    Next lngRow
+
+ExitSub:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "lastRow;bucketCount", _
+        lngLastRow, _
+        lngBucketCount
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef arrInput As Variant, ByVal lngRow As Long
+' Returns:       Boolean
+' Description:   Detects the generic PARBDE label row.
+'-------------------------------------------------------------------------------
+Private Function isSkippedLabelRow(ByRef arrInput As Variant, ByVal lngRow As Long) As Boolean
+    Const METHOD_NAME As String = "isSkippedLabelRow"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    isSkippedLabelRow = False
+    If lngRow <> SKIPPED_ROW Then GoTo ExitFunction
+    isSkippedLabelRow = (UCase$(toSafeString(arrInput(lngRow, INPUT_LABEL_COL))) = SKIPPED_ROW_MARKER)
+
+ExitFunction:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "rowIndex", _
+        lngRow
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef arrInput As Variant, ByVal lngLastRow As Long, ByVal lngLastCol As Long, ByRef arrRowKvg() As Long, ByVal lngBucketIndex As Long, ByVal lngRowCount As Long, ByVal lngSkippedRows As Long, ByVal strFullPath As String
+' Returns:       ---
+' Description:   Writes assigned rows into a new workbook and applies sensitivity label.
+'-------------------------------------------------------------------------------
+Private Sub saveTargetWorkbook(ByRef arrInput As Variant, _
+                               ByVal lngLastRow As Long, _
+                               ByVal lngLastCol As Long, _
+                               ByRef arrRowKvg() As Long, _
+                               ByVal lngBucketIndex As Long, _
+                               ByVal lngRowCount As Long, _
+                               ByVal lngSkippedRows As Long, _
+                               ByVal strFullPath As String)
+    Const METHOD_NAME As String = "saveTargetWorkbook"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim wkbOutput As Excel.Workbook
+    Dim wksOutput As Excel.Worksheet
+    Dim arrOutput As Variant
+    Dim lngRow As Long
+    Dim lngColumn As Long
+    Dim lngOutputRow As Long
+    Dim lngOutputRows As Long
+
+    On Error GoTo ErrorHandler
+
+    lngOutputRows = lngRowCount + lngSkippedRows + 1
+    ReDim arrOutput(1 To lngOutputRows, 1 To lngLastCol)
+
+    For lngColumn = 1 To lngLastCol
+        arrOutput(1, lngColumn) = arrInput(1, lngColumn)
+    Next lngColumn
+
+    lngOutputRow = 1
+    For lngRow = 2 To lngLastRow
+        If arrRowKvg(lngRow) = lngBucketIndex Or arrRowKvg(lngRow) = SKIPPED_KVG_INDEX Then
+            lngOutputRow = lngOutputRow + 1
+            For lngColumn = 1 To lngLastCol
+                arrOutput(lngOutputRow, lngColumn) = arrInput(lngRow, lngColumn)
+            Next lngColumn
+        End If
+    Next lngRow
+
+    Set wkbOutput = Application.Workbooks.Add(xlWBATWorksheet)
+    Set wksOutput = wkbOutput.Worksheets(1)
+    wksOutput.Range(wksOutput.Cells(1, 1), wksOutput.Cells(lngOutputRows, lngLastCol)).Value = arrOutput
+
+    Call applySensitivityLabel(wkbOutput)
+    wkbOutput.SaveAs Filename:=strFullPath, FileFormat:=xlOpenXMLWorkbook
+
+ExitSub:
+    If IsArray(arrOutput) Then Erase arrOutput
+    Set wksOutput = Nothing
+    If Not wkbOutput Is Nothing Then
+        wkbOutput.Close SaveChanges:=False
+        Set wkbOutput = Nothing
+    End If
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "bucketIndex;expectedCount;skippedRows;filePath", _
+        lngBucketIndex, _
+        lngRowCount, _
+        lngSkippedRows, _
+        strFilePath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef wkbTarget As Excel.Workbook
+' Returns:       ---
+' Description:   Applies the corporate sensitivity label.
+'-------------------------------------------------------------------------------
+Private Sub applySensitivityLabel(ByRef wkbTarget As Excel.Workbook)
+    Const METHOD_NAME As String = "applySensitivityLabel"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim objLabelInfo As Object
+
+    On Error GoTo ErrorHandler
+
+    Set objLabelInfo = wkbTarget.SensitivityLabel.CreateLabelInfo()
+    objLabelInfo.LabelId = SENSITIVITY_LABEL_ID
+    objLabelInfo.SiteId = SENSITIVITY_SITE_ID
+    objLabelInfo.AssignmentMethod = SENSITIVITY_ASSIGNMENT
+    objLabelInfo.ContentBits = SENSITIVITY_CONTENT_BITS
+    objLabelInfo.IsEnabled = True
+
+    wkbTarget.SensitivityLabel.SetLabel objLabelInfo, objLabelInfo
+
+ExitSub:
+    Set objLabelInfo = Nothing
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strRootPath As String, ByVal strBucketName As String
+' Returns:       String
+' Description:   Builds the folder path using root \ KVG \ yyyy \ mm \.
+'-------------------------------------------------------------------------------
+Private Function buildMonthlyFolder(ByVal strRootPath As String, ByVal strBucketName As String) As String
+    Const METHOD_NAME As String = "buildMonthlyFolder"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strFolder As String
+
+    On Error GoTo ErrorHandler
+
+    strFolder = withTrailingSeparator(strRootPath) & strBucketName & "\" & _
+                Format(Date, "yyyy") & "\" & Format(Date, "mm") & "\"
+    buildMonthlyFolder = strFolder
+
+ExitFunction:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "rootPath;folderName", _
+        strRootPath, _
+        strBucketName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String, ByVal strBaseName As String
+' Returns:       String
+' Description:   Builds the output path preventing collisions.
+'-------------------------------------------------------------------------------
+Private Function buildTargetFilePath(ByVal strFolderPath As String, ByVal strBaseName As String) As String
+    Const METHOD_NAME As String = "buildTargetFilePath"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strCandidate As String
+
+    On Error GoTo ErrorHandler
+
+    strCandidate = strFolderPath & strBaseName & ".xlsx"
+    If Dir(strCandidate) <> vbNullString Then
+        strCandidate = strFolderPath & strBaseName & "_" & Format(Now, "hhmmss") & ".xlsx"
+    End If
+
+    buildTargetFilePath = strCandidate
+
+ExitFunction:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folder;baseName", _
+        strFolderPath, _
+        strBaseName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef fso As Object, ByVal strFolderPath As String
+' Returns:       ---
+' Description:   Creates nested directory structures recursively.
+'-------------------------------------------------------------------------------
+Private Sub ensureFolderPath(ByRef fso As Object, ByVal strFolderPath As String)
+    Const METHOD_NAME As String = "ensureFolderPath"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strParentPath As String
+
+    On Error GoTo ErrorHandler
+
+    If strFolderPath = vbNullString Or strFolderPath = "\" Then GoTo ExitSub
+    If Right$(strFolderPath, 1) = "\" Then strFolderPath = Left$(strFolderPath, Len(strFolderPath) - 1)
+    If fso.FolderExists(strFolderPath) Then GoTo ExitSub
+
+    strParentPath = fso.GetParentFolderName(strFolderPath)
+    If strParentPath <> vbNullString Then
+        If Not fso.FolderExists(strParentPath) Then Call ensureFolderPath(fso, strParentPath)
+    End If
+
+    fso.CreateFolder strFolderPath
+
+ExitSub:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath", _
+        strFolderPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String, ByVal strBaseName As String
+' Returns:       String
+' Description:   Finds the Fondsliste file with the latest date key.
+'-------------------------------------------------------------------------------
+Private Function findLatestFondsliste(ByVal strFolderPath As String, ByVal strBaseName As String) As String
+    Const METHOD_NAME As String = "findLatestFondsliste"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strFileName As String
+    Dim strLatestFile As String
+    Dim lngLatestKey As Long
+    Dim lngCurrentKey As Long
+    Dim strKey As String
+
+    On Error GoTo ErrorHandler
+
+    lngLatestKey = -1
+    strFileName = Dir(strFolderPath & strBaseName & "_*.xls*")
+
+    Do While strFileName <> vbNullString
+        lngCurrentKey = 0
+        If InStrRev(strFileName, "_") > 0 Then
+            strKey = Mid$(strFileName, InStrRev(strFileName, "_") + 1, 8)
+            If IsNumeric(strKey) Then lngCurrentKey = CLng(strKey)
+        End If
+
+        If lngCurrentKey > lngLatestKey Then
+            lngLatestKey = lngCurrentKey
+            strLatestFile = strFileName
+        End If
+        strFileName = Dir()
+    Loop
+
+    findLatestFondsliste = strLatestFile
+
+ExitFunction:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;baseName", _
+        strFolderPath, _
+        strBaseName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFileName As String
+' Returns:       Boolean
+' Description:   Validates if a workbook is already open.
+'-------------------------------------------------------------------------------
+Private Function isWorkbookOpen(ByVal strFileName As String) As Boolean
+    Const METHOD_NAME As String = "isWorkbookOpen"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim wkbOpen As Excel.Workbook
+
+    On Error GoTo ErrorHandler
+
+    isWorkbookOpen = False
+    For Each wkbOpen In Application.Workbooks
+        If StrComp(wkbOpen.Name, strFileName, vbTextCompare) = 0 Then
+            isWorkbookOpen = True
+            Exit For
+        End If
+    Next wkbOpen
+
+ExitFunction:
+    Set wkbOpen = Nothing
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fileName", _
+        strFileName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef wkbInput As Excel.Workbook
+' Returns:       Excel.Worksheet
+' Description:   Finds the target worksheet from input workbook.
+'-------------------------------------------------------------------------------
+Private Function inputWorksheet(ByRef wkbInput As Excel.Workbook) As Excel.Worksheet
+    Const METHOD_NAME As String = "inputWorksheet"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim wksCandidate As Excel.Worksheet
+    Dim wksResult As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    For Each wksCandidate In wkbInput.Worksheets
+        If StrComp(wksCandidate.Name, INPUT_SHEET_NAME, vbTextCompare) = 0 Then
+            Set wksResult = wksCandidate
+            Exit For
+        End If
+    Next wksCandidate
+
+    If wksResult Is Nothing Then Set wksResult = wkbInput.Worksheets(1)
+    Set inputWorksheet = wksResult
+
+ExitFunction:
+    Set wksResult = Nothing
+    Set wksCandidate = Nothing
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef wksTarget As Excel.Worksheet
+' Returns:       ---
+' Description:   Clears dynamic filtering from the target worksheet.
+'-------------------------------------------------------------------------------
+Private Sub clearWorksheetFilters(ByRef wksTarget As Excel.Worksheet)
+    Const METHOD_NAME As String = "clearWorksheetFilters"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If wksTarget.FilterMode Then wksTarget.ShowAllData
+    If wksTarget.AutoFilterMode Then wksTarget.AutoFilterMode = False
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strRawName As String
+' Returns:       String
+' Description:   Sanitizes a string to comply with Windows filesystem naming rules.
+'-------------------------------------------------------------------------------
+Private Function sanitizeFileName(ByVal strRawName As String) As String
+    Const METHOD_NAME As String = "sanitizeFileName"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strCleanName As String
+    Dim arrIllegal As Variant
+    Dim lngItem As Long
+
+    On Error GoTo ErrorHandler
+
+    arrIllegal = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+    strCleanName = Trim$(strRawName)
+
+    For lngItem = LBound(arrIllegal) To UBound(arrIllegal)
+        strCleanName = Replace(strCleanName, CStr(arrIllegal(lngItem)), vbNullString)
+    Next lngItem
+
+    strCleanName = Replace(strCleanName, " ", "_")
+    If strCleanName = vbNullString Then strCleanName = "InvalidName"
+
+    sanitizeFileName = strCleanName
+
+ExitFunction:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "rawName", _
+        strRawName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String
+' Returns:       String
+' Description:   Ensures folder path ends with a backslash.
+'-------------------------------------------------------------------------------
+Private Function withTrailingSeparator(ByVal strFolderPath As String) As String
+    Const METHOD_NAME As String = "withTrailingSeparator"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strTrimmed As String
+
+    On Error GoTo ErrorHandler
+
+    strTrimmed = Trim$(strFolderPath)
+    If strTrimmed <> vbNullString And Right$(strTrimmed, 1) <> "\" Then strTrimmed = strTrimmed & "\"
+    withTrailingSeparator = strTrimmed
+
+ExitFunction:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath", _
+        strFolderPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal varValue As Variant
+' Returns:       String
+' Description:   Safely reads variant cells into strings without erroring.
+'-------------------------------------------------------------------------------
+Private Function toSafeString(ByVal varValue As Variant) As String
+    Const METHOD_NAME As String = "toSafeString"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    toSafeString = vbNullString
+    If IsError(varValue) Or IsEmpty(varValue) Or IsNull(varValue) Then GoTo ExitFunction
+    toSafeString = Trim$(CStr(varValue))
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal varValue As Variant
+' Returns:       Boolean
+' Description:   Determines active flag logic defaulting to true unless explicitly FALSE or 0.
+'-------------------------------------------------------------------------------
+Private Function isFlagTrue(ByVal varValue As Variant) As Boolean
+    Const METHOD_NAME As String = "isFlagTrue"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strText As String
+
+    On Error GoTo ErrorHandler
+
+    isFlagTrue = True
+    If IsError(varValue) Or IsEmpty(varValue) Or IsNull(varValue) Then GoTo ExitFunction
+
+    If VarType(varValue) = vbBoolean Then
+        isFlagTrue = CBool(varValue)
+        GoTo ExitFunction
+    End If
+
+    strText = UCase$(Trim$(CStr(varValue)))
+    If strText = "FALSE" Or strText = "FAŁSZ" Or strText = "0" Then
+        isFlagTrue = False
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strTitle As String, ByVal strSummary As String
+' Returns:       ---
+' Description:   Dedicated UI handler displaying the success summary.
+'-------------------------------------------------------------------------------
+Private Sub showSummaryMessage(ByVal strTitle As String, ByVal strSummary As String)
+    Const METHOD_NAME As String = "showSummaryMessage"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strText As String
+
+    On Error GoTo ErrorHandler
+
+    strText = strTitle & vbCrLf & vbCrLf & strSummary
+    MsgBox strText, vbInformation, "KVG backup"
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "title", _
+        strTitle
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strMethodName As String, ByVal lngErrorNumber As Long, ByVal strErrorDescription As String
+' Returns:       ---
+' Description:   Dedicated UI handler displaying failure context.
+'-------------------------------------------------------------------------------
+Private Sub showErrorMessage(ByVal strMethodName As String, _
+                             ByVal lngErrorNumber As Long, _
+                             ByVal strErrorDescription As String)
+    Const METHOD_NAME As String = "showErrorMessage"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strText As String
+
+    On Error GoTo ErrorHandler
+
+    strText = "Error " & CStr(lngErrorNumber) & " in " & strMethodName & ": " & strErrorDescription
+    errorManager.display strText
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "methodName;errorNumber", _
+        strMethodName, _
+        lngErrorNumber
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       String
+' Description:   Dedicated UI handler for opening file picking dialog.
+'-------------------------------------------------------------------------------
+Private Function pickInputFile() As String
+    Const METHOD_NAME As String = "pickInputFile"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim varSelected As Variant
+
+    On Error GoTo ErrorHandler
+
+    pickInputFile = vbNullString
+    varSelected = Application.GetOpenFilename( _
+        FileFilter:="Data Files (*.xlsx;*.xlsm;*.csv),*.xlsx;*.xlsm;*.csv", _
+        Title:="Select the input report to split per KVG", _
+        MultiSelect:=False)
+
+    If VarType(varSelected) = vbString Then pickInputFile = CStr(varSelected)
+
+ExitFunction:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function

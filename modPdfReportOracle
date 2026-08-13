@@ -1,0 +1,2901 @@
+Option Explicit
+
+'==============================================================================
+' Module      : modPdfReport
+' Purpose     : One-run PDF layout analyser. Reads a PDF, decompresses every
+'               /FlateDecode stream with a pure-VBA DEFLATE decoder, resolves the
+'               text matrix and writes FIVE files in a single pass:
+'
+'                 <name>_streams.txt  full decompressed streams (page operators)
+'                 <name>_layout.txt   full coordinate lists, per page
+'                 <name>_spec.txt     short spec: column / row vectors, RLE
+'                 <name>_columns.txt  human-readable rectangle bands
+'                 <name>_oracle_schema.txt compact Oracle table schema and rows
+'
+' Dependencies: none - no references, no external tools, no admin rights
+' Entry points: RunPdfAnalysis       - edit the two constants and press F5
+'               RunPdfAnalysisBrowse - choose a PDF and write beside it
+'               PdfAnalyse           - programmatic call
+' Notes       : replaces modPdfInflate and modPdfCompact - remove those two
+'               modules before importing this one.
+'               Inflate is a port of the public-domain "puff" implementation and
+'               was verified against zlib output at levels 0/1/6/9.
+'==============================================================================
+
+'--- DEFLATE ------------------------------------------------------------------
+Private Const MAX_BITS       As Long = 15
+Private Const MAX_LIT_CODES  As Long = 286
+Private Const MAX_DIST_CODES As Long = 30
+Private Const MAX_CODES      As Long = 316
+Private Const FIXED_LIT      As Long = 288
+
+'--- analysis -----------------------------------------------------------------
+Private Const TOL           As Double = 1#     ' coordinate clustering tolerance
+                                               ' 0.6 was too tight: Oracle jitters
+                                               ' baselines by 0.76 pt, which split
+                                               ' every text row into two clusters
+Private Const RULE_MAX_THICK As Double = 2#    ' a thinner "re" counts as a rule
+Private Const MAX_ROW_ITEMS As Long = 40       ' items printed for one text row
+Private Const ERR_BASE      As Long = vbObjectError + 3000
+
+Private Const ORACLE_TOP_COLUMN_COUNT As Long = 12
+Private Const ORACLE_BOTTOM_COLUMN_COUNT As Long = 13
+Private Const ORACLE_TABLE_LEFT_X As Double = 40.52
+Private Const ORACLE_TABLE_RIGHT_X As Double = 1323.04
+Private Const ORACLE_MIN_DATA_ROW_STEP As Double = 16#
+Private Const ORACLE_MAX_DATA_ROW_STEP As Double = 20#
+Private Const ORACLE_GRID_MATCH_TOLERANCE As Double = 1#
+Private Const ORACLE_FIRST_PAGE_MAX_TRADES As Long = 11
+Private Const ORACLE_CONTINUATION_PAGE_MAX_TRADES As Long = 12
+
+Private Type tHuffman
+    Cnt(0 To MAX_BITS) As Long
+    Sym(0 To FIXED_LIT - 1) As Long
+End Type
+
+'--- inflate state ------------------------------------------------------------
+Private m_in() As Byte
+Private m_inPos As Long
+Private m_inEnd As Long
+Private m_bitBuf As Long
+Private m_bitCnt As Long
+Private m_out() As Byte
+Private m_outLen As Long
+Private m_outCap As Long
+
+Private m_pow2(0 To 30) As Long
+Private m_lenBase(0 To 28) As Long
+Private m_lenExtra(0 To 28) As Long
+Private m_distBase(0 To 29) As Long
+Private m_distExtra(0 To 29) As Long
+Private m_clOrder(0 To 18) As Long
+Private m_tablesReady As Boolean
+
+'--- pdf object index ---------------------------------------------------------
+Private m_pdf() As Byte
+Private m_objNum() As Long
+Private m_objPos() As Long
+Private m_objCount As Long
+
+'--- collected page geometry --------------------------------------------------
+Private m_txX() As Double, m_txY() As Double, m_txSz() As Double
+Private m_txFont() As String, m_txStr() As String
+Private m_txN As Long
+
+Private m_segX1() As Double, m_segY1() As Double
+Private m_segX2() As Double, m_segY2() As Double
+Private m_segN As Long
+
+Private m_recX() As Double, m_recY() As Double
+Private m_recW() As Double, m_recH() As Double
+Private m_recN As Long
+
+Private m_vRuleX() As Double, m_vRuleN As Long
+Private m_hRuleY() As Double, m_hRuleN As Long
+
+Private m_minX As Double, m_maxX As Double
+Private m_minY As Double, m_maxY As Double
+
+Private m_fonts As Collection
+Private m_widths As Collection
+Private m_images As Collection
+
+
+'==============================================================================
+' ENTRY POINTS
+'==============================================================================
+
+'------------------------------------------------------------------------------
+' Edit the two constants below and press F5.
+'------------------------------------------------------------------------------
+Public Sub RunPdfAnalysis()
+
+    Const SRC_PDF    As String = "C:\Temp\Helaba_current.pdf"
+    Const OUT_FOLDER As String = "C:\Temp"
+
+    PdfAnalyse SRC_PDF, OUT_FOLDER
+
+End Sub
+
+Public Sub RunPdfAnalysisBrowse()
+
+    Dim dialogFile As Object
+    Dim pdfPath As String
+    Dim outFolder As String
+
+    Set dialogFile = Application.FileDialog(3)
+
+    With dialogFile
+        .Title = "Select the client reference PDF"
+        .AllowMultiSelect = False
+        .Filters.Clear
+        .Filters.Add "PDF files", "*.pdf"
+        If .Show <> -1 Then Exit Sub
+        pdfPath = .SelectedItems(1)
+    End With
+
+    outFolder = Left$(pdfPath, InStrRev(pdfPath, "\") - 1)
+    PdfAnalyse pdfPath, outFolder
+
+End Sub
+
+'------------------------------------------------------------------------------
+' Single pass: decompress, analyse, write the three report files.
+'------------------------------------------------------------------------------
+Public Sub PdfAnalyse(ByVal pdfPath As String, ByVal outFolder As String)
+
+    Dim baseName As String
+    Dim pathStreams As String, pathLayout As String, pathSpec As String, pathCells As String
+    Dim pathOracle As String
+    Dim fStreams As Integer, fLayout As Integer, fSpec As Integer, fCells As Integer
+    Dim fOracle As Integer
+    Dim pageRefs As String
+    Dim refs() As String
+    Dim i As Long, objIdx As Long
+    Dim pageDict As String, content As String
+    Dim pageCount As Long
+    Dim pageTradeCount As Long
+    Dim maxTradeCount As Long
+    Dim totalPageCount As Long
+
+    m_pdf = ReadBytes(pdfPath)
+    BuildObjectIndex
+
+    If Right$(outFolder, 1) <> "\" Then outFolder = outFolder & "\"
+    baseName = FileBaseName(pdfPath)
+    pathStreams = outFolder & baseName & "_streams.txt"
+    pathLayout = outFolder & baseName & "_layout.txt"
+    pathSpec = outFolder & baseName & "_spec.txt"
+    pathCells = outFolder & baseName & "_columns.txt"
+    pathOracle = outFolder & baseName & "_oracle_schema.txt"
+
+    fStreams = OpenNew(pathStreams)
+    fLayout = OpenNew(pathLayout)
+    fSpec = OpenNew(pathSpec)
+    fCells = OpenNew(pathCells)
+    fOracle = OpenNew(pathOracle)
+
+    EmitLine fCells, "TABLE GEOMETRY - human readable cell map"
+    EmitLine fCells, "source : " & pdfPath
+    EmitLine fCells, "units  : PDF points (1/72 inch), origin bottom-left"
+
+    WriteHeaders fStreams, fLayout, fSpec, pdfPath
+    WriteOracleSchemaHeader fOracle, pdfPath
+
+    '--- pass 1: raw decompressed streams --------------------------------------
+    DumpAllStreams fStreams
+
+    '--- pass 2: per page geometry ---------------------------------------------
+    pageRefs = PageObjectOrder()
+    If Len(pageRefs) = 0 Then
+        EmitLine fLayout, "*** no /Type/Page objects found ***"
+        EmitLine fSpec, "*** no /Type/Page objects found ***"
+        EmitLine fOracle, "ERROR|no /Type/Page objects found"
+    Else
+        refs = Split(pageRefs, ",")
+        totalPageCount = UBound(refs) - LBound(refs) + 1
+        For i = LBound(refs) To UBound(refs)
+            objIdx = IndexOfObject(CLng(refs(i)))
+            If objIdx >= 0 Then
+                pageCount = pageCount + 1
+                pageDict = ObjectDict(m_objPos(objIdx))
+                content = PageContent(pageDict)
+                ResetCollectors
+                AnalyseContent content
+                EmitLayoutFull fLayout, pageCount, CLng(refs(i)), pageDict, Len(content)
+                EmitSpecShort fSpec, pageCount, CLng(refs(i)), pageDict, Len(content)
+                EmitCellMap fCells, pageCount, CLng(refs(i)), pageDict
+                pageTradeCount = EmitOraclePageSchema( _
+                    fOracle, _
+                    pageCount, _
+                    CLng(refs(i)), _
+                    pageDict, _
+                    totalPageCount)
+                If pageTradeCount > maxTradeCount Then maxTradeCount = pageTradeCount
+            End If
+        Next i
+    End If
+
+    EmitLine fOracle, ""
+    EmitLine fOracle, "DOCUMENT|pages=" & CStr(pageCount) & "|maxTradesOnPage=" & CStr(maxTradeCount)
+
+    Close #fStreams
+    Close #fLayout
+    Close #fSpec
+    Close #fCells
+    Close #fOracle
+
+    MsgBox "Done - " & CStr(pageCount) & " page(s) analysed." & vbCrLf & vbCrLf & _
+           "1) " & pathStreams & vbCrLf & _
+           "2) " & pathLayout & vbCrLf & _
+           "3) " & pathSpec & vbCrLf & _
+           "4) " & pathCells & vbCrLf & _
+           "5) " & pathOracle & "   <- send this file", _
+           vbInformation, "modPdfReport"
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub WriteHeaders(ByVal fStreams As Integer, ByVal fLayout As Integer, _
+                         ByVal fSpec As Integer, ByVal pdfPath As String)
+
+    Dim info As String
+    info = "source: " & pdfPath & "   size: " & CStr(UBound(m_pdf) + 1) & " bytes"
+
+    EmitLine fStreams, "PDF STREAM DUMP - decompressed page operators"
+    EmitLine fStreams, info
+    EmitLine fStreams, String$(78, "=")
+
+    EmitLine fLayout, "PDF LAYOUT - full coordinate lists"
+    EmitLine fLayout, info
+    EmitLine fLayout, "units: PDF points (1/72 inch), origin bottom-left, absolute coordinates"
+    EmitLine fLayout, String$(78, "=")
+
+    EmitLine fSpec, "PDF LAYOUT - short specification"
+    EmitLine fSpec, info
+    EmitLine fSpec, "units: PDF points (1/72 inch), origin bottom-left"
+    EmitLine fSpec, String$(72, "=")
+
+End Sub
+
+
+'==============================================================================
+' REPORT 1 - RAW STREAMS
+'==============================================================================
+
+Private Sub DumpAllStreams(ByVal fileNum As Integer)
+
+    Dim i As Long
+    Dim dict As String
+    Dim dStart As Long, dEnd As Long
+    Dim plain() As Byte
+    Dim plainLen As Long
+    Dim errText As String
+    Dim count As Long
+
+    For i = 0 To m_objCount - 1
+        dict = ObjectDict(m_objPos(i))
+
+        If StreamBounds(m_objPos(i), dStart, dEnd) Then
+            count = count + 1
+            EmitLine fileNum, ""
+            EmitLine fileNum, String$(78, "-")
+            EmitLine fileNum, "obj " & CStr(m_objNum(i)) & "  " & Trim$(dict)
+            EmitLine fileNum, "raw stream bytes: " & CStr(dEnd - dStart + 1)
+            EmitLine fileNum, String$(78, "-")
+
+            If InStr(1, dict, "/DCTDecode") > 0 Then
+                EmitLine fileNum, "*** JPEG image stream - binary, not dumped ***"
+            ElseIf InStr(1, dict, "/FlateDecode") > 0 Then
+                If TryInflate(m_pdf, dStart + ZlibSkip(dStart), dEnd, plain, plainLen, errText) Then
+                    WriteRaw fileNum, plain, plainLen
+                    EmitLine fileNum, ""
+                Else
+                    EmitLine fileNum, "*** inflate failed: " & errText & " ***"
+                End If
+            Else
+                EmitLine fileNum, "*** uncompressed stream ***"
+                EmitLine fileNum, BytesText(m_pdf, dStart, dEnd)
+            End If
+        End If
+    Next i
+
+    EmitLine fileNum, ""
+    EmitLine fileNum, String$(78, "=")
+    EmitLine fileNum, "streams processed: " & CStr(count)
+
+End Sub
+
+
+'==============================================================================
+' REPORT 2 - FULL LAYOUT
+'==============================================================================
+
+Private Sub EmitLayoutFull(ByVal fileNum As Integer, ByVal pageNo As Long, _
+                           ByVal objNo As Long, ByVal pageDict As String, _
+                           ByVal contentLen As Long)
+
+    Dim colX() As Double, colN As Long
+    Dim rowY() As Double, rowN As Long
+    Dim baseY() As Double, baseN As Long
+    Dim anchX() As Double, anchN As Long
+    Dim i As Long
+
+    EmitLine fileNum, ""
+    EmitLine fileNum, String$(78, "=")
+    EmitLine fileNum, "PAGE " & CStr(pageNo) & "  (object " & CStr(objNo) & ")"
+    EmitLine fileNum, "  MediaBox : " & DictValue(pageDict, "/MediaBox")
+    EmitLine fileNum, "  Rotate   : " & DictValue(pageDict, "/Rotate")
+    EmitLine fileNum, "  Fonts    : " & DictValue(pageDict, "/Font")
+    EmitLine fileNum, "  content  : " & CStr(contentLen) & " chars, " & CStr(m_txN) & _
+                      " text runs, " & CStr(m_segN) & " segments, " & CStr(m_recN) & " rects"
+    EmitLine fileNum, String$(78, "-")
+
+    EmitLine fileNum, "FONT SIZES (Tf)"
+    EmitLine fileNum, "  " & JoinCollection(m_fonts, " ; ")
+    EmitLine fileNum, "LINE WIDTHS (w)"
+    EmitLine fileNum, "  " & JoinCollection(m_widths, " ; ")
+    EmitLine fileNum, "INK EXTENT"
+    EmitLine fileNum, "  x " & NumTxt(m_minX) & " .. " & NumTxt(m_maxX) & _
+                      "    y " & NumTxt(m_minY) & " .. " & NumTxt(m_maxY)
+    EmitLine fileNum, ""
+
+    colN = ClusterValues(m_vRuleX, m_vRuleN, colX, True)
+    EmitLine fileNum, "GRID X - vertical rules (" & CStr(colN) & ")"
+    EmitLine fileNum, "  " & JoinDoubles(colX, colN, " ; ")
+    EmitLine fileNum, "COLUMN WIDTHS (differences)"
+    EmitLine fileNum, "  " & JoinDoubles(Diffs(colX, colN), IIf(colN > 0, colN - 1, 0), " ; ")
+    EmitLine fileNum, ""
+
+    rowN = ClusterValues(m_hRuleY, m_hRuleN, rowY, False)
+    EmitLine fileNum, "GRID Y - horizontal rules, top to bottom (" & CStr(rowN) & ")"
+    EmitLine fileNum, "  " & JoinDoubles(rowY, rowN, " ; ")
+    EmitLine fileNum, "ROW HEIGHTS (differences)"
+    EmitLine fileNum, "  " & JoinDoubles(Diffs(rowY, rowN), IIf(rowN > 0, rowN - 1, 0), " ; ")
+    EmitLine fileNum, ""
+
+    baseN = ClusterValues(m_txY, m_txN, baseY, False)
+    EmitLine fileNum, "TEXT BASELINES Y, top to bottom (" & CStr(baseN) & ")"
+    EmitLine fileNum, "  " & JoinDoubles(baseY, baseN, " ; ")
+    EmitLine fileNum, "BASELINE STEPS (leading)"
+    EmitLine fileNum, "  " & JoinDoubles(Diffs(baseY, baseN), IIf(baseN > 0, baseN - 1, 0), " ; ")
+    EmitLine fileNum, ""
+
+    anchN = ClusterValues(m_txX, m_txN, anchX, True)
+    EmitLine fileNum, "TEXT ANCHORS X (" & CStr(anchN) & ")"
+    EmitLine fileNum, "  " & JoinDoubles(anchX, anchN, " ; ")
+    EmitLine fileNum, ""
+
+    EmitLine fileNum, "SEGMENTS - m / l (" & CStr(m_segN) & ")"
+    For i = 0 To m_segN - 1
+        EmitLine fileNum, "  " & NumTxt(m_segX1(i)) & "," & NumTxt(m_segY1(i)) & _
+                          "  ->  " & NumTxt(m_segX2(i)) & "," & NumTxt(m_segY2(i))
+    Next i
+    EmitLine fileNum, ""
+
+    EmitLine fileNum, "RECTANGLES - re (" & CStr(m_recN) & ")"
+    For i = 0 To m_recN - 1
+        EmitLine fileNum, "  x=" & NumTxt(m_recX(i)) & " y=" & NumTxt(m_recY(i)) & _
+                          " w=" & NumTxt(m_recW(i)) & " h=" & NumTxt(m_recH(i))
+    Next i
+    EmitLine fileNum, ""
+
+    EmitLine fileNum, "IMAGE PLACEMENT (cm before Do)"
+    EmitLine fileNum, "  " & JoinCollection(m_images, " | ")
+    EmitLine fileNum, ""
+
+    EmitLine fileNum, "TEXT RUNS - x  y  size  font  string (" & CStr(m_txN) & ")"
+    For i = 0 To m_txN - 1
+        EmitLine fileNum, "  " & PadRight(NumTxt(m_txX(i)), 9) & _
+                          PadRight(NumTxt(m_txY(i)), 9) & _
+                          PadRight(NumTxt(m_txSz(i)), 6) & _
+                          PadRight(m_txFont(i), 6) & m_txStr(i)
+    Next i
+
+End Sub
+
+
+'==============================================================================
+' REPORT 3 - SHORT SPEC
+'==============================================================================
+
+Private Sub EmitSpecShort(ByVal fileNum As Integer, ByVal pageNo As Long, _
+                          ByVal objNo As Long, ByVal pageDict As String, _
+                          ByVal contentLen As Long)
+
+    Dim colX() As Double, colN As Long
+    Dim rowY() As Double, rowN As Long
+    Dim baseY() As Double, baseN As Long
+    Dim anchX() As Double, anchN As Long
+    Dim i As Long
+
+    EmitLine fileNum, ""
+    EmitLine fileNum, String$(72, "=")
+    EmitLine fileNum, "PAGE " & CStr(pageNo) & "  (object " & CStr(objNo) & ")"
+    EmitLine fileNum, "  MediaBox : " & DictValue(pageDict, "/MediaBox") & _
+                      "   Rotate: " & DictValue(pageDict, "/Rotate")
+    EmitLine fileNum, "  Fonts    : " & DictValue(pageDict, "/Font")
+    EmitLine fileNum, "  content  : " & CStr(contentLen) & " chars, " & CStr(m_txN) & " text runs"
+    EmitLine fileNum, String$(72, "-")
+
+    EmitLine fileNum, "FONT SIZES  : " & JoinCollection(m_fonts, " ; ")
+    EmitLine fileNum, "LINE WIDTHS : " & JoinCollection(m_widths, " ; ")
+    EmitLine fileNum, "INK EXTENT  : x " & NumTxt(m_minX) & " .. " & NumTxt(m_maxX) & _
+                      "   y " & NumTxt(m_minY) & " .. " & NumTxt(m_maxY)
+    EmitLine fileNum, ""
+
+    colN = ClusterValues(m_vRuleX, m_vRuleN, colX, True)
+    EmitLine fileNum, "COLUMN RULES X (" & CStr(colN) & ")"
+    EmitLine fileNum, "  " & JoinDoubles(colX, colN, " ")
+    EmitLine fileNum, "COLUMN WIDTHS (run-length encoded)"
+    EmitLine fileNum, "  " & RunLength(Diffs(colX, colN), IIf(colN > 0, colN - 1, 0))
+    EmitLine fileNum, ""
+
+    rowN = ClusterValues(m_hRuleY, m_hRuleN, rowY, False)
+    EmitLine fileNum, "ROW RULES Y (" & CStr(rowN) & ", top to bottom)"
+    If rowN > 0 Then
+        EmitLine fileNum, "  top " & NumTxt(rowY(0)) & "   bottom " & NumTxt(rowY(rowN - 1))
+        EmitLine fileNum, "  " & JoinDoubles(rowY, rowN, " ")
+        EmitLine fileNum, "ROW HEIGHTS (run-length encoded)"
+        EmitLine fileNum, "  " & RunLength(Diffs(rowY, rowN), rowN - 1)
+    End If
+    EmitLine fileNum, ""
+
+    baseN = ClusterValues(m_txY, m_txN, baseY, False)
+    EmitLine fileNum, "TEXT BASELINES (" & CStr(baseN) & ")"
+    If baseN > 0 Then
+        EmitLine fileNum, "  first " & NumTxt(baseY(0)) & "   last " & NumTxt(baseY(baseN - 1))
+        EmitLine fileNum, "BASELINE STEPS (run-length encoded)"
+        EmitLine fileNum, "  " & RunLength(Diffs(baseY, baseN), baseN - 1)
+    End If
+    EmitLine fileNum, ""
+
+    anchN = ClusterValues(m_txX, m_txN, anchX, True)
+    EmitLine fileNum, "TEXT ANCHORS X (" & CStr(anchN) & ")"
+    EmitLine fileNum, "  " & JoinDoubles(anchX, anchN, " ")
+    EmitLine fileNum, ""
+
+    EmitLine fileNum, "ROW CONTENT SAMPLES (x:text)"
+    For i = 0 To baseN - 1
+        If i >= 4 Then
+            EmitLine fileNum, "  ... " & CStr(baseN - 4) & " further baselines, same pattern"
+            Exit For
+        End If
+        EmitLine fileNum, "  y=" & NumTxt(baseY(i)) & "  " & RowContent(baseY(i))
+    Next i
+    EmitLine fileNum, ""
+
+    EmitLine fileNum, "FILLS (x y w h) : " & RectSummary()
+    EmitLine fileNum, "IMAGES          : " & JoinCollection(m_images, " | ")
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Function RowContent(ByVal y As Double) As String
+
+    Dim idx() As Long
+    Dim n As Long, i As Long, j As Long, t As Long
+    Dim s As String
+
+    ReDim idx(0 To m_txN)
+    For i = 0 To m_txN - 1
+        If Abs(m_txY(i) - y) <= TOL Then
+            idx(n) = i
+            n = n + 1
+        End If
+    Next i
+    If n = 0 Then Exit Function
+
+    For i = 0 To n - 2
+        For j = i + 1 To n - 1
+            If m_txX(idx(j)) < m_txX(idx(i)) Then
+                t = idx(i): idx(i) = idx(j): idx(j) = t
+            End If
+        Next j
+    Next i
+
+    For i = 0 To n - 1
+        If i >= MAX_ROW_ITEMS Then
+            s = s & "...(+" & CStr(n - MAX_ROW_ITEMS) & ")"
+            Exit For
+        End If
+        s = s & NumTxt(m_txX(idx(i))) & ":" & Left$(m_txStr(idx(i)), 22) & " | "
+    Next i
+
+    RowContent = s
+
+End Function
+
+'------------------------------------------------------------------------------
+' Rectangles collapsed to distinct width x height shapes with a count.
+'------------------------------------------------------------------------------
+Private Function RectSummary() As String
+
+    Dim shapes As Collection
+    Dim counts As Collection
+    Dim key As String
+    Dim i As Long, k As Long
+    Dim found As Boolean
+    Dim s As String
+
+    If m_recN = 0 Then
+        RectSummary = "(none)"
+        Exit Function
+    End If
+
+    Set shapes = New Collection
+    Set counts = New Collection
+
+    For i = 0 To m_recN - 1
+        key = NumTxt(m_recW(i)) & " x " & NumTxt(m_recH(i))
+        found = False
+        For k = 1 To shapes.count
+            If shapes.Item(k) = key Then
+                counts.Add counts.Item(k) + 1
+                counts.Remove k
+                found = True
+                Exit For
+            End If
+        Next k
+        If Not found Then
+            shapes.Add key
+            counts.Add 1
+        End If
+    Next i
+
+    For k = 1 To shapes.count
+        s = s & shapes.Item(k) & " x" & CStr(counts.Item(k)) & " | "
+    Next k
+
+    s = s & "  first at " & NumTxt(m_recX(0)) & "," & NumTxt(m_recY(0))
+    RectSummary = s
+
+End Function
+
+
+'==============================================================================
+' CONTENT ANALYSIS
+'==============================================================================
+
+Private Sub ResetCollectors()
+
+    m_txN = 0: m_segN = 0: m_recN = 0: m_vRuleN = 0: m_hRuleN = 0
+
+    ReDim m_txX(0 To 1023): ReDim m_txY(0 To 1023): ReDim m_txSz(0 To 1023)
+    ReDim m_txFont(0 To 1023): ReDim m_txStr(0 To 1023)
+    ReDim m_segX1(0 To 1023): ReDim m_segY1(0 To 1023)
+    ReDim m_segX2(0 To 1023): ReDim m_segY2(0 To 1023)
+    ReDim m_recX(0 To 255): ReDim m_recY(0 To 255)
+    ReDim m_recW(0 To 255): ReDim m_recH(0 To 255)
+    ReDim m_vRuleX(0 To 1023): ReDim m_hRuleY(0 To 1023)
+
+    m_minX = 1E+30: m_maxX = -1E+30
+    m_minY = 1E+30: m_maxY = -1E+30
+
+    Set m_fonts = New Collection
+    Set m_widths = New Collection
+    Set m_images = New Collection
+
+End Sub
+
+'------------------------------------------------------------------------------
+' Walks the page operators, tracking the text matrix so that every reported
+' coordinate is absolute even when the producer used relative Td offsets.
+'------------------------------------------------------------------------------
+Private Sub AnalyseContent(ByVal content As String)
+
+    Dim toks() As String
+    Dim n As Long, i As Long
+    Dim tok As String
+    Dim h0 As String, h1 As String, h2 As String, h3 As String, h4 As String, h5 As String
+    Dim lineX As Double, lineY As Double
+    Dim fontName As String, fontSize As Double
+    Dim moveX As Double, moveY As Double
+    Dim x1 As Double, y1 As Double, x2 As Double, y2 As Double
+    Dim w As Double, hgt As Double
+    Dim lastStr As String, arrStr As String
+    Dim inArray As Boolean
+    Dim ctmA As Double, ctmD As Double, ctmE As Double, ctmF As Double
+
+    ctmA = 1: ctmD = 1
+    n = Tokenize(content, toks)
+
+    For i = 0 To n - 1
+        tok = toks(i)
+
+        Select Case tok
+
+            Case "Tf"
+                fontSize = Val(h0)
+                fontName = h1
+                AddUniqueText m_fonts, fontName & "@" & NumTxt(fontSize)
+
+            Case "w"
+                AddUniqueText m_widths, NumTxt(Val(h0))
+
+            Case "BT"
+                lineX = 0: lineY = 0
+
+            Case "Tm"
+                lineX = Val(h1): lineY = Val(h0)
+
+            Case "Td", "TD"
+                lineX = lineX + Val(h1)
+                lineY = lineY + Val(h0)
+
+            Case "T*"
+                lineY = lineY - fontSize * 1.2
+
+            Case "Tj", "'"
+                AddText lineX, lineY, fontSize, fontName, lastStr
+
+            Case "TJ"
+                AddText lineX, lineY, fontSize, fontName, arrStr
+                arrStr = vbNullString
+
+            Case "["
+                inArray = True: arrStr = vbNullString
+
+            Case "]"
+                inArray = False
+
+            Case "m"
+                moveX = Val(h1): moveY = Val(h0)
+
+            Case "l"
+                x2 = Val(h1): y2 = Val(h0)
+                x1 = moveX: y1 = moveY
+                If Abs(x1 - x2) <= TOL Then
+                    AddSegment x1, y1, x2, y2
+                    AddRule m_vRuleX, m_vRuleN, x1
+                ElseIf Abs(y1 - y2) <= TOL Then
+                    AddSegment x1, y1, x2, y2
+                    AddRule m_hRuleY, m_hRuleN, y1
+                End If
+                moveX = x2: moveY = y2
+
+            Case "re"
+                x1 = Val(h3): y1 = Val(h2): w = Val(h1): hgt = Val(h0)
+                Track x1, y1
+                Track x1 + w, y1 + hgt
+                If Abs(w) <= RULE_MAX_THICK Then
+                    AddRule m_vRuleX, m_vRuleN, x1
+                    AddSegment x1, y1, x1, y1 + hgt
+                ElseIf Abs(hgt) <= RULE_MAX_THICK Then
+                    AddRule m_hRuleY, m_hRuleN, y1
+                    AddSegment x1, y1, x1 + w, y1
+                Else
+                    ' Oracle Reports draws every table cell as a rectangle, so the
+                    ' four edges are the real column and row grid.
+                    AddRect x1, y1, w, hgt
+                    AddRule m_vRuleX, m_vRuleN, x1
+                    AddRule m_vRuleX, m_vRuleN, x1 + w
+                    AddRule m_hRuleY, m_hRuleN, y1
+                    AddRule m_hRuleY, m_hRuleN, y1 + hgt
+                End If
+
+            Case "cm"
+                ctmA = Val(h5): ctmD = Val(h2)
+                ctmE = Val(h1): ctmF = Val(h0)
+
+            Case "Do"
+                AddUniqueText m_images, h0 & ": scale " & NumTxt(ctmA) & " x " & NumTxt(ctmD) & _
+                                        " at " & NumTxt(ctmE) & " " & NumTxt(ctmF)
+        End Select
+
+        If Len(tok) > 0 Then
+            If Left$(tok, 1) = "(" Then
+                lastStr = Mid$(tok, 2)
+                If inArray Then arrStr = arrStr & lastStr
+            End If
+        End If
+
+        h5 = h4: h4 = h3: h3 = h2: h2 = h1: h1 = h0: h0 = tok
+    Next i
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub AddText(ByVal x As Double, ByVal y As Double, ByVal size As Double, _
+                    ByVal fontName As String, ByVal s As String)
+
+    If Len(Trim$(s)) = 0 Then Exit Sub
+
+    If m_txN > UBound(m_txX) Then
+        ReDim Preserve m_txX(0 To m_txN * 2)
+        ReDim Preserve m_txY(0 To m_txN * 2)
+        ReDim Preserve m_txSz(0 To m_txN * 2)
+        ReDim Preserve m_txFont(0 To m_txN * 2)
+        ReDim Preserve m_txStr(0 To m_txN * 2)
+    End If
+
+    m_txX(m_txN) = x: m_txY(m_txN) = y: m_txSz(m_txN) = size
+    m_txFont(m_txN) = fontName: m_txStr(m_txN) = s
+    m_txN = m_txN + 1
+
+    Track x, y
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub AddSegment(ByVal x1 As Double, ByVal y1 As Double, _
+                       ByVal x2 As Double, ByVal y2 As Double)
+
+    If m_segN > UBound(m_segX1) Then
+        ReDim Preserve m_segX1(0 To m_segN * 2)
+        ReDim Preserve m_segY1(0 To m_segN * 2)
+        ReDim Preserve m_segX2(0 To m_segN * 2)
+        ReDim Preserve m_segY2(0 To m_segN * 2)
+    End If
+
+    m_segX1(m_segN) = x1: m_segY1(m_segN) = y1
+    m_segX2(m_segN) = x2: m_segY2(m_segN) = y2
+    m_segN = m_segN + 1
+
+    Track x1, y1
+    Track x2, y2
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub AddRect(ByVal x As Double, ByVal y As Double, _
+                    ByVal w As Double, ByVal h As Double)
+
+    If m_recN > UBound(m_recX) Then
+        ReDim Preserve m_recX(0 To m_recN * 2)
+        ReDim Preserve m_recY(0 To m_recN * 2)
+        ReDim Preserve m_recW(0 To m_recN * 2)
+        ReDim Preserve m_recH(0 To m_recN * 2)
+    End If
+
+    m_recX(m_recN) = x: m_recY(m_recN) = y
+    m_recW(m_recN) = w: m_recH(m_recN) = h
+    m_recN = m_recN + 1
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub AddRule(ByRef arr() As Double, ByRef count As Long, ByVal v As Double)
+
+    If count > UBound(arr) Then ReDim Preserve arr(0 To count * 2)
+    arr(count) = v
+    count = count + 1
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub Track(ByVal x As Double, ByVal y As Double)
+
+    If x < m_minX Then m_minX = x
+    If x > m_maxX Then m_maxX = x
+    If y < m_minY Then m_minY = y
+    If y > m_maxY Then m_maxY = y
+
+End Sub
+
+
+'==============================================================================
+' TOKENIZER
+'==============================================================================
+
+Private Function Tokenize(ByVal s As String, ByRef toks() As String) As Long
+
+    Dim i As Long, n As Long, j As Long, depth As Long
+    Dim count As Long
+    Dim ch As String
+    Dim buf As String
+
+    n = Len(s)
+    ReDim toks(0 To 4095)
+
+    i = 1
+    Do While i <= n
+        ch = Mid$(s, i, 1)
+
+        If ch = " " Or ch = vbCr Or ch = vbLf Or ch = vbTab Or ch = Chr$(0) Then
+            i = i + 1
+
+        ElseIf ch = "(" Then
+            depth = 1: j = i + 1: buf = vbNullString
+            Do While j <= n And depth > 0
+                ch = Mid$(s, j, 1)
+                If ch = "\" Then
+                    buf = buf & Mid$(s, j + 1, 1)
+                    j = j + 2
+                Else
+                    If ch = "(" Then
+                        depth = depth + 1
+                    ElseIf ch = ")" Then
+                        depth = depth - 1
+                        If depth = 0 Then Exit Do
+                    End If
+                    buf = buf & ch
+                    j = j + 1
+                End If
+            Loop
+            PushToken toks, count, "(" & buf
+            i = j + 1
+
+        ElseIf ch = "/" Then
+            j = i + 1
+            Do While j <= n
+                If IsDelimiter(Mid$(s, j, 1)) Then Exit Do
+                j = j + 1
+            Loop
+            PushToken toks, count, Mid$(s, i, j - i)
+            i = j
+
+        ElseIf ch = "[" Or ch = "]" Then
+            PushToken toks, count, ch
+            i = i + 1
+
+        ElseIf ch = "<" Or ch = ">" Or ch = "{" Or ch = "}" Then
+            i = i + 1
+
+        Else
+            j = i
+            Do While j <= n
+                If IsDelimiter(Mid$(s, j, 1)) Then Exit Do
+                j = j + 1
+            Loop
+            If j = i Then j = i + 1
+            PushToken toks, count, Mid$(s, i, j - i)
+            i = j
+        End If
+    Loop
+
+    Tokenize = count
+
+End Function
+
+Private Sub PushToken(ByRef toks() As String, ByRef count As Long, ByVal t As String)
+
+    If count > UBound(toks) Then ReDim Preserve toks(0 To count * 2)
+    toks(count) = t
+    count = count + 1
+
+End Sub
+
+Private Function IsDelimiter(ByVal ch As String) As Boolean
+
+    Select Case ch
+        Case " ", vbCr, vbLf, vbTab, "(", ")", "<", ">", "[", "]", "{", "}", "/", "%"
+            IsDelimiter = True
+    End Select
+
+End Function
+
+
+'==============================================================================
+' PDF OBJECT ACCESS
+'==============================================================================
+
+Private Sub BuildObjectIndex()
+
+    Dim p As Long, k As Long
+    Dim head As String
+    Dim parts() As String
+    Dim numTxt As String
+    Dim seenGen As Boolean
+
+    m_objCount = 0
+    ReDim m_objNum(0 To 255)
+    ReDim m_objPos(0 To 255)
+
+    p = 0
+    Do
+        p = FindBytes(m_pdf, p, " obj")
+        If p < 0 Then Exit Do
+
+        head = BytesText(m_pdf, IIf(p - 24 < 0, 0, p - 24), p - 1)
+        head = Replace(Replace(head, vbCr, " "), vbLf, " ")
+        parts = Split(Trim$(head), " ")
+
+        numTxt = vbNullString
+        seenGen = False
+        For k = UBound(parts) To LBound(parts) Step -1
+            If Len(parts(k)) > 0 Then
+                If IsNumeric(parts(k)) Then
+                    If Not seenGen Then
+                        seenGen = True                    ' generation number
+                    Else
+                        numTxt = parts(k)                 ' object number
+                        Exit For
+                    End If
+                Else
+                    Exit For
+                End If
+            End If
+        Next k
+
+        If Len(numTxt) > 0 Then
+            If m_objCount > UBound(m_objNum) Then
+                ReDim Preserve m_objNum(0 To m_objCount * 2)
+                ReDim Preserve m_objPos(0 To m_objCount * 2)
+            End If
+            m_objNum(m_objCount) = CLng(numTxt)
+            m_objPos(m_objCount) = p + 4
+            m_objCount = m_objCount + 1
+        End If
+
+        p = p + 4
+    Loop
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Function IndexOfObject(ByVal objNo As Long) As Long
+
+    Dim i As Long
+
+    For i = 0 To m_objCount - 1
+        If m_objNum(i) = objNo Then
+            IndexOfObject = i
+            Exit Function
+        End If
+    Next i
+
+    IndexOfObject = -1
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function ObjectDict(ByVal pos As Long) As String
+
+    Dim eStream As Long, eObj As Long, stopAt As Long
+
+    eStream = FindBytes(m_pdf, pos, "stream")
+    eObj = FindBytes(m_pdf, pos, "endobj")
+
+    If eStream < 0 Then
+        stopAt = eObj
+    ElseIf eObj < 0 Then
+        stopAt = eStream
+    ElseIf eStream < eObj Then
+        stopAt = eStream
+    Else
+        stopAt = eObj
+    End If
+
+    If stopAt < 0 Then stopAt = pos + 2000
+    If stopAt - pos > 4000 Then stopAt = pos + 4000
+
+    ObjectDict = Replace(Replace(BytesText(m_pdf, pos, stopAt - 1), vbCr, " "), vbLf, " ")
+
+End Function
+
+'------------------------------------------------------------------------------
+' First and last data byte of the stream belonging to the object at pos.
+'------------------------------------------------------------------------------
+Private Function StreamBounds(ByVal pos As Long, ByRef dStart As Long, ByRef dEnd As Long) As Boolean
+
+    Dim sPos As Long, ePos As Long, oPos As Long
+    Dim declared As Long
+    Dim probe As String
+
+    sPos = FindBytes(m_pdf, pos, "stream")
+    oPos = FindBytes(m_pdf, pos, "endobj")
+    If sPos < 0 Then Exit Function
+    If oPos >= 0 And sPos > oPos Then Exit Function
+
+    dStart = sPos + 6
+    If dStart > UBound(m_pdf) Then Exit Function
+    If m_pdf(dStart) = 13 Then dStart = dStart + 1
+    If m_pdf(dStart) = 10 Then dStart = dStart + 1
+
+    declared = DeclaredLength(ObjectDict(pos))
+    If declared > 0 Then
+        If dStart + declared + 20 <= UBound(m_pdf) Then
+            probe = BytesText(m_pdf, dStart + declared, dStart + declared + 20)
+            If InStr(1, probe, "endstream") > 0 Then
+                dEnd = dStart + declared - 1
+                StreamBounds = True
+                Exit Function
+            End If
+        End If
+    End If
+
+    ePos = FindBytes(m_pdf, dStart, "endstream")
+    If ePos < 0 Then Exit Function
+    dEnd = ePos - 1
+    Do While dEnd >= dStart
+        If m_pdf(dEnd) <> 10 And m_pdf(dEnd) <> 13 Then Exit Do
+        dEnd = dEnd - 1
+    Loop
+
+    StreamBounds = True
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function DeclaredLength(ByVal dictTxt As String) As Long
+
+    Dim k As Long, i As Long
+    Dim ch As String, num As String, tail As String
+
+    k = InStr(1, dictTxt, "/Length")
+    If k = 0 Then Exit Function
+
+    i = k + 7
+    Do While i <= Len(dictTxt)
+        If Mid$(dictTxt, i, 1) <> " " Then Exit Do
+        i = i + 1
+    Loop
+
+    Do While i <= Len(dictTxt)
+        ch = Mid$(dictTxt, i, 1)
+        If ch < "0" Or ch > "9" Then Exit Do
+        num = num & ch
+        i = i + 1
+    Loop
+    If Len(num) = 0 Then Exit Function
+
+    tail = LTrim$(Mid$(dictTxt, i, 6))
+    If Len(tail) > 0 Then
+        If tail Like "#*" Then Exit Function              ' indirect /Length n 0 R
+    End If
+
+    DeclaredLength = CLng(num)
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function ZlibSkip(ByVal dStart As Long) As Long
+
+    Dim b0 As Long, b1 As Long
+
+    If dStart + 1 > UBound(m_pdf) Then Exit Function
+    b0 = m_pdf(dStart)
+    b1 = m_pdf(dStart + 1)
+
+    If (b0 And &HF) = 8 Then
+        If ((b0 * 256 + b1) Mod 31) = 0 Then ZlibSkip = 2
+    End If
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function PageObjectOrder() As String
+
+    Dim i As Long
+    Dim dict As String
+    Dim result As String
+
+    For i = 0 To m_objCount - 1
+        dict = ObjectDict(m_objPos(i))
+        If InStr(1, dict, "/Type/Pages") > 0 Or InStr(1, dict, "/Type /Pages") > 0 Then
+            result = RefList(dict, "/Kids")
+            If Len(result) > 0 Then
+                PageObjectOrder = result
+                Exit Function
+            End If
+        End If
+    Next i
+
+    For i = 0 To m_objCount - 1
+        dict = ObjectDict(m_objPos(i))
+        If InStr(1, dict, "/Type/Pages") = 0 Then
+            If InStr(1, dict, "/Type/Page") > 0 Then
+                If Len(result) > 0 Then result = result & ","
+                result = result & CStr(m_objNum(i))
+            End If
+        End If
+    Next i
+
+    PageObjectOrder = result
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function PageContent(ByVal pageDict As String) As String
+
+    Dim refs() As String
+    Dim list As String
+    Dim i As Long, objIdx As Long
+    Dim s As String
+
+    list = RefList(pageDict, "/Contents")
+    If Len(list) = 0 Then Exit Function
+
+    refs = Split(list, ",")
+    For i = LBound(refs) To UBound(refs)
+        objIdx = IndexOfObject(CLng(refs(i)))
+        If objIdx >= 0 Then
+            s = s & StreamText(m_objPos(objIdx)) & vbLf
+        End If
+    Next i
+
+    PageContent = s
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function StreamText(ByVal pos As Long) As String
+
+    Dim dict As String
+    Dim dStart As Long, dEnd As Long
+    Dim plain() As Byte
+    Dim plainLen As Long
+    Dim errText As String
+
+    If Not StreamBounds(pos, dStart, dEnd) Then Exit Function
+    dict = ObjectDict(pos)
+
+    If InStr(1, dict, "/FlateDecode") = 0 Then
+        StreamText = BytesText(m_pdf, dStart, dEnd)
+        Exit Function
+    End If
+
+    If TryInflate(m_pdf, dStart + ZlibSkip(dStart), dEnd, plain, plainLen, errText) Then
+        If plainLen > 0 Then
+            ReDim Preserve plain(0 To plainLen - 1)
+            StreamText = StrConv(plain, vbUnicode)
+        End If
+    End If
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function RefList(ByVal dict As String, ByVal key As String) As String
+
+    Dim k As Long, i As Long, j As Long, stopAt As Long
+    Dim seg As String
+    Dim parts() As String
+    Dim result As String
+
+    k = InStr(1, dict, key)
+    If k = 0 Then Exit Function
+
+    i = k + Len(key)
+    Do While i <= Len(dict)
+        If Mid$(dict, i, 1) <> " " Then Exit Do
+        i = i + 1
+    Loop
+
+    If Mid$(dict, i, 1) = "[" Then
+        stopAt = InStr(i, dict, "]")
+        If stopAt = 0 Then stopAt = i + 200
+        seg = Mid$(dict, i + 1, stopAt - i - 1)
+    Else
+        ' Single reference: "/Contents 2 0 R/CropBox[...]" - PDF puts no space
+        ' before the next key, so cut the segment at the first delimiter.
+        seg = Mid$(dict, i, 20)
+        stopAt = 0
+        For j = 1 To Len(seg)
+            If InStr("/>]", Mid$(seg, j, 1)) > 0 Then
+                stopAt = j
+                Exit For
+            End If
+        Next j
+        If stopAt > 0 Then seg = Left$(seg, stopAt - 1)
+    End If
+
+    Do While InStr(seg, "  ") > 0
+        seg = Replace(seg, "  ", " ")
+    Loop
+
+    parts = Split(Trim$(seg), " ")
+    For i = LBound(parts) To UBound(parts)
+        If parts(i) = "R" And i >= 2 Then
+            If Len(result) > 0 Then result = result & ","
+            result = result & parts(i - 2)
+        End If
+    Next i
+
+    RefList = result
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function DictValue(ByVal dict As String, ByVal key As String) As String
+
+    Dim k As Long, i As Long, depth As Long
+    Dim ch As String
+    Dim s As String
+
+    k = InStr(1, dict, key)
+    If k = 0 Then
+        DictValue = "(absent)"
+        Exit Function
+    End If
+
+    i = k + Len(key)
+    Do While i <= Len(dict)
+        If Mid$(dict, i, 1) <> " " Then Exit Do
+        i = i + 1
+    Loop
+
+    Do While i <= Len(dict)
+        ch = Mid$(dict, i, 1)
+        s = s & ch
+        If ch = "[" Or ch = "<" Then depth = depth + 1
+        If ch = "]" Or ch = ">" Then
+            depth = depth - 1
+            If depth <= 0 Then Exit Do
+        End If
+        If depth = 0 And Len(s) > 1 Then
+            If ch = " " Or ch = "/" Then Exit Do
+        End If
+        If Len(s) > 120 Then Exit Do
+        i = i + 1
+    Loop
+
+    DictValue = Trim$(s)
+
+End Function
+
+
+
+'==============================================================================
+' REPORT 5 - COMPACT ORACLE SCHEMA
+'==============================================================================
+
+Private Sub WriteOracleSchemaHeader(ByVal fileNum As Integer, ByVal pdfPath As String)
+
+    Dim topX() As Double
+    Dim topW() As Double
+    Dim bottomX() As Double
+    Dim bottomW() As Double
+
+    FillOracleTopGrid topX, topW
+    FillOracleBottomGrid bottomX, bottomW
+
+    EmitLine fileNum, "TRADEVERSAND ORACLE PDF SCHEMA V1"
+    EmitLine fileNum, "SOURCE|" & pdfPath
+    EmitLine fileNum, "UNITS|PDF points|origin=bottom-left"
+    EmitLine fileNum, "EXPECTED|MediaBox=0,0,1368,684|orientation=landscape|firstPageMaxTrades=11|continuationPageMaxTrades=12"
+    EmitLine fileNum, "EXPECTED_TOP_COLUMNS|12"
+    EmitLine fileNum, "EXPECTED_TOP_X|" & OracleJoinDoubles(topX, ORACLE_TOP_COLUMN_COUNT)
+    EmitLine fileNum, "EXPECTED_TOP_W|" & OracleJoinDoubles(topW, ORACLE_TOP_COLUMN_COUNT)
+    EmitLine fileNum, "EXPECTED_BOTTOM_COLUMNS|13"
+    EmitLine fileNum, "EXPECTED_BOTTOM_X|" & OracleJoinDoubles(bottomX, ORACLE_BOTTOM_COLUMN_COUNT)
+    EmitLine fileNum, "EXPECTED_BOTTOM_W|" & OracleJoinDoubles(bottomW, ORACLE_BOTTOM_COLUMN_COUNT)
+
+End Sub
+
+Private Function OracleMaxTradesForPage(ByVal pageNo As Long) As Long
+
+    If pageNo = 1 Then
+        OracleMaxTradesForPage = ORACLE_FIRST_PAGE_MAX_TRADES
+    Else
+        OracleMaxTradesForPage = ORACLE_CONTINUATION_PAGE_MAX_TRADES
+    End If
+End Function
+
+Private Function EmitOraclePageSchema(ByVal fileNum As Integer, ByVal pageNo As Long, _
+                                      ByVal objNo As Long, ByVal pageDict As String, _
+                                      ByVal totalPages As Long) As Long
+
+    Dim topX() As Double
+    Dim topW() As Double
+    Dim bottomX() As Double
+    Dim bottomW() As Double
+    Dim topHeaderY As Double
+    Dim bottomHeaderY As Double
+    Dim frameX As Double
+    Dim frameY As Double
+    Dim frameW As Double
+    Dim frameH As Double
+    Dim topTradeY() As Double
+    Dim bottomTradeY() As Double
+    Dim tradeCount As Long
+    Dim dataBaselineCount As Long
+    Dim unpairedRows As Long
+    Dim hRuleCount As Long
+    Dim vRuleCount As Long
+    Dim i As Long
+    Dim pageType As String
+    Dim topLabels As String
+    Dim bottomLabels As String
+    Dim topLabelX As String
+    Dim bottomLabelX As String
+    Dim topGridCheck As String
+    Dim bottomGridCheck As String
+    Dim footerText As String
+    Dim footerX As Double
+    Dim footerY As Double
+    Dim footerFound As Boolean
+    Dim footerExpected As Boolean
+    Dim headerMatch As Boolean
+    Dim gridMatch As Boolean
+    Dim tradePairMatch As Boolean
+    Dim tradeLimitMatch As Boolean
+    Dim footerMatch As Boolean
+    Dim layoutResult As String
+
+    FillOracleTopGrid topX, topW
+    FillOracleBottomGrid bottomX, bottomW
+
+    FindOracleTableFrame frameX, frameY, frameW, frameH
+    topHeaderY = FindOracleTextBaseline("DEPOTNR")
+    bottomHeaderY = FindOracleTextBaseline("TRANSAKTIONSNR")
+
+    If pageNo = 1 Then
+        pageType = "FIRST"
+    Else
+        pageType = "CONTINUATION"
+    End If
+
+    EmitLine fileNum, ""
+    EmitLine fileNum, "PAGE|" & CStr(pageNo) & "|object=" & CStr(objNo) & "|type=" & pageType
+    EmitLine fileNum, "PAGE_DICTIONARY|MediaBox=" & OracleCleanText(DictValue(pageDict, "/MediaBox")) & _
+                           "|Rotate=" & OracleCleanText(DictValue(pageDict, "/Rotate")) & _
+                           "|Fonts=" & OracleCleanText(FontMap(pageDict))
+    EmitLine fileNum, "FRAME|x=" & NumTxt(frameX) & "|y=" & NumTxt(frameY) & _
+                           "|w=" & NumTxt(frameW) & "|h=" & NumTxt(frameH) & _
+                           "|right=" & NumTxt(frameX + frameW) & "|top=" & NumTxt(frameY + frameH)
+    EmitLine fileNum, "IMAGE|" & OracleCleanText(JoinCollection(m_images, " ; "))
+    EmitLine fileNum, "FULL_WIDTH_Y|" & OracleFullWidthYRules()
+
+    topLabels = OracleRowValues(topHeaderY, topX, topW, ORACLE_TOP_COLUMN_COUNT, False)
+    bottomLabels = OracleRowValues(bottomHeaderY, bottomX, bottomW, ORACLE_BOTTOM_COLUMN_COUNT, False)
+    topLabelX = OracleRowAnchors(topHeaderY, topX, topW, ORACLE_TOP_COLUMN_COUNT)
+    bottomLabelX = OracleRowAnchors(bottomHeaderY, bottomX, bottomW, ORACLE_BOTTOM_COLUMN_COUNT)
+
+    EmitLine fileNum, "HEADER_TOP|baseline=" & NumTxt(topHeaderY) & _
+                           "|band=" & OracleFullWidthBand(topHeaderY) & _
+                           "|labels=" & topLabels & "|textX=" & topLabelX
+    EmitLine fileNum, "HEADER_BOTTOM|baseline=" & NumTxt(bottomHeaderY) & _
+                           "|band=" & OracleFullWidthBand(bottomHeaderY) & _
+                           "|labels=" & bottomLabels & "|textX=" & bottomLabelX
+
+    topGridCheck = OracleGridCheck(topX, topW, ORACLE_TOP_COLUMN_COUNT)
+    bottomGridCheck = OracleGridCheck(bottomX, bottomW, ORACLE_BOTTOM_COLUMN_COUNT)
+    EmitLine fileNum, "TOP_GRID_CHECK|" & topGridCheck
+    EmitLine fileNum, "BOTTOM_GRID_CHECK|" & bottomGridCheck
+
+    tradeCount = CollectOracleTradeBaselines(bottomHeaderY, frameY, topTradeY, bottomTradeY)
+    dataBaselineCount = CountOracleDataBaselines(bottomHeaderY, frameY)
+    unpairedRows = dataBaselineCount - (tradeCount * 2)
+    If unpairedRows < 0 Then unpairedRows = 0
+
+    EmitLine fileNum, "TRADES|count=" & CStr(tradeCount) & _
+                           "|topBaselines=" & OracleJoinDoubles(topTradeY, tradeCount) & _
+                           "|bottomBaselines=" & OracleJoinDoubles(bottomTradeY, tradeCount) & _
+                           "|pitches=" & OracleTradePitches(topTradeY, tradeCount) & _
+                           "|dataBaselines=" & CStr(dataBaselineCount) & _
+                           "|unpairedRows=" & CStr(unpairedRows)
+
+    For i = 0 To tradeCount - 1
+        EmitLine fileNum, "TRADE|" & Format$(i + 1, "00") & _
+                               "|topY=" & NumTxt(topTradeY(i)) & _
+                               "|topBand=" & OracleFullWidthBand(topTradeY(i)) & _
+                               "|bottomY=" & NumTxt(bottomTradeY(i)) & _
+                               "|bottomBand=" & OracleFullWidthBand(bottomTradeY(i))
+        EmitLine fileNum, "TOP|" & OracleRowValues(topTradeY(i), topX, topW, ORACLE_TOP_COLUMN_COUNT, True)
+        EmitLine fileNum, "BOTTOM|" & OracleRowValues(bottomTradeY(i), bottomX, bottomW, ORACLE_BOTTOM_COLUMN_COUNT, True)
+    Next i
+
+    footerFound = FindOracleFooter(footerText, footerX, footerY)
+    footerExpected = (pageNo = totalPages)
+
+    If footerFound Then
+        EmitLine fileNum, "FOOTER|x=" & NumTxt(footerX) & "|y=" & NumTxt(footerY) & _
+                               "|text=" & OracleCleanText(footerText)
+    Else
+        EmitLine fileNum, "FOOTER|(none)"
+    End If
+
+    hRuleCount = OracleClusteredRuleCount(False)
+    vRuleCount = OracleClusteredRuleCount(True)
+
+    EmitLine fileNum, "PAGE_FINGERPRINT|textRuns=" & CStr(m_txN) & _
+                           "|segments=" & CStr(m_segN) & _
+                           "|rectangles=" & CStr(m_recN) & _
+                           "|hRules=" & CStr(hRuleCount) & _
+                           "|vRules=" & CStr(vRuleCount) & _
+                           "|fullWidthY=" & OracleFullWidthYRules() & _
+                           "|topHeaderY=" & NumTxt(topHeaderY) & _
+                           "|bottomHeaderY=" & NumTxt(bottomHeaderY) & _
+                           "|trades=" & CStr(tradeCount) & _
+                           "|unpairedRows=" & CStr(unpairedRows) & _
+                           "|footer=" & UCase$(CStr(footerFound))
+
+    headerMatch = (topHeaderY <> 0 And bottomHeaderY <> 0)
+    gridMatch = _
+        InStr(1, topGridCheck, "match=TRUE", vbTextCompare) > 0 And _
+        InStr(1, bottomGridCheck, "match=TRUE", vbTextCompare) > 0
+    tradePairMatch = (unpairedRows = 0)
+    tradeLimitMatch = (tradeCount <= OracleMaxTradesForPage(pageNo))
+    footerMatch = (footerFound = footerExpected)
+
+    If headerMatch And gridMatch And tradePairMatch And tradeLimitMatch And footerMatch Then
+        layoutResult = "PASS"
+    Else
+        layoutResult = "WARN"
+    End If
+
+    EmitLine fileNum, "PAGE_LAYOUT_CHECK|header=" & UCase$(CStr(headerMatch)) & _
+                           "|grid=" & UCase$(CStr(gridMatch)) & _
+                           "|tradePairs=" & UCase$(CStr(tradePairMatch)) & _
+                           "|maxTrades=" & UCase$(CStr(tradeLimitMatch)) & _
+                           "|expectedMaxTrades=" & CStr(OracleMaxTradesForPage(pageNo)) & _
+                           "|footerExpected=" & UCase$(CStr(footerExpected)) & _
+                           "|footerFound=" & UCase$(CStr(footerFound)) & _
+                           "|footerMatch=" & UCase$(CStr(footerMatch)) & _
+                           "|result=" & layoutResult
+
+    If Not headerMatch Then
+        EmitLine fileNum, "WARNING|header baseline not detected"
+    End If
+    If Not gridMatch Then
+        EmitLine fileNum, "WARNING|top or bottom Oracle grid does not match expected coordinates"
+    End If
+    If Not tradePairMatch Then
+        EmitLine fileNum, "WARNING|unpaired data baseline detected - possible split or malformed two-row transaction"
+    End If
+    If Not tradeLimitMatch Then
+        EmitLine fileNum, "WARNING|trade count exceeds expected maximum " & CStr(OracleMaxTradesForPage(pageNo))
+    End If
+    If Not footerMatch Then
+        EmitLine fileNum, "WARNING|footer placement does not match last-page-only Oracle convention"
+    End If
+
+    EmitOraclePageSchema = tradeCount
+
+End Function
+
+Private Sub FillOracleTopGrid(ByRef x() As Double, ByRef w() As Double)
+
+    ReDim x(0 To ORACLE_TOP_COLUMN_COUNT - 1)
+    ReDim w(0 To ORACLE_TOP_COLUMN_COUNT - 1)
+
+    x(0) = 40.52: w(0) = 85.48
+    x(1) = 126#: w(1) = 202.52
+    x(2) = 328.52: w(2) = 85.48
+    x(3) = 414#: w(3) = 90#
+    x(4) = 504#: w(4) = 49.52
+    x(5) = 553.52: w(5) = 40.48
+    x(6) = 594#: w(6) = 81#
+    x(7) = 675#: w(7) = 216#
+    x(8) = 891#: w(8) = 135#
+    x(9) = 1026#: w(9) = 27#
+    x(10) = 1053#: w(10) = 126#
+    x(11) = 1179#: w(11) = 144.04
+
+End Sub
+
+Private Sub FillOracleBottomGrid(ByRef x() As Double, ByRef w() As Double)
+
+    ReDim x(0 To ORACLE_BOTTOM_COLUMN_COUNT - 1)
+    ReDim w(0 To ORACLE_BOTTOM_COLUMN_COUNT - 1)
+
+    x(0) = 40.52: w(0) = 85.48
+    x(1) = 126#: w(1) = 157.52
+    x(2) = 283.52: w(2) = 45#
+    x(3) = 328.52: w(3) = 139.48
+    x(4) = 468#: w(4) = 36#
+    x(5) = 504#: w(5) = 135#
+    x(6) = 639#: w(6) = 36#
+    x(7) = 675#: w(7) = 180#
+    x(8) = 855#: w(8) = 36#
+    x(9) = 891#: w(9) = 162#
+    x(10) = 1053#: w(10) = 126#
+    x(11) = 1179#: w(11) = 27#
+    x(12) = 1206#: w(12) = 117.04
+
+End Sub
+
+Private Sub FindOracleTableFrame(ByRef x As Double, ByRef y As Double, _
+                                 ByRef w As Double, ByRef h As Double)
+
+    Dim i As Long
+    Dim area As Double
+    Dim bestArea As Double
+    Dim bestIndex As Long
+
+    bestArea = -1#
+    bestIndex = -1
+
+    For i = 0 To m_recN - 1
+        area = Abs(m_recW(i)) * Abs(m_recH(i))
+        If area > bestArea Then
+            bestArea = area
+            bestIndex = i
+        End If
+    Next i
+
+    If bestIndex >= 0 Then
+        x = m_recX(bestIndex)
+        y = m_recY(bestIndex)
+        w = m_recW(bestIndex)
+        h = m_recH(bestIndex)
+    End If
+
+End Sub
+
+Private Function FindOracleTextBaseline(ByVal normalizedNeedle As String) As Double
+
+    Dim i As Long
+    Dim normalizedText As String
+
+    For i = 0 To m_txN - 1
+        normalizedText = NormalizeOracleLabel(m_txStr(i))
+        If normalizedText = normalizedNeedle Then
+            FindOracleTextBaseline = m_txY(i)
+            Exit Function
+        End If
+    Next i
+
+End Function
+
+Private Function CollectOracleTradeBaselines(ByVal bottomHeaderY As Double, _
+                                             ByVal frameBottomY As Double, _
+                                             ByRef topY() As Double, _
+                                             ByRef bottomY() As Double) As Long
+
+    Dim allY() As Double
+    Dim dataY() As Double
+    Dim allCount As Long
+    Dim dataCount As Long
+    Dim i As Long
+    Dim stepY As Double
+    Dim tradeCount As Long
+
+    allCount = ClusterValues(m_txY, m_txN, allY, False)
+    ReDim dataY(0 To allCount)
+
+    For i = 0 To allCount - 1
+        If allY(i) < bottomHeaderY - TOL And allY(i) > frameBottomY + TOL Then
+            If HasOracleDataText(allY(i)) Then
+                dataY(dataCount) = allY(i)
+                dataCount = dataCount + 1
+            End If
+        End If
+    Next i
+
+    ReDim topY(0 To dataCount)
+    ReDim bottomY(0 To dataCount)
+
+    i = 0
+    Do While i + 1 < dataCount
+        stepY = dataY(i) - dataY(i + 1)
+        If stepY >= ORACLE_MIN_DATA_ROW_STEP And stepY <= ORACLE_MAX_DATA_ROW_STEP Then
+            topY(tradeCount) = dataY(i)
+            bottomY(tradeCount) = dataY(i + 1)
+            tradeCount = tradeCount + 1
+            i = i + 2
+        Else
+            i = i + 1
+        End If
+    Loop
+
+    If tradeCount = 0 Then
+        ReDim topY(0 To 0)
+        ReDim bottomY(0 To 0)
+    Else
+        ReDim Preserve topY(0 To tradeCount - 1)
+        ReDim Preserve bottomY(0 To tradeCount - 1)
+    End If
+
+    CollectOracleTradeBaselines = tradeCount
+
+End Function
+
+Private Function HasOracleDataText(ByVal baselineY As Double) As Boolean
+
+    Dim i As Long
+
+    For i = 0 To m_txN - 1
+        If Abs(m_txY(i) - baselineY) <= TOL Then
+            If m_txX(i) >= ORACLE_TABLE_LEFT_X - TOL And _
+               m_txX(i) <= ORACLE_TABLE_RIGHT_X + TOL Then
+                If UCase$(m_txFont(i)) = "/F1" Then
+                    HasOracleDataText = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+
+End Function
+
+Private Function OracleRowValues(ByVal baselineY As Double, ByRef x() As Double, _
+                                 ByRef w() As Double, ByVal count As Long, _
+                                 ByVal includeAnchor As Boolean) As String
+
+    Dim i As Long
+    Dim cellText As String
+    Dim anchorX As Double
+    Dim result As String
+
+    For i = 0 To count - 1
+        cellText = OracleCellText(baselineY, x(i), w(i), anchorX)
+        If Len(cellText) = 0 Then cellText = "-"
+
+        If includeAnchor And anchorX >= 0 Then
+            result = result & NumTxt(anchorX) & ":" & OracleCleanText(cellText)
+        Else
+            result = result & OracleCleanText(cellText)
+        End If
+
+        If i < count - 1 Then result = result & "|"
+    Next i
+
+    OracleRowValues = result
+
+End Function
+
+Private Function OracleRowAnchors(ByVal baselineY As Double, ByRef x() As Double, _
+                                  ByRef w() As Double, ByVal count As Long) As String
+
+    Dim i As Long
+    Dim anchorX As Double
+    Dim cellText As String
+    Dim result As String
+
+    For i = 0 To count - 1
+        cellText = OracleCellText(baselineY, x(i), w(i), anchorX)
+        If anchorX < 0 Then
+            result = result & "-"
+        Else
+            result = result & NumTxt(anchorX)
+        End If
+        If i < count - 1 Then result = result & "|"
+    Next i
+
+    OracleRowAnchors = result
+
+End Function
+
+Private Function OracleCellText(ByVal baselineY As Double, ByVal cellX As Double, _
+                                ByVal cellW As Double, ByRef firstAnchorX As Double) As String
+
+    Dim idx() As Long
+    Dim count As Long
+    Dim i As Long
+    Dim j As Long
+    Dim swapIndex As Long
+    Dim rightX As Double
+    Dim result As String
+
+    firstAnchorX = -1#
+    rightX = cellX + cellW
+    ReDim idx(0 To m_txN)
+
+    For i = 0 To m_txN - 1
+        If Abs(m_txY(i) - baselineY) <= TOL Then
+            If m_txX(i) >= cellX - TOL And m_txX(i) < rightX + TOL Then
+                idx(count) = i
+                count = count + 1
+            End If
+        End If
+    Next i
+
+    For i = 0 To count - 2
+        For j = i + 1 To count - 1
+            If m_txX(idx(j)) < m_txX(idx(i)) Then
+                swapIndex = idx(i)
+                idx(i) = idx(j)
+                idx(j) = swapIndex
+            End If
+        Next j
+    Next i
+
+    For i = 0 To count - 1
+        If firstAnchorX < 0 Then firstAnchorX = m_txX(idx(i))
+        If Len(result) > 0 Then result = result & " ~ "
+        result = result & m_txStr(idx(i))
+    Next i
+
+    OracleCellText = result
+
+End Function
+
+Private Function OracleGridCheck(ByRef x() As Double, ByRef w() As Double, _
+                                 ByVal count As Long) As String
+
+    Dim rules() As Double
+    Dim ruleCount As Long
+    Dim i As Long
+    Dim expectedX As Double
+    Dim nearestX As Double
+    Dim deltaX As Double
+    Dim result As String
+    Dim allMatch As Boolean
+
+    ruleCount = ClusterValues(m_vRuleX, m_vRuleN, rules, True)
+    allMatch = True
+
+    For i = 0 To count
+        If i < count Then
+            expectedX = x(i)
+        Else
+            expectedX = x(count - 1) + w(count - 1)
+        End If
+
+        nearestX = NearestOracleRule(expectedX, rules, ruleCount)
+        deltaX = nearestX - expectedX
+        If Abs(deltaX) > ORACLE_GRID_MATCH_TOLERANCE Then allMatch = False
+
+        If Len(result) > 0 Then result = result & ";"
+        result = result & NumTxt(expectedX) & ">" & NumTxt(nearestX) & "(" & NumTxt(deltaX) & ")"
+    Next i
+
+    OracleGridCheck = "match=" & UCase$(CStr(allMatch)) & "|rules=" & result
+
+End Function
+
+Private Function NearestOracleRule(ByVal expectedX As Double, ByRef rules() As Double, _
+                                   ByVal ruleCount As Long) As Double
+
+    Dim i As Long
+    Dim bestDistance As Double
+    Dim distance As Double
+
+    bestDistance = 1E+30
+    NearestOracleRule = expectedX
+
+    For i = 0 To ruleCount - 1
+        distance = Abs(rules(i) - expectedX)
+        If distance < bestDistance Then
+            bestDistance = distance
+            NearestOracleRule = rules(i)
+        End If
+    Next i
+
+End Function
+
+Private Function OracleFullWidthYRules() As String
+
+    Dim rawY() As Double
+    Dim clusteredY() As Double
+    Dim rawCount As Long
+    Dim clusteredCount As Long
+    Dim i As Long
+
+    ReDim rawY(0 To m_segN * 2 + m_recN * 2 + 10)
+
+    For i = 0 To m_segN - 1
+        If Abs(m_segY1(i) - m_segY2(i)) <= TOL Then
+            If Abs(m_segX2(i) - m_segX1(i)) >= 1200# Then
+                rawY(rawCount) = m_segY1(i)
+                rawCount = rawCount + 1
+            End If
+        End If
+    Next i
+
+    For i = 0 To m_recN - 1
+        If Abs(m_recW(i)) >= 1200# Then
+            rawY(rawCount) = m_recY(i)
+            rawCount = rawCount + 1
+            rawY(rawCount) = m_recY(i) + m_recH(i)
+            rawCount = rawCount + 1
+        End If
+    Next i
+
+    clusteredCount = ClusterValues(rawY, rawCount, clusteredY, False)
+    OracleFullWidthYRules = OracleJoinDoubles(clusteredY, clusteredCount)
+
+End Function
+
+Private Function OracleFullWidthBand(ByVal baselineY As Double) As String
+
+    Dim rawY() As Double
+    Dim clusteredY() As Double
+    Dim rawCount As Long
+    Dim clusteredCount As Long
+    Dim i As Long
+    Dim topY As Double
+    Dim bottomY As Double
+
+    ReDim rawY(0 To m_segN * 2 + m_recN * 2 + 10)
+
+    For i = 0 To m_segN - 1
+        If Abs(m_segY1(i) - m_segY2(i)) <= TOL Then
+            If Abs(m_segX2(i) - m_segX1(i)) >= 1200# Then
+                rawY(rawCount) = m_segY1(i)
+                rawCount = rawCount + 1
+            End If
+        End If
+    Next i
+
+    For i = 0 To m_recN - 1
+        If Abs(m_recW(i)) >= 1200# Then
+            rawY(rawCount) = m_recY(i)
+            rawCount = rawCount + 1
+            rawY(rawCount) = m_recY(i) + m_recH(i)
+            rawCount = rawCount + 1
+        End If
+    Next i
+
+    clusteredCount = ClusterValues(rawY, rawCount, clusteredY, False)
+
+    For i = 0 To clusteredCount - 1
+        If clusteredY(i) > baselineY + TOL Then
+            If topY = 0 Or clusteredY(i) < topY Then topY = clusteredY(i)
+        ElseIf clusteredY(i) < baselineY - TOL Then
+            If bottomY = 0 Or clusteredY(i) > bottomY Then bottomY = clusteredY(i)
+        End If
+    Next i
+
+    If topY = 0 Or bottomY = 0 Then
+        OracleFullWidthBand = "(not detected)"
+    Else
+        OracleFullWidthBand = NumTxt(bottomY) & ".." & NumTxt(topY) & _
+                              ",h=" & NumTxt(topY - bottomY)
+    End If
+
+End Function
+
+Private Function OracleTradePitches(ByRef topY() As Double, ByVal count As Long) As String
+
+    Dim i As Long
+    Dim result As String
+
+    If count <= 1 Then
+        OracleTradePitches = "(none)"
+        Exit Function
+    End If
+
+    For i = 0 To count - 2
+        result = result & NumTxt(topY(i) - topY(i + 1))
+        If i < count - 2 Then result = result & "|"
+    Next i
+
+    OracleTradePitches = result
+
+End Function
+
+Private Function FindOracleFooter(ByRef footerText As String, ByRef footerX As Double, _
+                                  ByRef footerY As Double) As Boolean
+
+    Dim i As Long
+    Dim normalizedText As String
+
+    For i = 0 To m_txN - 1
+        normalizedText = UCase$(m_txStr(i))
+        If InStr(1, normalizedText, "DIESE ABRECHNUNG") > 0 Then
+            footerText = m_txStr(i)
+            footerX = m_txX(i)
+            footerY = m_txY(i)
+            FindOracleFooter = True
+            Exit Function
+        End If
+    Next i
+
+End Function
+
+Private Function NormalizeOracleLabel(ByVal value As String) As String
+
+    Dim i As Long
+    Dim ch As String
+    Dim result As String
+
+    value = UCase$(Trim$(value))
+
+    For i = 1 To Len(value)
+        ch = Mid$(value, i, 1)
+        If (ch >= "A" And ch <= "Z") Or (ch >= "0" And ch <= "9") Then
+            result = result & ch
+        End If
+    Next i
+
+    NormalizeOracleLabel = result
+
+End Function
+
+Private Function OracleCleanText(ByVal value As String) As String
+
+    value = Replace(value, vbCr, " ")
+    value = Replace(value, vbLf, " ")
+    value = Replace(value, "|", "/")
+    value = Replace(value, "~", "-")
+
+    Do While InStr(value, "  ") > 0
+        value = Replace(value, "  ", " ")
+    Loop
+
+    OracleCleanText = Trim$(value)
+
+End Function
+
+Private Function OracleJoinDoubles(ByRef values() As Double, ByVal count As Long) As String
+
+    Dim i As Long
+    Dim result As String
+
+    If count <= 0 Then
+        OracleJoinDoubles = "(none)"
+        Exit Function
+    End If
+
+    For i = 0 To count - 1
+        result = result & NumTxt(values(i))
+        If i < count - 1 Then result = result & "|"
+    Next i
+
+    OracleJoinDoubles = result
+
+End Function
+
+
+'------------------------------------------------------------------------------
+' Counts text baselines in the Oracle data area. Used to detect split/odd rows
+' that CollectOracleTradeBaselines cannot pair into normal two-row trades.
+'------------------------------------------------------------------------------
+Private Function CountOracleDataBaselines(ByVal bottomHeaderY As Double, _
+                                          ByVal frameBottomY As Double) As Long
+
+    Dim allY() As Double
+    Dim allCount As Long
+    Dim i As Long
+
+    allCount = ClusterValues(m_txY, m_txN, allY, False)
+
+    For i = 0 To allCount - 1
+        If allY(i) < bottomHeaderY - TOL And allY(i) > frameBottomY + TOL Then
+            If HasOracleDataText(allY(i)) Then
+                CountOracleDataBaselines = CountOracleDataBaselines + 1
+            End If
+        End If
+    Next i
+
+End Function
+
+'------------------------------------------------------------------------------
+' Returns the number of distinct clustered horizontal or vertical grid rules.
+'------------------------------------------------------------------------------
+Private Function OracleClusteredRuleCount(ByVal verticalRules As Boolean) As Long
+
+    Dim values() As Double
+
+    If verticalRules Then
+        OracleClusteredRuleCount = ClusterValues(m_vRuleX, m_vRuleN, values, True)
+    Else
+        OracleClusteredRuleCount = ClusterValues(m_hRuleY, m_hRuleN, values, False)
+    End If
+
+End Function
+
+'==============================================================================
+' DEFLATE DECODER
+'==============================================================================
+
+Public Function InflateStream(ByRef srcData() As Byte, ByVal fromIdx As Long, _
+                              ByVal toIdx As Long, ByRef destData() As Byte) As Long
+
+    Dim isLast As Long, blockType As Long
+    Dim litHuff As tHuffman, distHuff As tHuffman
+    Dim i As Long
+
+    InitTables
+
+    m_in = srcData
+    m_inPos = fromIdx
+    m_inEnd = toIdx
+    m_bitBuf = 0
+    m_bitCnt = 0
+    m_outCap = 65536
+    ReDim m_out(0 To m_outCap - 1)
+    m_outLen = 0
+
+    Do
+        isLast = GetBits(1)
+        blockType = GetBits(2)
+
+        Select Case blockType
+            Case 0
+                InflateStored
+            Case 1
+                BuildFixedTables litHuff, distHuff
+                InflateCodes litHuff, distHuff
+            Case 2
+                BuildDynamicTables litHuff, distHuff
+                InflateCodes litHuff, distHuff
+            Case Else
+                Err.Raise ERR_BASE + 1, "InflateStream", "Invalid DEFLATE block type"
+        End Select
+    Loop While isLast = 0
+
+    If m_outLen = 0 Then
+        ReDim destData(0 To 0)
+    Else
+        ReDim destData(0 To m_outLen - 1)
+        For i = 0 To m_outLen - 1
+            destData(i) = m_out(i)
+        Next i
+    End If
+
+    InflateStream = m_outLen
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function TryInflate(ByRef srcData() As Byte, ByVal fromIdx As Long, _
+                            ByVal toIdx As Long, ByRef destData() As Byte, _
+                            ByRef outLen As Long, ByRef errText As String) As Boolean
+
+    On Error GoTo ErrHandler
+
+    errText = vbNullString
+    outLen = InflateStream(srcData, fromIdx, toIdx, destData)
+    TryInflate = True
+    Exit Function
+
+ErrHandler:
+    errText = Err.Description
+    outLen = 0
+    TryInflate = False
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Sub InflateStored()
+
+    Dim blockLen As Long, i As Long
+
+    m_bitBuf = 0
+    m_bitCnt = 0
+
+    If m_inPos + 3 > m_inEnd Then
+        Err.Raise ERR_BASE + 2, "InflateStored", "Truncated stored block"
+    End If
+
+    blockLen = CLng(m_in(m_inPos)) + CLng(m_in(m_inPos + 1)) * 256
+    m_inPos = m_inPos + 4
+
+    For i = 1 To blockLen
+        If m_inPos > m_inEnd Then
+            Err.Raise ERR_BASE + 3, "InflateStored", "Stored block runs past end of data"
+        End If
+        OutByte m_in(m_inPos)
+        m_inPos = m_inPos + 1
+    Next i
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub InflateCodes(ByRef litHuff As tHuffman, ByRef distHuff As tHuffman)
+
+    Dim symbol As Long, matchLen As Long, dist As Long, i As Long
+
+    Do
+        symbol = HuffDecode(litHuff)
+
+        If symbol < 256 Then
+            OutByte CByte(symbol)
+
+        ElseIf symbol = 256 Then
+            Exit Do
+
+        Else
+            symbol = symbol - 257
+            If symbol >= 29 Then
+                Err.Raise ERR_BASE + 4, "InflateCodes", "Invalid length code"
+            End If
+            matchLen = m_lenBase(symbol) + GetBits(m_lenExtra(symbol))
+
+            symbol = HuffDecode(distHuff)
+            If symbol > 29 Then
+                Err.Raise ERR_BASE + 5, "InflateCodes", "Invalid distance code"
+            End If
+            dist = m_distBase(symbol) + GetBits(m_distExtra(symbol))
+            If dist > m_outLen Then
+                Err.Raise ERR_BASE + 6, "InflateCodes", "Distance points before start of output"
+            End If
+
+            For i = 1 To matchLen
+                OutByte m_out(m_outLen - dist)           ' overlapping copy is intentional
+            Next i
+        End If
+    Loop
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub BuildFixedTables(ByRef litHuff As tHuffman, ByRef distHuff As tHuffman)
+
+    Dim lengths(0 To FIXED_LIT - 1) As Long
+    Dim distLengths(0 To MAX_DIST_CODES - 1) As Long
+    Dim i As Long
+
+    For i = 0 To 143:   lengths(i) = 8: Next i
+    For i = 144 To 255: lengths(i) = 9: Next i
+    For i = 256 To 279: lengths(i) = 7: Next i
+    For i = 280 To 287: lengths(i) = 8: Next i
+    HuffConstruct litHuff, lengths, FIXED_LIT
+
+    For i = 0 To MAX_DIST_CODES - 1
+        distLengths(i) = 5
+    Next i
+    HuffConstruct distHuff, distLengths, MAX_DIST_CODES
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub BuildDynamicTables(ByRef litHuff As tHuffman, ByRef distHuff As tHuffman)
+
+    Dim lengths(0 To MAX_CODES - 1) As Long
+    Dim distLengths(0 To MAX_DIST_CODES - 1) As Long
+    Dim lenHuff As tHuffman
+    Dim nLen As Long, nDist As Long, nCode As Long
+    Dim idx As Long, symbol As Long, repeat As Long, prevLen As Long
+
+    nLen = GetBits(5) + 257
+    nDist = GetBits(5) + 1
+    nCode = GetBits(4) + 4
+
+    If nLen > MAX_LIT_CODES Or nDist > MAX_DIST_CODES Then
+        Err.Raise ERR_BASE + 7, "BuildDynamicTables", "Too many length or distance codes"
+    End If
+
+    For idx = 0 To nCode - 1
+        lengths(m_clOrder(idx)) = GetBits(3)
+    Next idx
+    For idx = nCode To 18
+        lengths(m_clOrder(idx)) = 0
+    Next idx
+    HuffConstruct lenHuff, lengths, 19
+
+    idx = 0
+    Do While idx < nLen + nDist
+        symbol = HuffDecode(lenHuff)
+
+        If symbol < 16 Then
+            lengths(idx) = symbol
+            idx = idx + 1
+        Else
+            prevLen = 0
+            If symbol = 16 Then
+                If idx = 0 Then
+                    Err.Raise ERR_BASE + 8, "BuildDynamicTables", "No previous code length"
+                End If
+                prevLen = lengths(idx - 1)
+                repeat = 3 + GetBits(2)
+            ElseIf symbol = 17 Then
+                repeat = 3 + GetBits(3)
+            Else
+                repeat = 11 + GetBits(7)
+            End If
+
+            If idx + repeat > nLen + nDist Then
+                Err.Raise ERR_BASE + 9, "BuildDynamicTables", "Too many code lengths"
+            End If
+            Do While repeat > 0
+                lengths(idx) = prevLen
+                idx = idx + 1
+                repeat = repeat - 1
+            Loop
+        End If
+    Loop
+
+    HuffConstruct litHuff, lengths, nLen
+
+    For idx = 0 To nDist - 1
+        distLengths(idx) = lengths(nLen + idx)
+    Next idx
+    HuffConstruct distHuff, distLengths, nDist
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub HuffConstruct(ByRef h As tHuffman, ByRef lengths() As Long, ByVal n As Long)
+
+    Dim offs(0 To MAX_BITS) As Long
+    Dim symbol As Long, bitLen As Long, leftCodes As Long
+
+    For bitLen = 0 To MAX_BITS
+        h.Cnt(bitLen) = 0
+    Next bitLen
+
+    For symbol = 0 To n - 1
+        h.Cnt(lengths(symbol)) = h.Cnt(lengths(symbol)) + 1
+    Next symbol
+
+    leftCodes = 1
+    For bitLen = 1 To MAX_BITS
+        leftCodes = leftCodes * 2 - h.Cnt(bitLen)
+        If leftCodes < 0 Then
+            Err.Raise ERR_BASE + 10, "HuffConstruct", "Over-subscribed Huffman code set"
+        End If
+    Next bitLen
+
+    offs(1) = 0
+    For bitLen = 1 To MAX_BITS - 1
+        offs(bitLen + 1) = offs(bitLen) + h.Cnt(bitLen)
+    Next bitLen
+
+    For symbol = 0 To n - 1
+        If lengths(symbol) <> 0 Then
+            h.Sym(offs(lengths(symbol))) = symbol
+            offs(lengths(symbol)) = offs(lengths(symbol)) + 1
+        End If
+    Next symbol
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Function HuffDecode(ByRef h As tHuffman) As Long
+
+    Dim code As Long, first As Long, index As Long
+    Dim count As Long, bitLen As Long
+
+    For bitLen = 1 To MAX_BITS
+        code = code Or GetBits(1)
+        count = h.Cnt(bitLen)
+        If code - first < count Then
+            HuffDecode = h.Sym(index + (code - first))
+            Exit Function
+        End If
+        index = index + count
+        first = (first + count) * 2
+        code = code * 2
+    Next bitLen
+
+    Err.Raise ERR_BASE + 11, "HuffDecode", "Invalid Huffman code"
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function GetBits(ByVal need As Long) As Long
+
+    Dim value As Long
+
+    Do While m_bitCnt < need
+        If m_inPos > m_inEnd Then
+            Err.Raise ERR_BASE + 12, "GetBits", "Ran out of compressed data"
+        End If
+        m_bitBuf = m_bitBuf Or (CLng(m_in(m_inPos)) * m_pow2(m_bitCnt))
+        m_inPos = m_inPos + 1
+        m_bitCnt = m_bitCnt + 8
+    Loop
+
+    value = m_bitBuf And (m_pow2(need) - 1)
+    m_bitBuf = m_bitBuf \ m_pow2(need)
+    m_bitCnt = m_bitCnt - need
+    GetBits = value
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Sub OutByte(ByVal b As Byte)
+
+    If m_outLen >= m_outCap Then
+        m_outCap = m_outCap * 2
+        ReDim Preserve m_out(0 To m_outCap - 1)
+    End If
+    m_out(m_outLen) = b
+    m_outLen = m_outLen + 1
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub InitTables()
+
+    Dim v() As String
+    Dim i As Long
+
+    If m_tablesReady Then Exit Sub
+
+    m_pow2(0) = 1
+    For i = 1 To 30
+        m_pow2(i) = m_pow2(i - 1) * 2
+    Next i
+
+    v = Split("3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258", ",")
+    For i = 0 To 28
+        m_lenBase(i) = CLng(v(i))
+    Next i
+
+    v = Split("0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0", ",")
+    For i = 0 To 28
+        m_lenExtra(i) = CLng(v(i))
+    Next i
+
+    v = Split("1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769," & _
+              "1025,1537,2049,3073,4097,6145,8193,12289,16385,24577", ",")
+    For i = 0 To 29
+        m_distBase(i) = CLng(v(i))
+    Next i
+
+    v = Split("0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13", ",")
+    For i = 0 To 29
+        m_distExtra(i) = CLng(v(i))
+    Next i
+
+    v = Split("16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15", ",")
+    For i = 0 To 18
+        m_clOrder(i) = CLng(v(i))
+    Next i
+
+    m_tablesReady = True
+
+End Sub
+
+
+'==============================================================================
+' CLUSTERING AND COMPRESSION
+'==============================================================================
+
+Private Function ClusterValues(ByRef src() As Double, ByVal n As Long, _
+                               ByRef result() As Double, ByVal ascending As Boolean) As Long
+
+    Dim tmp() As Double
+    Dim i As Long, k As Long
+    Dim swap As Double
+
+    If n <= 0 Then
+        ReDim result(0 To 0)
+        Exit Function
+    End If
+
+    ReDim tmp(0 To n - 1)
+    For i = 0 To n - 1
+        tmp(i) = src(i)
+    Next i
+
+    QuickSortD tmp, 0, n - 1
+
+    ReDim result(0 To n - 1)
+    k = 0
+    result(0) = tmp(0)
+    For i = 1 To n - 1
+        If tmp(i) - result(k) > TOL Then
+            k = k + 1
+            result(k) = tmp(i)
+        End If
+    Next i
+    k = k + 1
+
+    If Not ascending Then
+        For i = 0 To k \ 2 - 1
+            swap = result(i)
+            result(i) = result(k - 1 - i)
+            result(k - 1 - i) = swap
+        Next i
+    End If
+
+    ClusterValues = k
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Sub QuickSortD(ByRef arr() As Double, ByVal lo As Long, ByVal hi As Long)
+
+    Dim i As Long, j As Long
+    Dim pivot As Double, swap As Double
+
+    If lo >= hi Then Exit Sub
+
+    i = lo: j = hi
+    pivot = arr((lo + hi) \ 2)
+
+    Do While i <= j
+        Do While arr(i) < pivot
+            i = i + 1
+        Loop
+        Do While arr(j) > pivot
+            j = j - 1
+        Loop
+        If i <= j Then
+            swap = arr(i): arr(i) = arr(j): arr(j) = swap
+            i = i + 1: j = j - 1
+        End If
+    Loop
+
+    If lo < j Then QuickSortD arr, lo, j
+    If i < hi Then QuickSortD arr, i, hi
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Function Diffs(ByRef arr() As Double, ByVal n As Long) As Double()
+
+    Dim d() As Double
+    Dim i As Long
+
+    If n < 2 Then
+        ReDim d(0 To 0)
+        Diffs = d
+        Exit Function
+    End If
+
+    ReDim d(0 To n - 2)
+    For i = 0 To n - 2
+        d(i) = Abs(arr(i + 1) - arr(i))
+    Next i
+
+    Diffs = d
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Function RunLength(ByRef arr() As Double, ByVal n As Long) As String
+
+    Dim i As Long, runLen As Long
+    Dim cur As Double
+    Dim s As String
+
+    If n <= 0 Then
+        RunLength = "(none)"
+        Exit Function
+    End If
+
+    cur = arr(0): runLen = 1
+    For i = 1 To n - 1
+        If Abs(arr(i) - cur) <= 0.05 Then
+            runLen = runLen + 1
+        Else
+            s = s & NumTxt(cur) & IIf(runLen > 1, " x" & CStr(runLen), "") & " ; "
+            cur = arr(i): runLen = 1
+        End If
+    Next i
+    s = s & NumTxt(cur) & IIf(runLen > 1, " x" & CStr(runLen), "")
+
+    RunLength = s
+
+End Function
+
+
+'==============================================================================
+' HELPERS
+'==============================================================================
+
+Private Function JoinDoubles(ByRef arr() As Double, ByVal n As Long, ByVal sep As String) As String
+
+    Dim i As Long
+    Dim s As String
+
+    If n <= 0 Then
+        JoinDoubles = "(none)"
+        Exit Function
+    End If
+
+    For i = 0 To n - 1
+        s = s & NumTxt(arr(i))
+        If i < n - 1 Then s = s & sep
+        If (i + 1) Mod 12 = 0 Then s = s & vbCrLf & "  "
+    Next i
+
+    JoinDoubles = s
+
+End Function
+
+Private Function JoinCollection(ByRef col As Collection, ByVal sep As String) As String
+
+    Dim i As Long
+    Dim s As String
+
+    If col Is Nothing Then
+        JoinCollection = "(none)"
+        Exit Function
+    End If
+    If col.count = 0 Then
+        JoinCollection = "(none)"
+        Exit Function
+    End If
+
+    For i = 1 To col.count
+        s = s & col.Item(i)
+        If i < col.count Then s = s & sep
+    Next i
+
+    JoinCollection = s
+
+End Function
+
+Private Sub AddUniqueText(ByRef col As Collection, ByVal v As String)
+
+    On Error Resume Next
+    col.Add v, "k" & v
+    On Error GoTo 0
+
+End Sub
+
+Private Function NumTxt(ByVal v As Double) As String
+
+    NumTxt = Replace(Format$(v, "0.##"), ",", ".")
+
+End Function
+
+Private Function PadRight(ByVal s As String, ByVal width As Long) As String
+
+    If Len(s) >= width Then
+        PadRight = s & " "
+    Else
+        PadRight = s & Space$(width - Len(s))
+    End If
+
+End Function
+
+Private Function FileBaseName(ByVal filePath As String) As String
+
+    Dim s As String
+    Dim k As Long
+
+    s = Mid$(filePath, InStrRev(filePath, "\") + 1)
+    k = InStrRev(s, ".")
+    If k > 1 Then s = Left$(s, k - 1)
+
+    FileBaseName = s
+
+End Function
+
+Private Function OpenNew(ByVal filePath As String) As Integer
+
+    Dim fileNum As Integer
+
+    If Len(Dir$(filePath)) > 0 Then Kill filePath
+    fileNum = FreeFile
+    Open filePath For Binary Access Write As #fileNum
+    OpenNew = fileNum
+
+End Function
+
+Private Sub EmitLine(ByVal fileNum As Integer, ByVal s As String)
+
+    Dim b() As Byte
+    b = StrConv(s & vbCrLf, vbFromUnicode)
+    Put #fileNum, , b
+
+End Sub
+
+Private Sub WriteRaw(ByVal fileNum As Integer, ByRef b() As Byte, ByVal count As Long)
+
+    Dim chunk() As Byte
+    Dim i As Long
+
+    If count <= 0 Then Exit Sub
+    ReDim chunk(0 To count - 1)
+    For i = 0 To count - 1
+        chunk(i) = b(i)
+    Next i
+    Put #fileNum, , chunk
+
+End Sub
+
+Private Function ReadBytes(ByVal filePath As String) As Byte()
+
+    Dim fileNum As Integer
+    Dim size As Long
+    Dim buf() As Byte
+
+    If Len(Dir$(filePath)) = 0 Then
+        Err.Raise ERR_BASE + 20, "ReadBytes", "File not found: " & filePath
+    End If
+
+    fileNum = FreeFile
+    Open filePath For Binary Access Read As #fileNum
+    size = LOF(fileNum)
+    If size = 0 Then
+        Close #fileNum
+        Err.Raise ERR_BASE + 21, "ReadBytes", "File is empty: " & filePath
+    End If
+    ReDim buf(0 To size - 1)
+    Get #fileNum, 1, buf
+    Close #fileNum
+
+    ReadBytes = buf
+
+End Function
+
+Private Function BytesText(ByRef b() As Byte, ByVal fromIdx As Long, ByVal toIdx As Long) As String
+
+    Dim tmp() As Byte
+    Dim i As Long, n As Long
+
+    If fromIdx < 0 Then fromIdx = 0
+    If toIdx > UBound(b) Then toIdx = UBound(b)
+    If toIdx < fromIdx Then Exit Function
+
+    n = toIdx - fromIdx + 1
+    ReDim tmp(0 To n - 1)
+    For i = 0 To n - 1
+        tmp(i) = b(fromIdx + i)
+    Next i
+
+    BytesText = StrConv(tmp, vbUnicode)
+
+End Function
+
+Private Function FindBytes(ByRef data() As Byte, ByVal startAt As Long, ByVal pattern As String) As Long
+
+    Dim pat() As Byte
+    Dim patLen As Long
+    Dim i As Long, j As Long
+
+    pat = StrConv(pattern, vbFromUnicode)
+    patLen = UBound(pat) - LBound(pat) + 1
+    If startAt < 0 Then startAt = 0
+
+    For i = startAt To UBound(data) - patLen + 1
+        If data(i) = pat(0) Then
+            For j = 1 To patLen - 1
+                If data(i + j) <> pat(j) Then Exit For
+            Next j
+            If j = patLen Then
+                FindBytes = i
+                Exit Function
+            End If
+        End If
+    Next i
+
+    FindBytes = -1
+
+End Function
+
+
+'==============================================================================
+' REPORT 4 - HUMAN READABLE CELL MAP
+' Oracle Reports draws every table cell as a rectangle, so the rectangles ARE
+' the grid. Cells are grouped into horizontal bands, each band is printed once
+' with its column widths and the text sitting inside, and identical consecutive
+' bands are collapsed into "repeats xN, pitch ...".
+'==============================================================================
+
+Private Sub EmitCellMap(ByVal fileNum As Integer, ByVal pageNo As Long, _
+                        ByVal objNo As Long, ByVal pageDict As String)
+
+    Dim bandY() As Double
+    Dim bandN As Long
+    Dim idx() As Long
+    Dim n As Long, i As Long, j As Long, b As Long, t As Long
+    Dim sig As String, prevSig As String
+    Dim repeatCount As Long, printed As Long
+    Dim pitch As Double, prevY As Double
+    Dim txt As String, tx As Double, dx As Double
+    Dim frameI As Long
+    Dim area As Double, bestArea As Double
+    Dim mbW As Double, mbH As Double
+
+    If fileNum = 0 Then Exit Sub
+
+    EmitLine fileNum, ""
+    EmitLine fileNum, String$(78, "=")
+    EmitLine fileNum, "PAGE " & CStr(pageNo) & "   (object " & CStr(objNo) & ")"
+    EmitLine fileNum, String$(78, "=")
+
+    '--- page and font settings ------------------------------------------------
+    MediaBoxSize pageDict, mbW, mbH
+    EmitLine fileNum, "PAGE SIZE   : " & NumTxt(mbW) & " x " & NumTxt(mbH) & " pt" & _
+                      "   =  " & NumTxt(mbW / 72) & " x " & NumTxt(mbH / 72) & " in" & _
+                      "   =  " & NumTxt(mbW * 25.4 / 72) & " x " & NumTxt(mbH * 25.4 / 72) & " mm"
+    EmitLine fileNum, "ORIENTATION : " & IIf(mbW > mbH, "landscape", "portrait") & _
+                      "   Rotate " & DictValue(pageDict, "/Rotate")
+    EmitLine fileNum, "FONTS       : " & FontMap(pageDict)
+    EmitLine fileNum, "SIZES USED  : " & JoinCollection(m_fonts, " ; ")
+    EmitLine fileNum, "LINE WIDTH  : " & JoinCollection(m_widths, " ; ") & _
+                      "   (0 = hairline, thinnest the device can draw)"
+    EmitLine fileNum, "INK EXTENT  : x " & NumTxt(m_minX) & " .. " & NumTxt(m_maxX) & _
+                      "    y " & NumTxt(m_minY) & " .. " & NumTxt(m_maxY)
+    EmitLine fileNum, "MARGINS     : left " & NumTxt(m_minX) & _
+                      "   right " & NumTxt(mbW - m_maxX) & _
+                      "   top " & NumTxt(mbH - m_maxY) & _
+                      "   bottom " & NumTxt(m_minY)
+    EmitLine fileNum, "IMAGES      : " & JoinCollection(m_images, " | ")
+
+    If m_recN = 0 Then
+        EmitLine fileNum, ""
+        EmitLine fileNum, "(no rectangles on this page - nothing to map)"
+        Exit Sub
+    End If
+
+    '--- outer frame = largest rectangle ---------------------------------------
+    frameI = 0: bestArea = -1
+    For i = 0 To m_recN - 1
+        area = Abs(m_recW(i)) * Abs(m_recH(i))
+        If area > bestArea Then
+            bestArea = area
+            frameI = i
+        End If
+    Next i
+    EmitLine fileNum, "TABLE FRAME : x " & NumTxt(m_recX(frameI)) & " .. " & _
+                      NumTxt(m_recX(frameI) + m_recW(frameI)) & _
+                      "    y " & NumTxt(m_recY(frameI)) & " .. " & _
+                      NumTxt(m_recY(frameI) + m_recH(frameI)) & _
+                      "    (" & NumTxt(m_recW(frameI)) & " x " & NumTxt(m_recH(frameI)) & ")"
+
+    '--- bands ----------------------------------------------------------------
+    bandN = ClusterValues(m_recY, m_recN, bandY, False)
+
+    EmitLine fileNum, ""
+    EmitLine fileNum, "HORIZONTAL BANDS : " & CStr(bandN) & _
+                      "   (a band = all cells sharing one bottom edge)"
+    EmitLine fileNum, String$(78, "-")
+
+    prevSig = vbNullString
+    repeatCount = 0
+    pitch = 0
+
+    For b = 0 To bandN - 1
+
+        ReDim idx(0 To m_recN)
+        n = 0
+        For i = 0 To m_recN - 1
+            If Abs(m_recY(i) - bandY(b)) <= TOL Then
+                idx(n) = i
+                n = n + 1
+            End If
+        Next i
+        If n = 0 Then GoTo NextBand
+
+        For i = 0 To n - 2                                  ' sort cells left to right
+            For j = i + 1 To n - 1
+                If m_recX(idx(j)) < m_recX(idx(i)) Then
+                    t = idx(i): idx(i) = idx(j): idx(j) = t
+                End If
+            Next j
+        Next i
+
+        sig = vbNullString
+        For i = 0 To n - 1
+            sig = sig & NumTxt(m_recX(idx(i))) & "/" & NumTxt(m_recW(idx(i))) & " "
+        Next i
+
+        If sig = prevSig Then
+            repeatCount = repeatCount + 1
+            If pitch = 0 Then pitch = prevY - bandY(b)
+        Else
+            FlushRepeat fileNum, repeatCount, pitch
+            repeatCount = 0
+            pitch = 0
+
+            If printed < 8 Then
+                printed = printed + 1
+                EmitLine fileNum, ""
+                EmitLine fileNum, "BAND at y = " & NumTxt(bandY(b)) & _
+                                  "   height " & NumTxt(m_recH(idx(0))) & _
+                                  "   cells " & CStr(n)
+                EmitLine fileNum, "   #  X start    width     X end     text at   offset  content"
+                For i = 0 To n - 1
+                    txt = CellText(m_recX(idx(i)), m_recY(idx(i)), _
+                                   m_recW(idx(i)), m_recH(idx(i)), tx)
+                    If tx < 0 Then
+                        dx = 0
+                        txt = "-"
+                    Else
+                        dx = tx - m_recX(idx(i))
+                    End If
+                    EmitLine fileNum, "  " & PadL(CStr(i + 1), 2) & "  " & _
+                             PadL(NumTxt(m_recX(idx(i))), 8) & "  " & _
+                             PadL(NumTxt(m_recW(idx(i))), 8) & "  " & _
+                             PadL(NumTxt(m_recX(idx(i)) + m_recW(idx(i))), 8) & "  " & _
+                             PadL(IIf(tx < 0, "-", NumTxt(tx)), 8) & "  " & _
+                             PadL(IIf(tx < 0, "-", NumTxt(dx)), 6) & "  " & Left$(txt, 30)
+                Next i
+            ElseIf printed = 8 Then
+                printed = printed + 1
+                EmitLine fileNum, ""
+                EmitLine fileNum, "... further bands not expanded, see the repeat notes below"
+            End If
+
+            prevSig = sig
+        End If
+
+        prevY = bandY(b)
+NextBand:
+    Next b
+
+    FlushRepeat fileNum, repeatCount, pitch
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Sub FlushRepeat(ByVal fileNum As Integer, ByVal repeatCount As Long, _
+                        ByVal pitch As Double)
+
+    If repeatCount > 0 Then
+        EmitLine fileNum, "      ^ this band repeats " & CStr(repeatCount) & _
+                          " more time(s), pitch " & NumTxt(pitch) & " pt"
+    End If
+
+End Sub
+
+'------------------------------------------------------------------------------
+' The leftmost text run whose baseline falls inside the given rectangle.
+'------------------------------------------------------------------------------
+Private Function CellText(ByVal rx As Double, ByVal ry As Double, _
+                          ByVal rw As Double, ByVal rh As Double, _
+                          ByRef textX As Double) As String
+
+    Dim i As Long, best As Long
+    Dim bestX As Double
+
+    best = -1
+    bestX = 1E+30
+
+    For i = 0 To m_txN - 1
+        If m_txY(i) >= ry - 1 And m_txY(i) <= ry + rh + 1 Then
+            If m_txX(i) >= rx - 0.5 And m_txX(i) <= rx + rw Then
+                If m_txX(i) < bestX Then
+                    bestX = m_txX(i)
+                    best = i
+                End If
+            End If
+        End If
+    Next i
+
+    If best >= 0 Then
+        textX = m_txX(best)
+        CellText = m_txStr(best)
+    Else
+        textX = -1
+        CellText = vbNullString
+    End If
+
+End Function
+
+'------------------------------------------------------------------------------
+' "/F0 12 0 R/F1 14 0 R" -> "F0=Times-Bold ; F1=Times-Roman"
+'------------------------------------------------------------------------------
+Private Function FontMap(ByVal pageDict As String) As String
+
+    Dim fd As String, entry As String, s As String
+    Dim parts() As String, bits() As String
+    Dim i As Long, objIdx As Long
+
+    fd = DictValue(pageDict, "/Font")
+    If Len(fd) = 0 Or fd = "(absent)" Then
+        FontMap = "(absent)"
+        Exit Function
+    End If
+
+    fd = Replace(Replace(fd, "<<", ""), ">>", "")
+    parts = Split(fd, "/")
+
+    For i = LBound(parts) To UBound(parts)
+        entry = Trim$(parts(i))
+        If Len(entry) > 0 Then
+            bits = Split(entry, " ")
+            If UBound(bits) >= 1 Then
+                If IsNumeric(bits(1)) Then
+                    objIdx = IndexOfObject(CLng(bits(1)))
+                    If Len(s) > 0 Then s = s & " ; "
+                    s = s & bits(0) & "="
+                    If objIdx >= 0 Then
+                        s = s & Replace(DictValue(ObjectDict(m_objPos(objIdx)), "/BaseFont"), "/", "")
+                    Else
+                        s = s & "?"
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    FontMap = s
+
+End Function
+
+'------------------------------------------------------------------------------
+Private Sub MediaBoxSize(ByVal pageDict As String, ByRef w As Double, ByRef h As Double)
+
+    Dim v As String
+    Dim parts() As String
+    Dim i As Long, n As Long
+    Dim num(0 To 3) As Double
+
+    v = DictValue(pageDict, "/MediaBox")
+    v = Replace(Replace(v, "[", " "), "]", " ")
+
+    Do While InStr(v, "  ") > 0
+        v = Replace(v, "  ", " ")
+    Loop
+
+    parts = Split(Trim$(v), " ")
+    For i = LBound(parts) To UBound(parts)
+        If n <= 3 Then
+            If IsNumeric(parts(i)) Then
+                num(n) = Val(parts(i))
+                n = n + 1
+            End If
+        End If
+    Next i
+
+    If n = 4 Then
+        w = num(2) - num(0)
+        h = num(3) - num(1)
+    End If
+
+End Sub
+
+'------------------------------------------------------------------------------
+Private Function PadL(ByVal s As String, ByVal widthChars As Long) As String
+
+    If Len(s) >= widthChars Then
+        PadL = s
+    Else
+        PadL = Space$(widthChars - Len(s)) & s
+    End If
+
+End Function

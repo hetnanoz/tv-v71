@@ -1,0 +1,2707 @@
+Option Explicit
+
+Private Const CLASS_NAME As String = "modPowerPdfExport"
+Private Const POWER_PDF_PRINTER As String = "Power PDF on NUL"
+Private Const POWER_PDF_DEFAULT_RELATIVE_STAGING_PATH As String = "\BAT\Tradeversand\PowerPDF_Staging\"
+Private Const POWER_PDF_CONFIG_RELATIVE_FOLDER As String = "\BAT\Tradeversand\"
+Private Const POWER_PDF_CONFIG_FILE_NAME As String = "PowerPdfStagingPath.txt"
+Private Const POWER_PDF_PUMP_INTERVAL_SECONDS As Long = 2
+Private Const POWER_PDF_DELAY_WARNING_SECONDS As Long = 120
+Private Const POWER_PDF_SPOOL_FOLDER_NAME As String = "TradeversandPowerPdfSpool"
+Private Const CLIENT_PDF_HEADER As String = "%PDF-1.4"
+Private Const CLIENT_PDF_MEDIA_WIDTH_POINTS As Double = 1368#
+Private Const CLIENT_PDF_MEDIA_HEIGHT_POINTS As Double = 684#
+Private Const CLIENT_PDF_PAGE_TOLERANCE_POINTS As Double = 1#
+Private Const CLIENT_PDF_PREFLIGHT_TIMEOUT_SECONDS As Long = 30
+Private Const CLIENT_PDF_PREFIX_READ_BYTES As Long = 524288
+
+Private gblnBatchActive As Boolean
+Private gblnClientPdfConfigurationValidated As Boolean
+Private gblnDelayWarningLogged As Boolean
+Private gblnPrinterCaptured As Boolean
+Private gblnPumpRunning As Boolean
+Private gblnPumpScheduled As Boolean
+Private gdictExpectedPrefixes As Object
+Private gdictQueuedAt As Object
+Private gdictSpoolFiles As Object
+Private gdictTargetPaths As Object
+Private gdtNextPump As Date
+Private glngJobCounter As Long
+Private glngLastPowerPdfErrorNumber As Long
+Private gstrLastPowerPdfErrorDescription As String
+Private gstrPreviousPrinter As String
+Private gstrSpoolFolder As String
+Private gstrStagingFolder As String
+Private gstrCompletionCallback As String
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Lets the current Windows user select a local Power PDF staging folder.
+'-------------------------------------------------------------------------------
+Public Sub BrowsePowerPdfStagingFolder()
+    Const METHOD_NAME As String = "BrowsePowerPdfStagingFolder"
+    Dim dlgFolder As Office.FileDialog
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strDefaultFolder As String
+    Dim strSelectedFolder As String
+
+    On Error GoTo ErrorHandler
+
+    strDefaultFolder = GetPowerPdfStagingFolder()
+
+    If Len(strDefaultFolder) = 0 Then
+        Err.Raise 1022, METHOD_NAME, "The Power PDF staging folder could not be resolved."
+    End If
+
+    If Not EnsureFolderExists(strDefaultFolder) Then
+        Err.Raise 1022, METHOD_NAME, "The default Power PDF staging folder could not be created."
+    End If
+
+    Set dlgFolder = Application.FileDialog(msoFileDialogFolderPicker)
+
+    With dlgFolder
+        .Title = "Select the Power PDF staging folder for this Windows user"
+        .AllowMultiSelect = False
+        .InitialFileName = strDefaultFolder
+
+        If .Show <> -1 Then
+            GoTo ExitSub
+        End If
+
+        strSelectedFolder = CStr(.SelectedItems(1))
+    End With
+
+    strSelectedFolder = EnsureTrailingBackslash(strSelectedFolder)
+
+    If Not EnsureFolderExists(strSelectedFolder) Then
+        Err.Raise 1022, METHOD_NAME, "The selected Power PDF staging folder could not be created or accessed."
+    End If
+
+    If Not SavePowerPdfStagingFolderSetting(strSelectedFolder) Then
+        Err.Raise 1022, METHOD_NAME, "The selected Power PDF staging folder could not be stored for the current Windows user."
+    End If
+
+    MsgBox _
+        "Power PDF staging folder for the current Windows user:" & vbCrLf & _
+        strSelectedFolder & vbCrLf & vbCrLf & _
+        "Select exactly the same folder in the global Power PDF printer preferences.", _
+        vbInformation, _
+        "Power PDF configuration"
+
+ExitSub:
+    Set dlgFolder = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "defaultFolder;selectedFolder", _
+        strDefaultFolder, _
+        strSelectedFolder
+    errorManager.save
+    errorManager.display "The Power PDF staging folder could not be configured."
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Initializes the asynchronous Power PDF queue before reports are submitted.
+'-------------------------------------------------------------------------------
+Public Sub BeginPowerPdfBatch()
+    Const METHOD_NAME As String = "BeginPowerPdfBatch"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    glngLastPowerPdfErrorNumber = 0
+    gstrLastPowerPdfErrorDescription = vbNullString
+
+    If Not EnsurePowerPdfBatch() Then
+        If glngLastPowerPdfErrorNumber <> 0 Then
+            Err.Raise glngLastPowerPdfErrorNumber, METHOD_NAME, gstrLastPowerPdfErrorDescription
+        End If
+
+        Err.Raise 1021, METHOD_NAME, "Power PDF batch could not be initialized."
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    glngLastPowerPdfErrorNumber = errNumber
+    gstrLastPowerPdfErrorDescription = errDescription
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal wksSource As Excel.Worksheet, ByVal strTargetPdfPath As String
+' Returns:       Boolean
+' Description:   Sends one worksheet to Power PDF and returns immediately after the print job is queued.
+'-------------------------------------------------------------------------------
+Public Function QueueWorksheetForPowerPdf(ByVal wksSource As Excel.Worksheet, _
+                                           ByVal strTargetPdfPath As String) As Boolean
+    Const METHOD_NAME As String = "QueueWorksheetForPowerPdf"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnDisplayAlertsCaptured As Boolean
+    Dim blnJobRegistered As Boolean
+    Dim blnSheetRenamed As Boolean
+    Dim blnPreviousDisplayAlerts As Boolean
+    Dim strExpectedPrefix As String
+    Dim strJobId As String
+    Dim strOriginalSheetName As String
+    Dim strSheetPrefix As String
+    Dim strSpoolPath As String
+    Dim wkbSource As Excel.Workbook
+
+    On Error GoTo ErrorHandler
+
+    QueueWorksheetForPowerPdf = False
+    glngLastPowerPdfErrorNumber = 0
+    gstrLastPowerPdfErrorDescription = vbNullString
+
+    If wksSource Is Nothing Then
+        Err.Raise 1001, METHOD_NAME, "Source worksheet is required."
+    End If
+
+    If Len(Trim$(strTargetPdfPath)) = 0 Then
+        Err.Raise 1020, METHOD_NAME, "Target PDF path is required."
+    End If
+
+    If Not EnsurePowerPdfBatch() Then
+        If glngLastPowerPdfErrorNumber <> 0 Then
+            Err.Raise glngLastPowerPdfErrorNumber, METHOD_NAME, gstrLastPowerPdfErrorDescription
+        End If
+
+        Err.Raise 1021, METHOD_NAME, "Power PDF batch is not available."
+    End If
+
+    If Not ApplyClientPdfPageSetup(wksSource) Then
+        Err.Raise 1024, METHOD_NAME, "Client PDF page setup could not be applied."
+    End If
+
+    Set wkbSource = wksSource.Parent
+    blnPreviousDisplayAlerts = Application.DisplayAlerts
+    blnDisplayAlertsCaptured = True
+    Application.DisplayAlerts = False
+
+    strJobId = BuildPowerPdfJobId()
+    strExpectedPrefix = GetFileBaseName(wkbSource.Name)
+
+    If Len(strExpectedPrefix) = 0 _
+        Or Len(wkbSource.Path) = 0 _
+        Or IsExpectedPrefixInUse(strExpectedPrefix) Then
+
+        strExpectedPrefix = strJobId
+        strSpoolPath = gstrSpoolFolder & strExpectedPrefix & ".xlsx"
+        wkbSource.SaveAs _
+            fileName:=strSpoolPath, _
+            FileFormat:=xlOpenXMLWorkbook
+    End If
+
+    strOriginalSheetName = wksSource.Name
+    strSheetPrefix = BuildSafeWorksheetName(strExpectedPrefix)
+
+    If StrComp(strOriginalSheetName, strSheetPrefix, vbBinaryCompare) <> 0 Then
+        wksSource.Name = strSheetPrefix
+        blnSheetRenamed = True
+    End If
+
+    If Not DeleteExistingFile(strTargetPdfPath) Then
+        Err.Raise 1012, METHOD_NAME, "Existing target PDF could not be removed."
+    End If
+
+    gdictTargetPaths.Add strJobId, strTargetPdfPath
+    gdictExpectedPrefixes.Add strJobId, strExpectedPrefix & "|" & strSheetPrefix
+    gdictSpoolFiles.Add strJobId, strSpoolPath
+    gdictQueuedAt.Add strJobId, Now
+    blnJobRegistered = True
+
+    wksSource.PrintOut _
+        Copies:=1, _
+        ActivePrinter:=POWER_PDF_PRINTER, _
+        Collate:=True, _
+        IgnorePrintAreas:=False
+
+    QueueWorksheetForPowerPdf = True
+    Call SchedulePowerPdfPump
+
+ExitFunction:
+    If blnSheetRenamed Then
+        On Error Resume Next
+        wksSource.Name = strOriginalSheetName
+        On Error GoTo 0
+    End If
+
+    If blnDisplayAlertsCaptured Then
+        Application.DisplayAlerts = blnPreviousDisplayAlerts
+    End If
+
+    Set wkbSource = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    QueueWorksheetForPowerPdf = False
+    glngLastPowerPdfErrorNumber = errNumber
+    gstrLastPowerPdfErrorDescription = errDescription
+
+    If blnJobRegistered Then
+        Call RemovePowerPdfJob(strJobId, False)
+    End If
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "targetPdfPath;expectedPrefix;printer", _
+        strTargetPdfPath, _
+        strExpectedPrefix, _
+        POWER_PDF_PRINTER
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Processes completed Power PDF files without waiting for unfinished print jobs.
+'-------------------------------------------------------------------------------
+Public Sub PumpPowerPdfQueue()
+    Const METHOD_NAME As String = "PumpPowerPdfQueue"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    gblnPumpScheduled = False
+
+    If Not gblnBatchActive Then
+        GoTo ExitSub
+    End If
+
+    If gblnPumpRunning Then
+        Call SchedulePowerPdfPump
+        GoTo ExitSub
+    End If
+
+    gblnPumpRunning = True
+    Call ProcessCompletedPowerPdfJobs
+    Call LogDelayedPowerPdfQueue
+
+    If GetPowerPdfPendingCount() = 0 Then
+        Call CompletePowerPdfBatch
+    Else
+        Call SchedulePowerPdfPump
+    End If
+
+ExitSub:
+    gblnPumpRunning = False
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    gblnPumpRunning = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "pendingCount;stagingFolder", _
+        GetPowerPdfPendingCount(), _
+        gstrStagingFolder
+    errorManager.save
+
+    If gblnBatchActive Then
+        Call SchedulePowerPdfPump
+    End If
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Requests another asynchronous queue pass and returns without waiting.
+'-------------------------------------------------------------------------------
+Public Sub FinishPowerPdfBatch()
+    Const METHOD_NAME As String = "FinishPowerPdfBatch"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If gblnBatchActive Then
+        Call PumpPowerPdfQueue
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "pendingCount", _
+        GetPowerPdfPendingCount()
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strProcedureName As String
+' Returns:       ---
+' Description:   Stores the macro that must run after all queued PDF files are completed.
+'-------------------------------------------------------------------------------
+Public Sub SetPowerPdfCompletionCallback(ByVal strProcedureName As String)
+    Const METHOD_NAME As String = "SetPowerPdfCompletionCallback"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    gstrCompletionCallback = Trim$(strProcedureName)
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "procedureName", _
+        strProcedureName
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       String
+' Description:   Returns the most recent Power PDF initialization or queue failure description.
+'-------------------------------------------------------------------------------
+Public Function GetPowerPdfLastErrorDescription() As String
+    Const METHOD_NAME As String = "GetPowerPdfLastErrorDescription"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    GetPowerPdfLastErrorDescription = gstrLastPowerPdfErrorDescription
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetPowerPdfLastErrorDescription = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       Long
+' Description:   Returns the number of Power PDF files still waiting to be completed and moved.
+'-------------------------------------------------------------------------------
+Public Function GetPowerPdfPendingCount() As Long
+    Const METHOD_NAME As String = "GetPowerPdfPendingCount"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If Not gdictTargetPaths Is Nothing Then
+        GetPowerPdfPendingCount = gdictTargetPaths.Count
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetPowerPdfPendingCount = 0
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Cancels background queue processing and restores the printer without deleting produced PDFs.
+'-------------------------------------------------------------------------------
+Public Sub CancelPowerPdfQueue()
+    Const METHOD_NAME As String = "CancelPowerPdfQueue"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Call CancelScheduledPowerPdfPump
+    Call RestorePreviousPrinter
+    Call ResetPowerPdfState
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "pendingCount", _
+        GetPowerPdfPendingCount()
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       Boolean
+' Description:   Creates the queue state, prepares dedicated folders, and selects the Power PDF printer.
+'-------------------------------------------------------------------------------
+Private Function EnsurePowerPdfBatch() As Boolean
+    Const METHOD_NAME As String = "EnsurePowerPdfBatch"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strValidationError As String
+
+    On Error GoTo ErrorHandler
+
+    EnsurePowerPdfBatch = False
+
+    If gblnBatchActive Then
+        EnsurePowerPdfBatch = True
+        GoTo ExitFunction
+    End If
+
+    gstrStagingFolder = GetPowerPdfStagingFolder()
+    gstrSpoolFolder = Environ$("TEMP") & "\" & POWER_PDF_SPOOL_FOLDER_NAME & "\"
+
+    If Not EnsureFolderExists(gstrStagingFolder) Then
+        Err.Raise 1022, METHOD_NAME, "Power PDF staging folder is not accessible."
+    End If
+
+    If Not EnsureFolderExists(gstrSpoolFolder) Then
+        Err.Raise 1022, METHOD_NAME, "Power PDF spool folder is not accessible."
+    End If
+
+    If Not ClearFolderFiles(gstrStagingFolder, "*.pdf") Then
+        Err.Raise 1011, METHOD_NAME, "Power PDF staging folder could not be cleared."
+    End If
+
+    If Not ClearFolderFiles(gstrSpoolFolder, "*.xlsx") Then
+        Err.Raise 1011, METHOD_NAME, "Power PDF spool folder could not be cleared."
+    End If
+
+    Set gdictTargetPaths = CreateObject("Scripting.Dictionary")
+    Set gdictExpectedPrefixes = CreateObject("Scripting.Dictionary")
+    Set gdictSpoolFiles = CreateObject("Scripting.Dictionary")
+    Set gdictQueuedAt = CreateObject("Scripting.Dictionary")
+
+    gstrPreviousPrinter = Application.ActivePrinter
+    gblnPrinterCaptured = True
+    Application.ActivePrinter = POWER_PDF_PRINTER
+
+    If Not gblnClientPdfConfigurationValidated Then
+        If Not ValidatePowerPdfConfiguration(strValidationError) Then
+            Err.Raise 1024, METHOD_NAME, strValidationError
+        End If
+        gblnClientPdfConfigurationValidated = True
+
+        If Not ClearFolderFiles(gstrStagingFolder, "*.pdf") Then
+            Err.Raise 1011, METHOD_NAME, "Power PDF staging folder could not be cleared after preflight."
+        End If
+    End If
+
+    glngJobCounter = 0
+    gblnDelayWarningLogged = False
+    gblnBatchActive = True
+    EnsurePowerPdfBatch = True
+    Call SchedulePowerPdfPump
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    EnsurePowerPdfBatch = False
+    glngLastPowerPdfErrorNumber = errNumber
+    gstrLastPowerPdfErrorDescription = errDescription
+
+    Call RestorePreviousPrinter
+    Call ResetPowerPdfState
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "stagingFolder;spoolFolder;printer;validationError", _
+        gstrStagingFolder, _
+        gstrSpoolFolder, _
+        POWER_PDF_PRINTER, _
+        strValidationError
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Scans the staging folder once and moves every completed queue item to its final path.
+'-------------------------------------------------------------------------------
+Private Sub ProcessCompletedPowerPdfJobs()
+    Const METHOD_NAME As String = "ProcessCompletedPowerPdfJobs"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim arrJobIds As Variant
+    Dim strGeneratedPdfPath As String
+    Dim strJobId As String
+    Dim strTargetPdfPath As String
+    Dim varJobId As Variant
+
+    On Error GoTo ErrorHandler
+
+    If gdictTargetPaths Is Nothing Then
+        GoTo ExitSub
+    End If
+
+    If gdictTargetPaths.Count = 0 Then
+        GoTo ExitSub
+    End If
+
+    arrJobIds = gdictTargetPaths.Keys
+
+    For Each varJobId In arrJobIds
+        strJobId = CStr(varJobId)
+        strGeneratedPdfPath = FindGeneratedPdfForPrefixes( _
+            gstrStagingFolder, _
+            CStr(gdictExpectedPrefixes(strJobId)))
+
+        If Len(strGeneratedPdfPath) > 0 Then
+            strTargetPdfPath = CStr(gdictTargetPaths(strJobId))
+
+            If TryMoveGeneratedPdf(strGeneratedPdfPath, strTargetPdfPath) Then
+                If GetPdfHeaderVersion(strTargetPdfPath) <> CLIENT_PDF_HEADER Then
+                    Call LogPowerPdfIssue( _
+                        "Generated PDF is not PDF 1.4. Check the global Power PDF printing profile.", _
+                        strTargetPdfPath)
+                End If
+
+                Call RemovePowerPdfJob(strJobId, True)
+            End If
+        End If
+    Next varJobId
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "jobId;generatedPdfPath;targetPdfPath", _
+        strJobId, _
+        strGeneratedPdfPath, _
+        strTargetPdfPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Restores the original printer after the asynchronous queue becomes empty.
+'-------------------------------------------------------------------------------
+Private Sub CompletePowerPdfBatch()
+    Const METHOD_NAME As String = "CompletePowerPdfBatch"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strCompletionCallback As String
+
+    On Error GoTo ErrorHandler
+
+    strCompletionCallback = gstrCompletionCallback
+
+    Call CancelScheduledPowerPdfPump
+    Call RestorePreviousPrinter
+    Call ClearFolderFiles(gstrSpoolFolder, "*.xlsx")
+    Call ResetPowerPdfState
+
+    If Len(strCompletionCallback) > 0 Then
+        Application.Run GetQualifiedPowerPdfProcedureName(strCompletionCallback)
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "stagingFolder;spoolFolder", _
+        gstrStagingFolder, _
+        gstrSpoolFolder
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Schedules the next non-blocking Power PDF folder scan.
+'-------------------------------------------------------------------------------
+Private Sub SchedulePowerPdfPump()
+    Const METHOD_NAME As String = "SchedulePowerPdfPump"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If Not gblnBatchActive Then
+        GoTo ExitSub
+    End If
+
+    If gblnPumpScheduled Then
+        GoTo ExitSub
+    End If
+
+    gdtNextPump = DateAdd("s", POWER_PDF_PUMP_INTERVAL_SECONDS, Now)
+    Application.OnTime _
+        EarliestTime:=gdtNextPump, _
+        Procedure:=GetPowerPdfPumpProcedureName(), _
+        Schedule:=True
+    gblnPumpScheduled = True
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    gblnPumpScheduled = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Cancels a previously scheduled Power PDF queue scan.
+'-------------------------------------------------------------------------------
+Private Sub CancelScheduledPowerPdfPump()
+    Const METHOD_NAME As String = "CancelScheduledPowerPdfPump"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If gblnPumpScheduled Then
+        On Error Resume Next
+        Application.OnTime _
+            EarliestTime:=gdtNextPump, _
+            Procedure:=GetPowerPdfPumpProcedureName(), _
+            Schedule:=False
+        On Error GoTo ErrorHandler
+        gblnPumpScheduled = False
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    gblnPumpScheduled = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       String
+' Description:   Returns the fully qualified macro name used by Application.OnTime.
+'-------------------------------------------------------------------------------
+Private Function GetPowerPdfPumpProcedureName() As String
+    Const METHOD_NAME As String = "GetPowerPdfPumpProcedureName"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    GetPowerPdfPumpProcedureName = GetQualifiedPowerPdfProcedureName("PumpPowerPdfQueue")
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetPowerPdfPumpProcedureName = "PumpPowerPdfQueue"
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strProcedureName As String
+' Returns:       String
+' Description:   Returns a workbook-qualified macro name for Application.Run or Application.OnTime.
+'-------------------------------------------------------------------------------
+Private Function GetQualifiedPowerPdfProcedureName(ByVal strProcedureName As String) As String
+    Const METHOD_NAME As String = "GetQualifiedPowerPdfProcedureName"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strWorkbookName As String
+
+    On Error GoTo ErrorHandler
+
+    strWorkbookName = Replace$(ThisWorkbook.Name, "'", "''")
+    GetQualifiedPowerPdfProcedureName = "'" & strWorkbookName & "'!" & strProcedureName
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetQualifiedPowerPdfProcedureName = strProcedureName
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "procedureName", _
+        strProcedureName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       String
+' Description:   Resolves a per-user Power PDF staging folder and creates it when required.
+'-------------------------------------------------------------------------------
+Private Function GetPowerPdfStagingFolder() As String
+    Const METHOD_NAME As String = "GetPowerPdfStagingFolder"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strFolderPath As String
+
+    On Error GoTo ErrorHandler
+
+    strFolderPath = ReadPowerPdfStagingFolderSetting()
+
+    If Len(strFolderPath) = 0 Then
+        strFolderPath = GetDefaultPowerPdfStagingFolder()
+    End If
+
+    strFolderPath = ExpandEnvironmentPath(strFolderPath)
+    strFolderPath = EnsureTrailingBackslash(strFolderPath)
+
+    If Len(strFolderPath) = 0 Then
+        Err.Raise 1022, METHOD_NAME, "Power PDF staging folder could not be resolved."
+    End If
+
+    If Not EnsureFolderExists(strFolderPath) Then
+        Err.Raise 1022, METHOD_NAME, "Power PDF staging folder could not be created or accessed: " & strFolderPath
+    End If
+
+    GetPowerPdfStagingFolder = strFolderPath
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetPowerPdfStagingFolder = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath", _
+        strFolderPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       String
+' Description:   Returns the default Power PDF staging folder for the current Windows user.
+'-------------------------------------------------------------------------------
+Private Function GetDefaultPowerPdfStagingFolder() As String
+    Const METHOD_NAME As String = "GetDefaultPowerPdfStagingFolder"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strBaseFolder As String
+
+    On Error GoTo ErrorHandler
+
+    strBaseFolder = Trim$(Environ$("LOCALAPPDATA"))
+
+    If Len(strBaseFolder) = 0 Then
+        strBaseFolder = Trim$(Environ$("TEMP"))
+    End If
+
+    If Len(strBaseFolder) = 0 Then
+        Err.Raise 1022, METHOD_NAME, "Neither LOCALAPPDATA nor TEMP could be resolved."
+    End If
+
+    GetDefaultPowerPdfStagingFolder = _
+        EnsureTrailingBackslash(strBaseFolder & POWER_PDF_DEFAULT_RELATIVE_STAGING_PATH)
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetDefaultPowerPdfStagingFolder = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "baseFolder", _
+        strBaseFolder
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       String
+' Description:   Reads the current user's optional local Power PDF staging folder setting.
+'-------------------------------------------------------------------------------
+Private Function ReadPowerPdfStagingFolderSetting() As String
+    Const METHOD_NAME As String = "ReadPowerPdfStagingFolderSetting"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngFileNumber As Long
+    Dim strConfigFilePath As String
+    Dim strFolderPath As String
+
+    On Error GoTo ErrorHandler
+
+    strConfigFilePath = GetPowerPdfConfigFilePath()
+
+    If Len(strConfigFilePath) = 0 Then
+        GoTo ExitFunction
+    End If
+
+    If Len(Dir$(strConfigFilePath)) = 0 Then
+        GoTo ExitFunction
+    End If
+
+    lngFileNumber = FreeFile
+    Open strConfigFilePath For Input As #lngFileNumber
+    Line Input #lngFileNumber, strFolderPath
+    Close #lngFileNumber
+    lngFileNumber = 0
+
+    ReadPowerPdfStagingFolderSetting = Trim$(strFolderPath)
+
+ExitFunction:
+    If lngFileNumber > 0 Then
+        On Error Resume Next
+        Close #lngFileNumber
+        On Error GoTo 0
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ReadPowerPdfStagingFolderSetting = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "configFilePath", _
+        strConfigFilePath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String
+' Returns:       Boolean
+' Description:   Stores the Power PDF staging folder in the current user's local configuration.
+'-------------------------------------------------------------------------------
+Private Function SavePowerPdfStagingFolderSetting(ByVal strFolderPath As String) As Boolean
+    Const METHOD_NAME As String = "SavePowerPdfStagingFolderSetting"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngFileNumber As Long
+    Dim strConfigFilePath As String
+    Dim strNormalizedFolder As String
+
+    On Error GoTo ErrorHandler
+
+    SavePowerPdfStagingFolderSetting = False
+    strNormalizedFolder = EnsureTrailingBackslash(ExpandEnvironmentPath(strFolderPath))
+
+    If Len(strNormalizedFolder) = 0 Then
+        Err.Raise 1022, METHOD_NAME, "Power PDF staging folder is empty."
+    End If
+
+    If Not EnsureFolderExists(strNormalizedFolder) Then
+        Err.Raise 1022, METHOD_NAME, "Power PDF staging folder could not be created or accessed."
+    End If
+
+    strConfigFilePath = GetPowerPdfConfigFilePath()
+
+    If Len(strConfigFilePath) = 0 Then
+        Err.Raise 1022, METHOD_NAME, "Power PDF local configuration file could not be resolved."
+    End If
+
+    lngFileNumber = FreeFile
+    Open strConfigFilePath For Output As #lngFileNumber
+    Print #lngFileNumber, strNormalizedFolder
+    Close #lngFileNumber
+    lngFileNumber = 0
+
+    SavePowerPdfStagingFolderSetting = True
+
+ExitFunction:
+    If lngFileNumber > 0 Then
+        On Error Resume Next
+        Close #lngFileNumber
+        On Error GoTo 0
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    SavePowerPdfStagingFolderSetting = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;configFilePath", _
+        strFolderPath, _
+        strConfigFilePath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       String
+' Description:   Returns the current user's local Power PDF configuration file path.
+'-------------------------------------------------------------------------------
+Private Function GetPowerPdfConfigFilePath() As String
+    Const METHOD_NAME As String = "GetPowerPdfConfigFilePath"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strBaseFolder As String
+    Dim strConfigFolder As String
+
+    On Error GoTo ErrorHandler
+
+    strBaseFolder = Trim$(Environ$("LOCALAPPDATA"))
+
+    If Len(strBaseFolder) = 0 Then
+        strBaseFolder = Trim$(Environ$("TEMP"))
+    End If
+
+    If Len(strBaseFolder) = 0 Then
+        Err.Raise 1022, METHOD_NAME, "Neither LOCALAPPDATA nor TEMP could be resolved."
+    End If
+
+    strConfigFolder = EnsureTrailingBackslash(strBaseFolder & POWER_PDF_CONFIG_RELATIVE_FOLDER)
+
+    If Not EnsureFolderExists(strConfigFolder) Then
+        Err.Raise 1022, METHOD_NAME, "Power PDF local configuration folder could not be created."
+    End If
+
+    GetPowerPdfConfigFilePath = strConfigFolder & POWER_PDF_CONFIG_FILE_NAME
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetPowerPdfConfigFilePath = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "baseFolder;configFolder", _
+        strBaseFolder, _
+        strConfigFolder
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strPath As String
+' Returns:       String
+' Description:   Expands Windows environment variables in a configured folder path.
+'-------------------------------------------------------------------------------
+Private Function ExpandEnvironmentPath(ByVal strPath As String) As String
+    Const METHOD_NAME As String = "ExpandEnvironmentPath"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim objShell As Object
+
+    On Error GoTo ErrorHandler
+
+    If Len(Trim$(strPath)) = 0 Then
+        GoTo ExitFunction
+    End If
+
+    Set objShell = CreateObject("WScript.Shell")
+    ExpandEnvironmentPath = CStr(objShell.ExpandEnvironmentStrings(Trim$(strPath)))
+
+ExitFunction:
+    Set objShell = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ExpandEnvironmentPath = strPath
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "path", _
+        strPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String
+' Returns:       String
+' Description:   Ensures that a folder path ends with one backslash.
+'-------------------------------------------------------------------------------
+Private Function EnsureTrailingBackslash(ByVal strFolderPath As String) As String
+    Const METHOD_NAME As String = "EnsureTrailingBackslash"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strResult As String
+
+    On Error GoTo ErrorHandler
+
+    strResult = Trim$(strFolderPath)
+
+    Do While Len(strResult) > 0 And Right$(strResult, 1) = "\"
+        strResult = Left$(strResult, Len(strResult) - 1)
+    Loop
+
+    If Len(strResult) > 0 Then
+        strResult = strResult & "\"
+    End If
+
+    EnsureTrailingBackslash = strResult
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    EnsureTrailingBackslash = strFolderPath
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath", _
+        strFolderPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String
+' Returns:       Boolean
+' Description:   Creates a folder tree when the configured folder does not yet exist.
+'-------------------------------------------------------------------------------
+Private Function EnsureFolderExists(ByVal strFolderPath As String) As Boolean
+    Const METHOD_NAME As String = "EnsureFolderExists"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim objFileSystem As Object
+    Dim strFolderWithoutSlash As String
+    Dim strParentFolder As String
+
+    On Error GoTo ErrorHandler
+
+    EnsureFolderExists = False
+    strFolderWithoutSlash = strFolderPath
+
+    If Right$(strFolderWithoutSlash, 1) = "\" Then
+        strFolderWithoutSlash = Left$(strFolderWithoutSlash, Len(strFolderWithoutSlash) - 1)
+    End If
+
+    If Len(strFolderWithoutSlash) = 0 Then
+        Err.Raise 1022, METHOD_NAME, "Folder path is required."
+    End If
+
+    Set objFileSystem = CreateObject("Scripting.FileSystemObject")
+
+    If Not objFileSystem.FolderExists(strFolderWithoutSlash) Then
+        strParentFolder = objFileSystem.GetParentFolderName(strFolderWithoutSlash)
+
+        If Len(strParentFolder) > 0 Then
+            If Not objFileSystem.FolderExists(strParentFolder) Then
+                If Not EnsureFolderExists(strParentFolder) Then
+                    GoTo ExitFunction
+                End If
+            End If
+        End If
+
+        objFileSystem.CreateFolder strFolderWithoutSlash
+    End If
+
+    EnsureFolderExists = objFileSystem.FolderExists(strFolderWithoutSlash)
+
+ExitFunction:
+    Set objFileSystem = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    EnsureFolderExists = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath", _
+        strFolderPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String, ByVal strFilePattern As String
+' Returns:       Boolean
+' Description:   Deletes files matching a pattern from the dedicated temporary folder.
+'-------------------------------------------------------------------------------
+Private Function ClearFolderFiles(ByVal strFolderPath As String, _
+                                  ByVal strFilePattern As String) As Boolean
+    Const METHOD_NAME As String = "ClearFolderFiles"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strFileName As String
+
+    On Error GoTo ErrorHandler
+
+    ClearFolderFiles = False
+
+    If Len(strFolderPath) = 0 Then
+        Err.Raise 1022, METHOD_NAME, "Folder path is required."
+    End If
+
+    strFileName = Dir$(strFolderPath & strFilePattern)
+
+    Do While Len(strFileName) > 0
+        Kill strFolderPath & strFileName
+        strFileName = Dir$()
+    Loop
+
+    ClearFolderFiles = Len(Dir$(strFolderPath & strFilePattern)) = 0
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ClearFolderFiles = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;filePattern", _
+        strFolderPath, _
+        strFilePattern
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       String
+' Description:   Creates a unique short identifier for one Power PDF print job.
+'-------------------------------------------------------------------------------
+Private Function BuildPowerPdfJobId() As String
+    Const METHOD_NAME As String = "BuildPowerPdfJobId"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    glngJobCounter = glngJobCounter + 1
+    BuildPowerPdfJobId = "PPDF_" & Format$(Now, "yyyymmdd_hhnnss") & "_" & Format$(glngJobCounter, "00000")
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    BuildPowerPdfJobId = "PPDF_" & Format$(Timer, "000000")
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFileName As String
+' Returns:       String
+' Description:   Returns a file name without its final extension.
+'-------------------------------------------------------------------------------
+Private Function GetFileBaseName(ByVal strFileName As String) As String
+    Const METHOD_NAME As String = "GetFileBaseName"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngDotPosition As Long
+
+    On Error GoTo ErrorHandler
+
+    lngDotPosition = InStrRev(strFileName, ".")
+
+    If lngDotPosition > 1 Then
+        GetFileBaseName = Left$(strFileName, lngDotPosition - 1)
+    Else
+        GetFileBaseName = strFileName
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetFileBaseName = strFileName
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fileName", _
+        strFileName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strExpectedPrefix As String
+' Returns:       Boolean
+' Description:   Returns whether an output prefix is already assigned to a pending print job.
+'-------------------------------------------------------------------------------
+Private Function IsExpectedPrefixInUse(ByVal strExpectedPrefix As String) As Boolean
+    Const METHOD_NAME As String = "IsExpectedPrefixInUse"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strPrefixes As String
+    Dim varJobId As Variant
+
+    On Error GoTo ErrorHandler
+
+    If gdictExpectedPrefixes Is Nothing Then
+        GoTo ExitFunction
+    End If
+
+    For Each varJobId In gdictExpectedPrefixes.Keys
+        strPrefixes = CStr(gdictExpectedPrefixes(CStr(varJobId)))
+
+        If InStr(1, strPrefixes, strExpectedPrefix, vbTextCompare) > 0 Then
+            IsExpectedPrefixInUse = True
+            GoTo ExitFunction
+        End If
+    Next varJobId
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    IsExpectedPrefixInUse = True
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "expectedPrefix", _
+        strExpectedPrefix
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strValue As String
+' Returns:       String
+' Description:   Creates a legal worksheet name used as an additional Power PDF auto-name hint.
+'-------------------------------------------------------------------------------
+Private Function BuildSafeWorksheetName(ByVal strValue As String) As String
+    Const METHOD_NAME As String = "BuildSafeWorksheetName"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strResult As String
+
+    On Error GoTo ErrorHandler
+
+    strResult = strValue
+    strResult = Replace$(strResult, "\", "_")
+    strResult = Replace$(strResult, "/", "_")
+    strResult = Replace$(strResult, ":", "_")
+    strResult = Replace$(strResult, "*", "_")
+    strResult = Replace$(strResult, "?", "_")
+    strResult = Replace$(strResult, "[", "_")
+    strResult = Replace$(strResult, "]", "_")
+
+    If Len(strResult) = 0 Then
+        strResult = "PowerPDF"
+    End If
+
+    BuildSafeWorksheetName = Left$(strResult, 31)
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    BuildSafeWorksheetName = "PowerPDF"
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "value", _
+        strValue
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String, ByVal strPrefixes As String
+' Returns:       String
+' Description:   Finds a generated PDF whose automatic name matches the workbook or worksheet prefix.
+'-------------------------------------------------------------------------------
+Private Function FindGeneratedPdfForPrefixes(ByVal strFolderPath As String, _
+                                             ByVal strPrefixes As String) As String
+    Const METHOD_NAME As String = "FindGeneratedPdfForPrefixes"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim arrPrefixes As Variant
+    Dim dtOldestMatch As Date
+    Dim objFile As Object
+    Dim objFileSystem As Object
+    Dim objFolder As Object
+    Dim strFileBase As String
+    Dim strPrefix As String
+    Dim varPrefix As Variant
+
+    On Error GoTo ErrorHandler
+
+    Set objFileSystem = CreateObject("Scripting.FileSystemObject")
+    Set objFolder = objFileSystem.GetFolder(strFolderPath)
+    arrPrefixes = Split(strPrefixes, "|")
+
+    For Each objFile In objFolder.Files
+        If LCase$(objFileSystem.GetExtensionName(objFile.Name)) = "pdf" Then
+            strFileBase = objFileSystem.GetBaseName(objFile.Name)
+
+            For Each varPrefix In arrPrefixes
+                strPrefix = CStr(varPrefix)
+
+                If Len(strPrefix) > 0 Then
+                    If Left$(strFileBase, Len(strPrefix)) = strPrefix Then
+                        If dtOldestMatch = 0 Or objFile.DateLastModified < dtOldestMatch Then
+                            dtOldestMatch = objFile.DateLastModified
+                            FindGeneratedPdfForPrefixes = objFile.Path
+                        End If
+                        Exit For
+                    End If
+                End If
+            Next varPrefix
+        End If
+    Next objFile
+
+ExitFunction:
+    Set objFile = Nothing
+    Set objFolder = Nothing
+    Set objFileSystem = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    FindGeneratedPdfForPrefixes = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;prefixes", _
+        strFolderPath, _
+        strPrefixes
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strSourcePath As String, ByVal strTargetPath As String
+' Returns:       Boolean
+' Description:   Attempts one non-blocking move of a completed Power PDF file to its final path.
+'-------------------------------------------------------------------------------
+Private Function TryMoveGeneratedPdf(ByVal strSourcePath As String, _
+                                     ByVal strTargetPath As String) As Boolean
+    Const METHOD_NAME As String = "TryMoveGeneratedPdf"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngMoveError As Long
+    Dim objFileSystem As Object
+    Dim strTargetFolder As String
+
+    On Error GoTo ErrorHandler
+
+    TryMoveGeneratedPdf = False
+
+    If Len(Dir$(strSourcePath)) = 0 Then
+        GoTo ExitFunction
+    End If
+
+    If FileLen(strSourcePath) = 0 Then
+        GoTo ExitFunction
+    End If
+
+    If DateDiff("s", FileDateTime(strSourcePath), Now) < 1 Then
+        GoTo ExitFunction
+    End If
+
+    Set objFileSystem = CreateObject("Scripting.FileSystemObject")
+    strTargetFolder = objFileSystem.GetParentFolderName(strTargetPath)
+
+    If Not EnsureFolderExists(strTargetFolder) Then
+        GoTo ExitFunction
+    End If
+
+    If Len(Dir$(strTargetPath)) > 0 Then
+        On Error Resume Next
+        Kill strTargetPath
+        lngMoveError = VBA.Err.Number
+        VBA.Err.Clear
+        On Error GoTo ErrorHandler
+
+        If lngMoveError <> 0 Then
+            GoTo ExitFunction
+        End If
+    End If
+
+    On Error Resume Next
+    objFileSystem.MoveFile strSourcePath, strTargetPath
+    lngMoveError = VBA.Err.Number
+    VBA.Err.Clear
+    On Error GoTo ErrorHandler
+
+    If lngMoveError = 0 Then
+        TryMoveGeneratedPdf = Len(Dir$(strTargetPath)) > 0
+    End If
+
+ExitFunction:
+    Set objFileSystem = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    TryMoveGeneratedPdf = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "sourcePath;targetPath", _
+        strSourcePath, _
+        strTargetPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFilePath As String
+' Returns:       Boolean
+' Description:   Deletes an existing target file before a new asynchronous job is registered.
+'-------------------------------------------------------------------------------
+Private Function DeleteExistingFile(ByVal strFilePath As String) As Boolean
+    Const METHOD_NAME As String = "DeleteExistingFile"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngDeleteError As Long
+
+    On Error GoTo ErrorHandler
+
+    DeleteExistingFile = False
+
+    If Len(Dir$(strFilePath)) > 0 Then
+        On Error Resume Next
+        Kill strFilePath
+        lngDeleteError = VBA.Err.Number
+        VBA.Err.Clear
+        On Error GoTo ErrorHandler
+
+        If lngDeleteError <> 0 Then
+            GoTo ExitFunction
+        End If
+    End If
+
+    DeleteExistingFile = Len(Dir$(strFilePath)) = 0
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    DeleteExistingFile = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "filePath", _
+        strFilePath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strJobId As String, ByVal blnDeleteSpoolFile As Boolean
+' Returns:       ---
+' Description:   Removes one completed or failed job from all internal queue collections.
+'-------------------------------------------------------------------------------
+Private Sub RemovePowerPdfJob(ByVal strJobId As String, _
+                              ByVal blnDeleteSpoolFile As Boolean)
+    Const METHOD_NAME As String = "RemovePowerPdfJob"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strSpoolPath As String
+
+    On Error GoTo ErrorHandler
+
+    If Not gdictSpoolFiles Is Nothing Then
+        If gdictSpoolFiles.Exists(strJobId) Then
+            strSpoolPath = CStr(gdictSpoolFiles(strJobId))
+
+            If blnDeleteSpoolFile And Len(strSpoolPath) > 0 Then
+                On Error Resume Next
+                If Len(Dir$(strSpoolPath)) > 0 Then
+                    Kill strSpoolPath
+                End If
+                On Error GoTo ErrorHandler
+            End If
+
+            gdictSpoolFiles.Remove strJobId
+        End If
+    End If
+
+    If Not gdictExpectedPrefixes Is Nothing Then
+        If gdictExpectedPrefixes.Exists(strJobId) Then
+            gdictExpectedPrefixes.Remove strJobId
+        End If
+    End If
+
+    If Not gdictQueuedAt Is Nothing Then
+        If gdictQueuedAt.Exists(strJobId) Then
+            gdictQueuedAt.Remove strJobId
+        End If
+    End If
+
+    If Not gdictTargetPaths Is Nothing Then
+        If gdictTargetPaths.Exists(strJobId) Then
+            gdictTargetPaths.Remove strJobId
+        End If
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "jobId;spoolPath", _
+        strJobId, _
+        strSpoolPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Logs one delayed-queue warning without interrupting report generation.
+'-------------------------------------------------------------------------------
+Private Sub LogDelayedPowerPdfQueue()
+    Const METHOD_NAME As String = "LogDelayedPowerPdfQueue"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dtOldestJob As Date
+    Dim varJobId As Variant
+
+    On Error GoTo ErrorHandler
+
+    If gblnDelayWarningLogged Then
+        GoTo ExitSub
+    End If
+
+    If gdictQueuedAt Is Nothing Then
+        GoTo ExitSub
+    End If
+
+    For Each varJobId In gdictQueuedAt.Keys
+        If dtOldestJob = 0 Or CDate(gdictQueuedAt(CStr(varJobId))) < dtOldestJob Then
+            dtOldestJob = CDate(gdictQueuedAt(CStr(varJobId)))
+        End If
+    Next varJobId
+
+    If dtOldestJob > 0 Then
+        If DateDiff("s", dtOldestJob, Now) >= POWER_PDF_DELAY_WARNING_SECONDS Then
+            errorManager.addError _
+                CLASS_NAME, _
+                METHOD_NAME, _
+                1014, _
+                "Power PDF queue is delayed. Verify automatic naming, the staging folder, and that no Save As dialog is open.", _
+                "pendingCount;stagingFolder", _
+                GetPowerPdfPendingCount(), _
+                gstrStagingFolder
+            errorManager.save
+            gblnDelayWarningLogged = True
+        End If
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strDescription As String, ByVal strFilePath As String
+' Returns:       ---
+' Description:   Records a non-fatal validation issue for one completed Power PDF file.
+'-------------------------------------------------------------------------------
+Private Sub LogPowerPdfIssue(ByVal strDescription As String, _
+                             ByVal strFilePath As String)
+    Const METHOD_NAME As String = "LogPowerPdfIssue"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        1016, _
+        strDescription, _
+        "filePath", _
+        strFilePath
+    errorManager.save
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "filePath", _
+        strFilePath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFilePath As String
+' Returns:       String
+' Description:   Reads the PDF version marker from the generated file header.
+'-------------------------------------------------------------------------------
+Private Function GetPdfHeaderVersion(ByVal strFilePath As String) As String
+    Const METHOD_NAME As String = "GetPdfHeaderVersion"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngFileNumber As Long
+    Dim strHeader As String
+
+    On Error GoTo ErrorHandler
+
+    lngFileNumber = FreeFile
+    Open strFilePath For Binary Access Read As #lngFileNumber
+    strHeader = Space$(8)
+    Get #lngFileNumber, 1, strHeader
+    Close #lngFileNumber
+    lngFileNumber = 0
+
+    GetPdfHeaderVersion = Left$(strHeader, 8)
+
+ExitFunction:
+    If lngFileNumber > 0 Then
+        On Error Resume Next
+        Close #lngFileNumber
+        On Error GoTo 0
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetPdfHeaderVersion = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "filePath", _
+        strFilePath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal wksSource As Excel.Worksheet
+' Returns:       Boolean
+' Description:   Applies the client-specific landscape page setup before printing through Power PDF.
+'-------------------------------------------------------------------------------
+Private Function ApplyClientPdfPageSetup(ByVal wksSource As Excel.Worksheet) As Boolean
+    Const METHOD_NAME As String = "ApplyClientPdfPageSetup"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngPaperSizeError As Long
+    Dim strWorksheetName As String
+
+    On Error GoTo ErrorHandler
+
+    ApplyClientPdfPageSetup = False
+
+    If wksSource Is Nothing Then
+        Err.Raise 1001, METHOD_NAME, "Source worksheet is required."
+    End If
+
+    strWorksheetName = wksSource.Name
+
+    On Error Resume Next
+    wksSource.PageSetup.PaperSize = xlPaperUser
+    lngPaperSizeError = VBA.Err.Number
+    VBA.Err.Clear
+    On Error GoTo ErrorHandler
+
+    With wksSource.PageSetup
+        .Orientation = xlLandscape
+        .Zoom = False
+        .FitToPagesWide = 1
+        .FitToPagesTall = False
+    End With
+
+    ApplyClientPdfPageSetup = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ApplyClientPdfPageSetup = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "worksheet;paperSizeError", _
+        strWorksheetName, _
+        lngPaperSizeError
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByRef strValidationError As String
+' Returns:       Boolean
+' Description:   Prints one technical page and verifies the global Power PDF version and page-size settings.
+'-------------------------------------------------------------------------------
+Private Function ValidatePowerPdfConfiguration(ByRef strValidationError As String) As Boolean
+    Const METHOD_NAME As String = "ValidatePowerPdfConfiguration"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnDisplayAlertsCaptured As Boolean
+    Dim blnPreviousDisplayAlerts As Boolean
+    Dim strPreflightPdfPath As String
+    Dim strValidationDetails As String
+    Dim wkbPreflight As Excel.Workbook
+    Dim wksPreflight As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    ValidatePowerPdfConfiguration = False
+    strValidationError = vbNullString
+    blnPreviousDisplayAlerts = Application.DisplayAlerts
+    blnDisplayAlertsCaptured = True
+    Application.DisplayAlerts = False
+
+    Set wkbPreflight = Workbooks.Add(xlWBATWorksheet)
+    Set wksPreflight = wkbPreflight.Worksheets(1)
+    wksPreflight.Name = "PPDF_PREFLIGHT"
+    wksPreflight.Range("A1").Value = "Power PDF preflight"
+
+    With wksPreflight.PageSetup
+        .PrintArea = "$A$1:$A$1"
+        .LeftMargin = Application.CentimetersToPoints(0.7)
+        .RightMargin = Application.CentimetersToPoints(0.7)
+        .TopMargin = Application.CentimetersToPoints(0.7)
+        .BottomMargin = Application.CentimetersToPoints(0.7)
+    End With
+
+    If Not ApplyClientPdfPageSetup(wksPreflight) Then
+        Err.Raise 1024, METHOD_NAME, "Preflight page setup could not be applied."
+    End If
+
+    wksPreflight.PrintOut _
+        Copies:=1, _
+        ActivePrinter:=POWER_PDF_PRINTER, _
+        Collate:=True, _
+        IgnorePrintAreas:=False
+
+    wkbPreflight.Close SaveChanges:=False
+    Set wksPreflight = Nothing
+    Set wkbPreflight = Nothing
+
+    strPreflightPdfPath = WaitForPowerPdfPreflightFile( _
+        gstrStagingFolder, _
+        CLIENT_PDF_PREFLIGHT_TIMEOUT_SECONDS)
+
+    If Len(strPreflightPdfPath) = 0 Then
+        Err.Raise 1014, METHOD_NAME, _
+                  "Power PDF did not save the preflight automatically. " & _
+                  "In global Power PDF Printing Preferences set Destination > Naming Method to " & _
+                  "'Save in named folder; auto-name file', set the folder to " & _
+                  gstrStagingFolder & ", and disable View Resulting PDF."
+    End If
+
+    If Not IsClientPdfCompatible(strPreflightPdfPath, strValidationDetails) Then
+        Err.Raise 1024, METHOD_NAME, strValidationDetails
+    End If
+
+    ValidatePowerPdfConfiguration = True
+    strValidationError = vbNullString
+
+ExitFunction:
+    On Error Resume Next
+    If Not wkbPreflight Is Nothing Then
+        wkbPreflight.Close SaveChanges:=False
+    End If
+    If Len(strPreflightPdfPath) > 0 Then
+        If Len(Dir$(strPreflightPdfPath)) > 0 Then
+            Kill strPreflightPdfPath
+        End If
+    End If
+    On Error GoTo 0
+    If blnDisplayAlertsCaptured Then
+        Application.DisplayAlerts = blnPreviousDisplayAlerts
+    End If
+    Set wksPreflight = Nothing
+    Set wkbPreflight = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ValidatePowerPdfConfiguration = False
+    strValidationError = errDescription
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "stagingFolder;preflightPdfPath;validationDetails", _
+        gstrStagingFolder, _
+        strPreflightPdfPath, _
+        strValidationDetails
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String, ByVal lngTimeoutSeconds As Long
+' Returns:       String
+' Description:   Waits once for the technical preflight PDF and returns its stable file path.
+'-------------------------------------------------------------------------------
+Private Function WaitForPowerPdfPreflightFile(ByVal strFolderPath As String, _
+                                               ByVal lngTimeoutSeconds As Long) As String
+    Const METHOD_NAME As String = "WaitForPowerPdfPreflightFile"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dblStartTime As Double
+    Dim lngCurrentSize As Long
+    Dim lngPreviousSize As Long
+    Dim strCandidatePath As String
+    Dim strPreviousPath As String
+
+    On Error GoTo ErrorHandler
+
+    dblStartTime = Timer
+    lngPreviousSize = -1
+
+    Do While GetElapsedSeconds(dblStartTime) < lngTimeoutSeconds
+        strCandidatePath = FindNewestPdfInFolder(strFolderPath)
+
+        If Len(strCandidatePath) > 0 Then
+            If Len(Dir$(strCandidatePath)) > 0 Then
+                lngCurrentSize = FileLen(strCandidatePath)
+
+                If lngCurrentSize > 0 _
+                    And StrComp(strCandidatePath, strPreviousPath, vbTextCompare) = 0 _
+                    And lngCurrentSize = lngPreviousSize _
+                    And DateDiff("s", FileDateTime(strCandidatePath), Now) >= 1 Then
+
+                    WaitForPowerPdfPreflightFile = strCandidatePath
+                    GoTo ExitFunction
+                End If
+
+                strPreviousPath = strCandidatePath
+                lngPreviousSize = lngCurrentSize
+            End If
+        End If
+
+        DoEvents
+        Application.Wait DateAdd("s", 1, Now)
+    Loop
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    WaitForPowerPdfPreflightFile = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;timeoutSeconds", _
+        strFolderPath, _
+        lngTimeoutSeconds
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFolderPath As String
+' Returns:       String
+' Description:   Returns the newest PDF file found in the specified folder.
+'-------------------------------------------------------------------------------
+Private Function FindNewestPdfInFolder(ByVal strFolderPath As String) As String
+    Const METHOD_NAME As String = "FindNewestPdfInFolder"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dtNewestModified As Date
+    Dim objFile As Object
+    Dim objFileSystem As Object
+    Dim objFolder As Object
+
+    On Error GoTo ErrorHandler
+
+    Set objFileSystem = CreateObject("Scripting.FileSystemObject")
+    Set objFolder = objFileSystem.GetFolder(strFolderPath)
+
+    For Each objFile In objFolder.Files
+        If LCase$(objFileSystem.GetExtensionName(objFile.Name)) = "pdf" Then
+            If dtNewestModified = 0 Or objFile.DateLastModified > dtNewestModified Then
+                dtNewestModified = objFile.DateLastModified
+                FindNewestPdfInFolder = objFile.Path
+            End If
+        End If
+    Next objFile
+
+ExitFunction:
+    Set objFile = Nothing
+    Set objFolder = Nothing
+    Set objFileSystem = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    FindNewestPdfInFolder = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath", _
+        strFolderPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFilePath As String, ByRef strValidationDetails As String
+' Returns:       Boolean
+' Description:   Verifies PDF 1.4 and the effective page dimensions; an omitted CropBox inherits MediaBox.
+'-------------------------------------------------------------------------------
+Private Function IsClientPdfCompatible(ByVal strFilePath As String, _
+                                       ByRef strValidationDetails As String) As Boolean
+    Const METHOD_NAME As String = "IsClientPdfCompatible"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnCropBoxFound As Boolean
+    Dim blnMediaBoxFound As Boolean
+    Dim dblCropHeight As Double
+    Dim dblCropWidth As Double
+    Dim dblMediaHeight As Double
+    Dim dblMediaWidth As Double
+    Dim strHeader As String
+    Dim strPdfText As String
+
+    On Error GoTo ErrorHandler
+
+    IsClientPdfCompatible = False
+    strHeader = GetPdfHeaderVersion(strFilePath)
+    strPdfText = ReadPdfPrefixText(strFilePath, CLIENT_PDF_PREFIX_READ_BYTES)
+    blnMediaBoxFound = TryGetPdfBoxDimensions( _
+        strPdfText, _
+        "MediaBox", _
+        dblMediaWidth, _
+        dblMediaHeight)
+    blnCropBoxFound = TryGetPdfBoxDimensions( _
+        strPdfText, _
+        "CropBox", _
+        dblCropWidth, _
+        dblCropHeight)
+
+    If StrComp(strHeader, CLIENT_PDF_HEADER, vbBinaryCompare) <> 0 Then
+        strValidationDetails = "Expected PDF 1.4 but found " & strHeader & ". Set the global Power PDF printing profile to PDF 1.4."
+        GoTo ExitFunction
+    End If
+
+    If Not blnMediaBoxFound Then
+        strValidationDetails = "MediaBox was not found in the Power PDF preflight output."
+        GoTo ExitFunction
+    End If
+
+    If Not blnCropBoxFound Then
+        dblCropWidth = dblMediaWidth
+        dblCropHeight = dblMediaHeight
+    End If
+
+    If Abs(dblMediaWidth - CLIENT_PDF_MEDIA_WIDTH_POINTS) > CLIENT_PDF_PAGE_TOLERANCE_POINTS _
+        Or Abs(dblMediaHeight - CLIENT_PDF_MEDIA_HEIGHT_POINTS) > CLIENT_PDF_PAGE_TOLERANCE_POINTS Then
+
+        strValidationDetails = "Expected MediaBox 1368 x 684 points but found " & _
+                               CStr(dblMediaWidth) & " x " & CStr(dblMediaHeight) & "."
+        GoTo ExitFunction
+    End If
+
+    If Abs(dblCropWidth - CLIENT_PDF_MEDIA_WIDTH_POINTS) > CLIENT_PDF_PAGE_TOLERANCE_POINTS _
+        Or Abs(dblCropHeight - CLIENT_PDF_MEDIA_HEIGHT_POINTS) > CLIENT_PDF_PAGE_TOLERANCE_POINTS Then
+
+        strValidationDetails = "Expected CropBox 1368 x 684 points but found " & _
+                               CStr(dblCropWidth) & " x " & CStr(dblCropHeight) & "."
+        GoTo ExitFunction
+    End If
+
+    strValidationDetails = vbNullString
+    IsClientPdfCompatible = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    IsClientPdfCompatible = False
+    strValidationDetails = errDescription
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "filePath", _
+        strFilePath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strFilePath As String, ByVal lngMaximumBytes As Long
+' Returns:       String
+' Description:   Reads the initial PDF bytes used to locate page dictionary boxes.
+'-------------------------------------------------------------------------------
+Private Function ReadPdfPrefixText(ByVal strFilePath As String, _
+                                   ByVal lngMaximumBytes As Long) As String
+    Const METHOD_NAME As String = "ReadPdfPrefixText"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngFileLength As Long
+    Dim lngFileNumber As Long
+    Dim lngReadLength As Long
+    Dim strPdfText As String
+
+    On Error GoTo ErrorHandler
+
+    lngFileNumber = FreeFile
+    Open strFilePath For Binary Access Read As #lngFileNumber
+    lngFileLength = LOF(lngFileNumber)
+    lngReadLength = lngFileLength
+
+    If lngReadLength > lngMaximumBytes Then
+        lngReadLength = lngMaximumBytes
+    End If
+
+    If lngReadLength > 0 Then
+        strPdfText = Space$(lngReadLength)
+        Get #lngFileNumber, 1, strPdfText
+    End If
+
+    Close #lngFileNumber
+    lngFileNumber = 0
+    ReadPdfPrefixText = strPdfText
+
+ExitFunction:
+    If lngFileNumber > 0 Then
+        On Error Resume Next
+        Close #lngFileNumber
+        On Error GoTo 0
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ReadPdfPrefixText = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "filePath;maximumBytes", _
+        strFilePath, _
+        lngMaximumBytes
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strPdfText As String, ByVal strBoxName As String, ByRef dblWidth As Double, ByRef dblHeight As Double
+' Returns:       Boolean
+' Description:   Parses a direct PDF page-box array and returns its width and height in points.
+'-------------------------------------------------------------------------------
+Private Function TryGetPdfBoxDimensions(ByVal strPdfText As String, _
+                                        ByVal strBoxName As String, _
+                                        ByRef dblWidth As Double, _
+                                        ByRef dblHeight As Double) As Boolean
+    Const METHOD_NAME As String = "TryGetPdfBoxDimensions"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim arrTokens As Variant
+    Dim dblBottom As Double
+    Dim dblLeft As Double
+    Dim dblRight As Double
+    Dim dblTop As Double
+    Dim lngBoxPosition As Long
+    Dim lngClosePosition As Long
+    Dim lngOpenPosition As Long
+    Dim strBoxText As String
+
+    On Error GoTo ErrorHandler
+
+    lngBoxPosition = InStr(1, strPdfText, "/" & strBoxName, vbBinaryCompare)
+    If lngBoxPosition = 0 Then
+        GoTo ExitFunction
+    End If
+
+    lngOpenPosition = InStr(lngBoxPosition, strPdfText, "[", vbBinaryCompare)
+    If lngOpenPosition = 0 Then
+        GoTo ExitFunction
+    End If
+
+    lngClosePosition = InStr(lngOpenPosition + 1, strPdfText, "]", vbBinaryCompare)
+    If lngClosePosition = 0 Then
+        GoTo ExitFunction
+    End If
+
+    strBoxText = Mid$( _
+        strPdfText, _
+        lngOpenPosition + 1, _
+        lngClosePosition - lngOpenPosition - 1)
+    strBoxText = NormalizePdfBoxText(strBoxText)
+    arrTokens = Split(strBoxText, " ")
+
+    If UBound(arrTokens) < 3 Then
+        GoTo ExitFunction
+    End If
+
+    dblLeft = VBA.Val(CStr(arrTokens(0)))
+    dblBottom = VBA.Val(CStr(arrTokens(1)))
+    dblRight = VBA.Val(CStr(arrTokens(2)))
+    dblTop = VBA.Val(CStr(arrTokens(3)))
+    dblWidth = Abs(dblRight - dblLeft)
+    dblHeight = Abs(dblTop - dblBottom)
+    TryGetPdfBoxDimensions = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    TryGetPdfBoxDimensions = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "boxName", _
+        strBoxName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal strValue As String
+' Returns:       String
+' Description:   Normalizes PDF page-box whitespace for numeric parsing.
+'-------------------------------------------------------------------------------
+Private Function NormalizePdfBoxText(ByVal strValue As String) As String
+    Const METHOD_NAME As String = "NormalizePdfBoxText"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strResult As String
+
+    On Error GoTo ErrorHandler
+
+    strResult = Replace$(strValue, vbCr, " ")
+    strResult = Replace$(strResult, vbLf, " ")
+    strResult = Replace$(strResult, vbTab, " ")
+    strResult = Trim$(strResult)
+
+    Do While InStr(1, strResult, "  ", vbBinaryCompare) > 0
+        strResult = Replace$(strResult, "  ", " ")
+    Loop
+
+    NormalizePdfBoxText = strResult
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    NormalizePdfBoxText = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal dblStartTime As Double
+' Returns:       Double
+' Description:   Returns elapsed Timer seconds and handles a midnight rollover.
+'-------------------------------------------------------------------------------
+Private Function GetElapsedSeconds(ByVal dblStartTime As Double) As Double
+    Const METHOD_NAME As String = "GetElapsedSeconds"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dblElapsed As Double
+
+    On Error GoTo ErrorHandler
+
+    dblElapsed = Timer - dblStartTime
+    If dblElapsed < 0 Then
+        dblElapsed = dblElapsed + 86400#
+    End If
+    GetElapsedSeconds = dblElapsed
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetElapsedSeconds = 0
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "startTime", _
+        dblStartTime
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Restores the printer that was active before the first queued Power PDF job.
+'-------------------------------------------------------------------------------
+Private Sub RestorePreviousPrinter()
+    Const METHOD_NAME As String = "RestorePreviousPrinter"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If gblnPrinterCaptured Then
+        On Error Resume Next
+        Application.ActivePrinter = gstrPreviousPrinter
+        On Error GoTo ErrorHandler
+        gblnPrinterCaptured = False
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    gblnPrinterCaptured = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "previousPrinter", _
+        gstrPreviousPrinter
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Clears all module-level queue objects after completion or cancellation.
+'-------------------------------------------------------------------------------
+Private Sub ResetPowerPdfState()
+    Const METHOD_NAME As String = "ResetPowerPdfState"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Set gdictExpectedPrefixes = Nothing
+    Set gdictQueuedAt = Nothing
+    Set gdictSpoolFiles = Nothing
+    Set gdictTargetPaths = Nothing
+    gblnBatchActive = False
+    gblnDelayWarningLogged = False
+    gblnPumpRunning = False
+    gblnPumpScheduled = False
+    gdtNextPump = 0
+    glngJobCounter = 0
+    gstrPreviousPrinter = vbNullString
+    gstrSpoolFolder = vbNullString
+    gstrStagingFolder = vbNullString
+    gstrCompletionCallback = vbNullString
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub

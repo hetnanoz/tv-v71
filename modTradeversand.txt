@@ -1,0 +1,3165 @@
+Option Explicit
+
+#If VBA7 Then
+    Private Declare PtrSafe Function EmptyWorkingSet Lib "psapi.dll" (ByVal hProcess As LongPtr) As Long
+    Private Declare PtrSafe Function GetCurrentProcess Lib "kernel32.dll" () As LongPtr
+    Private Declare PtrSafe Function GetCurrentProcessId Lib "kernel32" () As Long
+#End If
+
+Private Const CLASS_NAME As String = "modTradeversand"
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByRef inputDataArr As Variant, ByRef dictMapping As Object, Optional ByRef outStats As String = "", Optional ByVal skipCsv As Boolean = False, Optional ByVal skipPdfXlsx As Boolean = False, Optional ByVal pdfXlsxPrefixOverride As String = "", Optional ByVal csvPrefixOverride As String = "", Optional ByVal csvNrOverride As String = "", Optional ByVal isChildPass As Boolean = False, Optional ByVal skipFfyCsv As Boolean = False, Optional ByVal ffyPrefixOverride As String = "", Optional ByRef fondsArr As Variant
+' Returns:       ---
+' Description:   Generates configured CSV, FFY, PDF, and XLSX reports for all mapped funds.
+'-------------------------------------------------------------------------------
+Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMapping As Object, _
+                             Optional ByRef outStats As String = "", _
+                             Optional ByVal skipCsv As Boolean = False, _
+                             Optional ByVal skipPdfXlsx As Boolean = False, _
+                             Optional ByVal pdfXlsxPrefixOverride As String = "", _
+                             Optional ByVal csvPrefixOverride As String = "", _
+                             Optional ByVal csvNrOverride As String = "", _
+                             Optional ByVal isChildPass As Boolean = False, _
+                             Optional ByVal skipFfyCsv As Boolean = False, _
+                             Optional ByVal ffyPrefixOverride As String = "", _
+                             Optional ByRef fondsArr As Variant)
+    Const METHOD_NAME As String = "generatePerfectReportsV3"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnPreviousDisplayAlerts As Boolean
+    Dim blnPreviousEnableEvents As Boolean
+    Dim blnPreviousScreenUpdating As Boolean
+    Dim blnSettingsCaptured As Boolean
+    Dim calculationPrevious As Excel.XlCalculation
+    Dim varPreviousStatusBar As Variant
+    Dim originalUseSystem As Boolean
+    Dim originalDecimal As String
+    Dim originalThousands As String
+    Dim missingFundsList As String
+    Dim dictFunds As Object
+    Dim dictSkippedKvg As Object
+    Dim fundKey As Variant
+    Dim countSuccess As Long
+    Dim fundCounter As Long
+    Dim wsMacro As Excel.Worksheet
+    Dim resultsFileNamePrefix As String
+    Dim csvNameNr As String
+    Dim pathXlsx As String
+    Dim pathPdf As String
+    Dim pathCsv As String
+    Dim tempXlsx As String
+    Dim tempPdf As String
+    Dim logoFolder As String
+    Dim logoFileName As String
+    Dim logoFullPath As String
+    Dim tradesPerPage As Long
+    Dim createXlsxFlag As Boolean
+    Dim createCsvFlag As Boolean
+    Dim inclFreeFlag As Boolean
+    Dim inclNotFoundFlag As Boolean
+    Dim csvFullName As String
+    Dim csvDateStr As String
+    Dim fundIdStr As String
+    Dim fileSystemObj As Object
+    Dim inputLastRow As Long
+    Dim diagT As Double
+    Dim diagStart As Double
+    Dim cachedPrevBizDay As Date
+    Dim safeCsvPrefix As String
+    Dim totalFundsForReport As Long
+    Dim countKey As Variant
+    Dim csvCount As Long
+    Dim effectivePdfXlsxPrefix As String
+    Dim effectiveCsvPrefix As String
+    Dim effectiveCsvNr As String
+    Dim createFfyCsvFlag As Boolean
+    Dim ffyUseExterneFondNr As Boolean
+    Dim effectiveFfyPrefix As String
+    Dim safeFfyPrefix As String
+    Dim ffyFullName As String
+    Dim ffyCount As Long
+    Dim depotnrToExterneFondNr As Object
+    Dim hasFfyOutput As Boolean
+    Dim dictFondsbez As Object
+    Dim createFfyPdfFlag As Boolean
+    Dim ffyPdfFullName As String
+
+    On Error GoTo ErrorHandler
+
+    outStats = vbNullString
+    blnPreviousDisplayAlerts = Application.DisplayAlerts
+    blnPreviousEnableEvents = Application.EnableEvents
+    blnPreviousScreenUpdating = Application.ScreenUpdating
+    calculationPrevious = Application.Calculation
+    varPreviousStatusBar = Application.StatusBar
+    originalUseSystem = Application.UseSystemSeparators
+    originalDecimal = Application.DecimalSeparator
+    originalThousands = Application.ThousandsSeparator
+    blnSettingsCaptured = True
+
+    missingFundsList = ""
+    countSuccess = 0
+    fundCounter = 0
+    Application.CutCopyMode = False
+    DoEvents
+
+    Application.DecimalSeparator = "."
+    Application.ThousandsSeparator = " "
+    Application.UseSystemSeparators = False
+
+    Set wsMacro = ThisWorkbook.Sheets("Tradeversand")
+
+    wsMacro.Calculate
+    DoEvents
+
+    resultsFileNamePrefix = wsMacro.Range("results_file_name").Value
+    csvNameNr = wsMacro.Range("csv_name_nr").Value
+
+    If pdfXlsxPrefixOverride <> "" Then
+        effectivePdfXlsxPrefix = pdfXlsxPrefixOverride
+    Else
+        effectivePdfXlsxPrefix = resultsFileNamePrefix
+    End If
+
+    If csvPrefixOverride <> "" Then
+        effectiveCsvPrefix = csvPrefixOverride
+    Else
+        effectiveCsvPrefix = resultsFileNamePrefix
+    End If
+
+    If csvNrOverride <> "" Then
+        effectiveCsvNr = csvNrOverride
+    Else
+        effectiveCsvNr = csvNameNr
+    End If
+
+    If ffyPrefixOverride <> "" Then
+        effectiveFfyPrefix = ffyPrefixOverride
+    Else
+        effectiveFfyPrefix = resultsFileNamePrefix
+    End If
+
+    pathXlsx = wsMacro.Range("results_path_xlsx").Value
+    pathPdf = wsMacro.Range("results_path_pdf").Value
+    pathCsv = wsMacro.Range("results_path_csv").Value
+
+    If pathXlsx <> "" And Right(pathXlsx, 1) <> "\" Then pathXlsx = pathXlsx & "\"
+    If pathPdf <> "" And Right(pathPdf, 1) <> "\" Then pathPdf = pathPdf & "\"
+    If pathCsv <> "" And Right(pathCsv, 1) <> "\" Then pathCsv = pathCsv & "\"
+
+    logoFolder = wsMacro.Range("bnp_logo_loc").Value
+    logoFileName = wsMacro.Range("bnp_logo_name").Value
+    If logoFolder <> "" And Right(logoFolder, 1) <> "\" Then logoFolder = logoFolder & "\"
+    logoFullPath = logoFolder & logoFileName
+
+    tradesPerPage = extractNumber(wsMacro.Range("trades_per_pdf_page").Value)
+    If tradesPerPage <= 0 Then tradesPerPage = 99999
+
+    createXlsxFlag = UCase(Trim(safeString(wsMacro.Range("create_xlsx_file").Value))) = "TRUE"
+    inclFreeFlag = UCase(Trim(safeString(wsMacro.Range("incl_free_of_payment").Value))) = "TRUE"
+    createCsvFlag = UCase(Trim(safeString(wsMacro.Range("create_csv_file").Value))) = "TRUE"
+    inclNotFoundFlag = UCase(Trim(safeString(wsMacro.Range("include_not_found_funds").Value))) = "TRUE"
+    createFfyCsvFlag = UCase(Trim(safeString(wsMacro.Range("create_ffy_csv_file").Value))) = "TRUE"
+    ffyUseExterneFondNr = UCase(Trim(safeString(wsMacro.Range("ffy_use_externe_fond_nr").Value))) = "TRUE"
+    createFfyPdfFlag = UCase(Trim(safeString(wsMacro.Range("create_ffy_pdf_file").Value))) = "TRUE"
+
+    If Not isChildPass Then
+        If Not assertClientInPath(pathXlsx, resultsFileNamePrefix) Then
+            Err.Raise 1020, , "SAFETY ABORT: XLSX path does not match client name. Path: " & pathXlsx & ", Client: " & resultsFileNamePrefix
+        End If
+        If Not assertClientInPath(pathPdf, resultsFileNamePrefix) Then
+            Err.Raise 1021, , "SAFETY ABORT: PDF path does not match client name. Path: " & pathPdf & ", Client: " & resultsFileNamePrefix
+        End If
+        If createCsvFlag And Not assertClientInPath(pathCsv, resultsFileNamePrefix) Then
+            Err.Raise 1022, , "SAFETY ABORT: CSV path does not match client name. Path: " & pathCsv & ", Client: " & resultsFileNamePrefix
+        End If
+
+        If createCsvFlag And pathCsv = "" Then
+            Err.Raise 1023, , "CSV path is empty for client " & resultsFileNamePrefix
+        End If
+
+        Call ClearFolderContentSafe(pathXlsx, "*.xlsx")
+        Call ClearFolderContentSafe(pathPdf, "*.pdf")
+        Call ClearFolderContentSafe(pathCsv, "*.csv")
+    End If
+
+    Set fileSystemObj = CreateObject("Scripting.FileSystemObject")
+    Call CreateFolderIfMissing(pathXlsx)
+    Call CreateFolderIfMissing(pathPdf)
+    Call CreateFolderIfMissing(pathCsv)
+
+    tempXlsx = Environ("TEMP") & "\MacroXlsx_" & resultsFileNamePrefix & "_" & Format(Now, "hhmmss") & "\"
+    tempPdf = Environ("TEMP") & "\MacroPdf_" & resultsFileNamePrefix & "_" & Format(Now, "hhmmss") & "\"
+    If Not fileSystemObj.FolderExists(tempXlsx) Then MkDir tempXlsx
+    If Not fileSystemObj.FolderExists(tempPdf) Then MkDir tempPdf
+
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+    diagStart = Timer
+    diagT = Timer
+
+    If Not IsArray(inputDataArr) Then GoTo ExitSub
+    inputLastRow = UBound(inputDataArr, 1)
+
+    diagT = Timer
+
+    If createCsvFlag And Not skipCsv Then
+        safeCsvPrefix = Replace(Replace(Replace(effectiveCsvPrefix, "/", "_"), "\", "_"), ":", "")
+
+        csvDateStr = Format(Date, "yyyymmdd")
+        If createFfyCsvFlag Then
+            csvFullName = safeCsvPrefix & "-WP_Geschafte_" & effectiveCsvNr & "_" & csvDateStr & "_new_version.csv"
+        Else
+            csvFullName = safeCsvPrefix & "-WP_Geschafte_" & effectiveCsvNr & "_" & csvDateStr & ".csv"
+        End If
+
+        Call saveArrayAsCsv(inputDataArr, pathCsv & csvFullName, dictMapping, inclFreeFlag)
+    End If
+    diagT = Timer
+
+    hasFfyOutput = False
+    If createFfyCsvFlag And Not skipFfyCsv Then
+        safeFfyPrefix = Replace(Replace(Replace(effectiveFfyPrefix, "/", "_"), "\", "_"), ":", "")
+
+        csvDateStr = Format(Date, "yyyymmdd")
+        ffyFullName = safeFfyPrefix & "-WP_Geschafte_" & effectiveCsvNr & "_" & csvDateStr & ".csv"
+
+        If ffyUseExterneFondNr Then
+            Set depotnrToExterneFondNr = buildDepotnrToExterneFondNrMap(fondsArr)
+        Else
+            Set depotnrToExterneFondNr = Nothing
+        End If
+
+        Call saveArrayAsFfyCsv(inputDataArr, pathCsv & ffyFullName, dictMapping, _
+                               ffyUseExterneFondNr, depotnrToExterneFondNr, inclFreeFlag)
+
+        If Dir(pathCsv & ffyFullName) <> "" Then
+            hasFfyOutput = True
+        
+
+        If createFfyPdfFlag Then
+            ffyPdfFullName = safeFfyPrefix & "-WP_Geschafte_" & effectiveCsvNr & "_" & csvDateStr & ".pdf"
+            Call convertFfyCsvToPdf(pathCsv & ffyFullName, pathPdf & ffyPdfFullName)
+        End If
+        End If
+        Set depotnrToExterneFondNr = Nothing
+    End If
+    diagT = Timer
+
+    Set dictFunds = getUniqueFundIds(inputDataArr, inputLastRow, inclFreeFlag)
+    Set dictFondsbez = buildFondsbezeichnungMap(fondsArr)
+
+    diagT = Timer
+
+    cachedPrevBizDay = getPreviousBusinessDay()
+
+    totalFundsForReport = 0
+    For Each countKey In dictFunds.Keys
+        If dictMapping.Exists(CStr(countKey)) Then
+            totalFundsForReport = totalFundsForReport + 1
+        End If
+    Next countKey
+    progressSetTotalFunds totalFundsForReport
+
+    For Each fundKey In dictFunds.Keys
+        fundIdStr = CStr(fundKey)
+
+        If dictMapping.Exists(fundIdStr) Then
+            fundCounter = fundCounter + 1
+            progressStartFund fundCounter, CStr(dictMapping(fundIdStr))
+
+            If Not skipPdfXlsx Then
+                Call processFundZeroTemplate(fundIdStr, inputDataArr, inputLastRow, tempXlsx, pathPdf, _
+                                             dictMapping, effectivePdfXlsxPrefix, tradesPerPage, _
+                                             createXlsxFlag, inclFreeFlag, logoFullPath, missingFundsList, _
+                                             cachedPrevBizDay, dictFondsbez)
+            End If
+            countSuccess = countSuccess + 1
+
+            If fundCounter Mod 25 = 0 Then
+                Application.CutCopyMode = False
+                DoEvents
+                Call flushSystemRAM
+            End If
+
+        ElseIf inclNotFoundFlag Then
+            missingFundsList = missingFundsList & fundIdStr & vbCrLf
+        End If
+
+    Next fundKey
+
+    progressSubStage "Transferring files to target drive"
+
+    If fileSystemObj.FolderExists(tempXlsx) Then
+        If Dir(tempXlsx & "*.*") <> "" Then Call fastCopyFiles(tempXlsx, pathXlsx)
+        fileSystemObj.DeleteFolder Left(tempXlsx, Len(tempXlsx) - 1), True
+    End If
+
+    If fileSystemObj.FolderExists(tempPdf) Then
+        If Dir(tempPdf & "*.*") <> "" Then Call fastCopyFiles(tempPdf, pathPdf)
+        fileSystemObj.DeleteFolder Left(tempPdf, Len(tempPdf) - 1), True
+    End If
+
+    csvCount = 0
+    If createCsvFlag And Dir(pathCsv & csvFullName) <> "" Then csvCount = 1
+
+    ffyCount = 0
+    If hasFfyOutput Then ffyCount = 1
+
+    outStats = csvCount & " CSV, " & fundCounter & " PDF"
+    If createXlsxFlag Then outStats = outStats & ", " & fundCounter & " XLSX"
+    If ffyCount > 0 Then outStats = outStats & ", " & ffyCount & " FFY"
+
+ExitSub:
+    Set dictFunds = Nothing
+    Set dictSkippedKvg = Nothing
+    Set fileSystemObj = Nothing
+    Set dictFondsbez = Nothing
+    Set depotnrToExterneFondNr = Nothing
+    Set wsMacro = Nothing
+    If blnSettingsCaptured Then
+        Application.DecimalSeparator = originalDecimal
+        Application.ThousandsSeparator = originalThousands
+        Application.UseSystemSeparators = originalUseSystem
+        Application.Calculation = calculationPrevious
+        Application.ScreenUpdating = blnPreviousScreenUpdating
+        Application.DisplayAlerts = blnPreviousDisplayAlerts
+        Application.EnableEvents = blnPreviousEnableEvents
+        Application.StatusBar = varPreviousStatusBar
+    End If
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal folderPath As String, ByVal baseName As String, ByVal kvgToMatch As String, ByRef dictSkipped As Object
+' Returns:       Object
+' Description:   Reads the latest Fondsliste and returns the fund mapping for the requested KVG.
+'-------------------------------------------------------------------------------
+Public Function getMappingFromFondsliste(ByVal folderPath As String, ByVal baseName As String, ByVal kvgToMatch As String, _
+                                  ByRef dictSkipped As Object) As Object
+    Const METHOD_NAME As String = "getMappingFromFondsliste"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dict As Object
+    Dim fileName As String
+    Dim latestFile As String
+    Dim latestDate As Long
+    Dim currentDate As Long
+    Dim wbMapping As Excel.Workbook
+    Dim wsMapping As Excel.Worksheet
+    Dim wasAlreadyOpen As Boolean
+    Dim lastRow As Long
+    Dim i As Long
+    Dim rawID As String
+    Dim cleanID As String
+    Dim friendlyName As String
+    Dim status As String
+    Dim currentKvg As String
+    Dim dataArr As Variant
+
+    On Error GoTo ErrorHandler
+
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    If Right(folderPath, 1) <> "\" Then folderPath = folderPath & "\"
+    fileName = Dir(folderPath & baseName & "_*.xls*")
+
+    Do While fileName <> ""
+        currentDate = ParseDateFromFileName(fileName)
+        If currentDate > latestDate Then
+            latestDate = currentDate
+            latestFile = fileName
+        End If
+        fileName = Dir()
+    Loop
+
+    If latestFile = "" Then
+        Err.Raise 1030, , "Fondsliste file not found: " & baseName
+    End If
+
+    wasAlreadyOpen = IsWorkbookOpen(latestFile)
+    If wasAlreadyOpen Then
+        Set wbMapping = Workbooks(latestFile)
+    Else
+        Set wbMapping = Workbooks.Open(folderPath & latestFile, ReadOnly:=True)
+    End If
+
+    Set wsMapping = wbMapping.Sheets(1)
+    lastRow = wsMapping.Cells(wsMapping.Rows.Count, "N").End(xlUp).Row
+
+    If lastRow >= 2 Then
+        dataArr = wsMapping.Range("A1:N" & lastRow).Value
+
+        For i = 2 To lastRow
+            status = Trim(safeString(dataArr(i, 2)))
+            currentKvg = Trim(safeString(dataArr(i, 9)))
+
+            If UCase(status) = "OPEN" Then
+                rawID = Replace(safeString(dataArr(i, 14)), " ", "")
+                If Len(rawID) >= 11 Then
+                    cleanID = Right(rawID, 11)
+                    friendlyName = safeString(dataArr(i, 4))
+
+                    If UCase(currentKvg) = UCase(kvgToMatch) Then
+                        If Not dict.Exists(cleanID) Then dict.Add cleanID, friendlyName
+                    Else
+                        If Not dictSkipped.Exists(cleanID) Then dictSkipped.Add cleanID, currentKvg
+                    End If
+                End If
+            End If
+        Next i
+    End If
+
+    Set getMappingFromFondsliste = dict
+    GoTo ExitFunction
+
+ExitFunction:
+    If Not wbMapping Is Nothing Then
+        If Not wasAlreadyOpen Then
+            On Error Resume Next
+            wbMapping.Close SaveChanges:=False
+            On Error GoTo 0
+        End If
+    End If
+    Set wsMapping = Nothing
+    Set wbMapping = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set getMappingFromFondsliste = dict
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;baseName;kvgToMatch", _
+        folderPath, _
+        baseName, _
+        kvgToMatch
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    fundId As String, ByRef inputArr As Variant, ByVal lastInRow As Long, pXlsx As String, pPdf As String, dictMap As Object, prefix As String, limitPerPage As Long, saveXlsx As Boolean, inclFree As Boolean, logoPath As String, ByRef missingFundsList As String, ByVal prevBizDay As Date, ByRef dictFondsbez As Object
+' Returns:       ---
+' Description:   Builds and exports one fund report from the transaction array.
+'-------------------------------------------------------------------------------
+Public Sub processFundZeroTemplate(fundId As String, ByRef inputArr As Variant, ByVal lastInRow As Long, _
+                            pXlsx As String, pPdf As String, dictMap As Object, _
+                            prefix As String, limitPerPage As Long, saveXlsx As Boolean, inclFree As Boolean, _
+                            logoPath As String, ByRef missingFundsList As String, ByVal prevBizDay As Date, _
+                            ByRef dictFondsbez As Object)
+    Const METHOD_NAME As String = "processFundZeroTemplate"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnPreviousDisplayAlerts As Boolean
+    Dim blnRawOraclePdfEnabled As Boolean
+    Dim blnPreviousEnableEvents As Boolean
+    Dim blnSettingsCaptured As Boolean
+    Dim wbOut As Excel.Workbook
+    Dim wsOut As Excel.Worksheet
+    Dim wksMacro As Excel.Worksheet
+    Dim r As Long
+    Dim outRow As Long
+    Dim tradeCount As Long
+    Dim c As Long
+    Dim friendlyName As String
+    Dim todayStr As String
+    Dim pdfName As String
+    Dim xlsxName As String
+    Dim originalView As Long
+    Dim baseNamePdf As String
+    Dim baseNameXlsx As String
+    Dim suffixStr As String
+    Dim maxFriendly As Long
+    Dim fullPdfPath As String
+
+    On Error GoTo ErrorHandler
+
+    blnPreviousDisplayAlerts = Application.DisplayAlerts
+    blnPreviousEnableEvents = Application.EnableEvents
+    blnSettingsCaptured = True
+
+    DoEvents
+    Application.CutCopyMode = False
+
+    Set wbOut = createWorkbookSafe()
+    Set wsOut = wbOut.Sheets(1)
+
+    Call insertLogo(wsOut, logoPath)
+    Call buildPerfectHeaders(wsOut)
+
+    outRow = 7
+    tradeCount = 0
+
+    originalView = ActiveWindow.View
+    If originalView <> xlNormalView Then ActiveWindow.View = xlNormalView
+
+    For r = 2 To lastInRow
+        If Right(safeString(inputArr(r, 4)), 11) = fundId And (inclFree = True Or extractNumber(inputArr(r, 52)) <> 0) Then
+            If UCase(Trim(safeString(inputArr(r, 15)))) = "L/B" Then GoTo nextRow
+
+            tradeCount = tradeCount + 1
+
+            If tradeCount > 1 Then
+                With wsOut.Range(wsOut.Cells(outRow, 1), wsOut.Cells(outRow, 22))
+                    .RowHeight = 5
+                    .Interior.Color = RGB(220, 220, 220)
+                End With
+            
+                outRow = outRow + 1
+            End If
+
+            Call fillTradeData(inputArr, r, wsOut, outRow, dictFondsbez)
+            outRow = outRow + 2
+
+        End If
+nextRow:
+    Next r
+
+    If tradeCount = 0 Then
+        GoTo ExitSub
+    End If
+
+    If ActiveWindow.View <> originalView Then ActiveWindow.View = originalView
+
+    With wsOut.Range("A1:V" & (outRow + 2)).Font
+        .Name = "Times New Roman"
+        .Size = 8
+    End With
+
+    wsOut.Range(wsOut.Cells(5, 1), wsOut.Cells(outRow - 1, 22)).BorderAround LineStyle:=xlContinuous, Weight:=xlThin
+    wsOut.Columns("A:V").EntireColumn.AutoFit
+
+    For c = 1 To 22
+        If wsOut.Columns(c).ColumnWidth < 8 Then wsOut.Columns(c).ColumnWidth = 8
+        wsOut.Columns(c).ColumnWidth = wsOut.Columns(c).ColumnWidth + 1
+    Next c
+
+    wsOut.Cells(outRow + 1, 1).Value = "Diese Abrechnung wurde maschinell erstellt und ist ohne eigenhaendige Unterschrift gueltig"
+    wsOut.Cells(outRow + 1, 1).Font.Italic = False
+    wsOut.Cells(outRow + 1, 1).Font.Bold = True
+    wsOut.Cells(outRow + 1, 1).Font.Size = 9
+
+    todayStr = Format(prevBizDay, "yyyymmdd")
+
+    If dictMap.Exists(fundId) Then
+        friendlyName = dictMap(fundId)
+    Else
+        friendlyName = fundId
+        missingFundsList = missingFundsList & fundId & vbCrLf
+    End If
+
+    friendlyName = Replace(Replace(Replace(friendlyName, "/", "_"), "\", "_"), ":", "")
+
+    baseNamePdf = prefix & "-WP_Geschafte_PDF_"
+    baseNameXlsx = prefix & "-WP_Geschafte_XLSX_"
+    suffixStr = "_" & todayStr
+
+    maxFriendly = 240 - Len(pPdf) - Len(baseNamePdf) - Len(suffixStr) - 4
+    If Len(friendlyName) > maxFriendly And maxFriendly > 0 Then
+        friendlyName = Left(friendlyName, maxFriendly)
+    End If
+
+    pdfName = baseNamePdf & friendlyName & suffixStr
+    xlsxName = baseNameXlsx & friendlyName & suffixStr
+
+    With wsOut.PageSetup
+        .PrintArea = "$A$1:$V$" & (outRow + 1)
+        .Orientation = xlLandscape
+        .LeftMargin = Application.CentimetersToPoints(0.7)
+        .RightMargin = Application.CentimetersToPoints(0.7)
+        .Zoom = False
+        .FitToPagesWide = 1
+        .FitToPagesTall = False
+        .PrintTitleRows = "$5:$6"
+        .RightFooter = "&""Times New Roman,Regular""&8&P/&N"
+    End With
+
+    Application.DisplayAlerts = False
+    Application.EnableEvents = False
+
+    Call ApplySensitivityLabel(wbOut, "8ffbc0b8-e97b-47d1-beac-cb0955d66f3b")
+
+    If saveXlsx Then
+        wbOut.SaveAs fileName:=pXlsx & xlsxName & ".xlsx", FileFormat:=xlOpenXMLWorkbook
+    End If
+
+    fullPdfPath = pPdf & pdfName & ".pdf"
+    Set wksMacro = ThisWorkbook.Worksheets("Tradeversand")
+    blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wksMacro)
+
+    If blnRawOraclePdfEnabled Then
+        If Not GenerateRawOraclePdfFromWorksheet(fullPdfPath, wsOut, logoPath) Then
+            Err.Raise 1026, METHOD_NAME, _
+                      "The raw Oracle-compatible PDF could not be generated for fund " & fundId & "."
+        End If
+    Else
+        If Not QueueWorksheetForPowerPdf(wsOut, fullPdfPath) Then
+            Err.Raise 1015, METHOD_NAME, _
+                      "Power PDF print job could not be queued for fund " & fundId & ". " & _
+                      GetPowerPdfLastErrorDescription()
+        End If
+    End If
+
+ExitSub:
+    If Not wbOut Is Nothing Then
+        On Error Resume Next
+        wbOut.Close SaveChanges:=False
+        On Error GoTo 0
+    End If
+    Set wksMacro = Nothing
+    Set wsOut = Nothing
+    Set wbOut = Nothing
+    If blnSettingsCaptured Then
+        Application.EnableEvents = blnPreviousEnableEvents
+        Application.DisplayAlerts = blnPreviousDisplayAlerts
+    End If
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fundId;pXlsx;pPdf;rawOraclePdfEnabled", _
+        fundId, _
+        pXlsx, _
+        pPdf, _
+        blnRawOraclePdfEnabled
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByRef inputArr As Variant, inR As Long, wsOut As Excel.Worksheet, outR As Long, ByRef dictFondsbez As Object
+' Returns:       ---
+' Description:   Writes one transaction block to the fund report worksheet.
+'-------------------------------------------------------------------------------
+
+Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.Worksheet, outR As Long, ByRef dictFondsbez As Object)
+    Const METHOD_NAME As String = "fillTradeData"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnPreviousDisplayAlerts As Boolean
+    Dim blnSettingsCaptured As Boolean
+    Dim colA As String
+    Dim colB As String
+    Dim colP As String
+    Dim colQ As String
+    Dim valNom As Double
+    Dim whgRow1 As String
+    Dim valKurs As Double
+    Dim transNr As String
+    Dim finalWhg As String
+    Dim useFormula As Boolean
+    Dim valBW As Double
+    Dim fundNameStr As String
+    Dim secNameStr As String
+    Dim depotnrKey As String
+    Dim steuernVal As Double
+    Dim steuernWhg As String
+
+    On Error GoTo ErrorHandler
+
+    blnPreviousDisplayAlerts = Application.DisplayAlerts
+    blnSettingsCaptured = True
+
+    Application.DisplayAlerts = False
+    wsOut.Range(wsOut.Cells(outR, 2), wsOut.Cells(outR, 4)).Merge
+    wsOut.Range(wsOut.Cells(outR, 5), wsOut.Cells(outR, 6)).Merge
+    wsOut.Range(wsOut.Cells(outR, 7), wsOut.Cells(outR, 8)).Merge
+    wsOut.Range(wsOut.Cells(outR, 11), wsOut.Cells(outR, 12)).Merge
+    wsOut.Range(wsOut.Cells(outR, 13), wsOut.Cells(outR, 15)).Merge
+    wsOut.Range(wsOut.Cells(outR, 16), wsOut.Cells(outR, 17)).Merge
+    wsOut.Range(wsOut.Cells(outR, 20), wsOut.Cells(outR, 22)).Merge
+    wsOut.Range(wsOut.Cells(outR + 1, 2), wsOut.Cells(outR + 1, 3)).Merge
+    wsOut.Range(wsOut.Cells(outR + 1, 5), wsOut.Cells(outR + 1, 7)).Merge
+    wsOut.Range(wsOut.Cells(outR + 1, 9), wsOut.Cells(outR + 1, 11)).Merge
+    wsOut.Range(wsOut.Cells(outR + 1, 13), wsOut.Cells(outR + 1, 14)).Merge
+    wsOut.Range(wsOut.Cells(outR + 1, 16), wsOut.Cells(outR + 1, 18)).Merge
+    wsOut.Range(wsOut.Cells(outR + 1, 21), wsOut.Cells(outR + 1, 22)).Merge
+    Application.DisplayAlerts = blnPreviousDisplayAlerts
+
+    wsOut.Rows(outR).RowHeight = 18
+    wsOut.Rows(outR).VerticalAlignment = xlCenter
+
+    depotnrKey = Right(safeString(inputArr(inR, 4)), 11)
+    wsOut.Cells(outR, 1).Value = depotnrKey
+
+    If Not dictFondsbez Is Nothing Then
+        If dictFondsbez.Exists(depotnrKey) Then
+            fundNameStr = dictFondsbez(depotnrKey)
+        Else
+            fundNameStr = safeString(inputArr(inR, 5))
+        End If
+    Else
+        fundNameStr = safeString(inputArr(inR, 5))
+    End If
+
+    wsOut.Cells(outR, 2).Value = "'" & fundNameStr
+    Call shrinkFontIfTooLong(wsOut.Cells(outR, 2), fundNameStr)
+
+    colA = UCase(safeString(inputArr(inR, 1)))
+    colB = UCase(safeString(inputArr(inR, 2)))
+    colP = UCase(safeString(inputArr(inR, 16)))
+    colQ = UCase(Trim(safeString(inputArr(inR, 17))))
+
+    If colP = "S" Then
+        If colB = "N" Then
+            If colQ = "PURCHASE" Then wsOut.Cells(outR, 5).Value = "Kauf"
+            If colQ = "REPURCHASE" Then wsOut.Cells(outR, 5).Value = "Verkauf"
+        ElseIf colB = "O" Then
+            If colQ = "PURCHASE" Then wsOut.Cells(outR, 5).Value = "Storno Kauf"
+            If colQ = "REPURCHASE" Then wsOut.Cells(outR, 5).Value = "Storno Verkauf"
+        End If
+    ElseIf colA = "EX" Or colA = "CN" Then
+        If colB = "N" Then
+            If colP = "R" Then wsOut.Cells(outR, 5).Value = "Verkauf"
+            If colP = "P" Then wsOut.Cells(outR, 5).Value = "Kauf"
+        ElseIf colB = "O" Then
+            If colP = "R" Then wsOut.Cells(outR, 5).Value = "Storno Verkauf"
+            If colP = "P" Then wsOut.Cells(outR, 5).Value = "Storno Kauf"
+        End If
+    Else
+        If colB = "N" Then
+            If colP = "R" Then wsOut.Cells(outR, 5).Value = "Kauf"
+            If colP = "D" Then wsOut.Cells(outR, 5).Value = "Verkauf"
+        ElseIf colB = "O" Then
+            If colP = "R" Then wsOut.Cells(outR, 5).Value = "Storno Kauf"
+            If colP = "D" Then wsOut.Cells(outR, 5).Value = "Storno Verkauf"
+        End If
+    End If
+
+    wsOut.Cells(outR, 7).Value = toDate(inputArr(inR, 10))
+    wsOut.Cells(outR, 7).NumberFormat = "dd-mm-yy"
+    wsOut.Cells(outR, 7).HorizontalAlignment = xlCenter
+
+    wsOut.Cells(outR, 9).Value = toDate(inputArr(inR, 9))
+    wsOut.Cells(outR, 9).NumberFormat = "dd-mm-yy"
+    wsOut.Cells(outR, 9).HorizontalAlignment = xlCenter
+
+    wsOut.Cells(outR, 10).Value = ""
+
+    wsOut.Cells(outR, 11).Value = "'" & safeString(inputArr(inR, 11))
+    wsOut.Cells(outR, 11).ShrinkToFit = False
+
+    secNameStr = safeString(inputArr(inR, 12))
+    wsOut.Cells(outR, 13).Value = "'" & secNameStr
+    Call shrinkFontIfTooLong(wsOut.Cells(outR, 13), secNameStr)
+
+    valNom = extractNumber(inputArr(inR, 18))
+    wsOut.Cells(outR, 16).Value = valNom
+    If valNom = Int(valNom) Then
+        wsOut.Cells(outR, 16).NumberFormat = "# ### ### ### ##0"
+    Else
+        wsOut.Cells(outR, 16).NumberFormat = "# ### ### ### ##0.00####"
+    End If
+
+    whgRow1 = safeString(inputArr(inR, 29))
+    If whgRow1 = "" Then whgRow1 = safeString(inputArr(inR, 21))
+    If whgRow1 = "" Then whgRow1 = safeString(inputArr(inR, 76))
+    wsOut.Cells(outR, 18).Value = whgRow1
+
+    If colA = "CN" Or colA = "EX" Then
+        valKurs = extractNumber(inputArr(inR, 25))
+    Else
+        valKurs = extractNumber(inputArr(inR, 20))
+    End If
+
+    wsOut.Cells(outR, 19).Value = valKurs
+    If valKurs = Int(valKurs) Then
+        wsOut.Cells(outR, 19).NumberFormat = "# ### ### ### ##0"
+    Else
+        wsOut.Cells(outR, 19).NumberFormat = "# ### ### ### ##0.00####"
+    End If
+    wsOut.Cells(outR, 20).Value = safeString(inputArr(inR, 32))
+
+    wsOut.Rows(outR + 1).RowHeight = 18
+    wsOut.Rows(outR + 1).VerticalAlignment = xlCenter
+
+    transNr = safeString(inputArr(inR, 7))
+    If colB = "O" And Left(transNr, 1) = "P" Then
+        transNr = transNr & "A"
+    End If
+    wsOut.Cells(outR + 1, 1).NumberFormat = "@"
+    wsOut.Cells(outR + 1, 1).Value = transNr
+
+    If safeString(inputArr(inR, 34)) = "" And safeString(inputArr(inR, 110)) = "" Then
+        wsOut.Cells(outR + 1, 2).Value = ""
+    Else
+        wsOut.Cells(outR + 1, 2).Value = extractNumber(inputArr(inR, 34)) + extractNumber(inputArr(inR, 110))
+        wsOut.Cells(outR + 1, 2).NumberFormat = "# ### ### ### ### ##0.00"
+    End If
+
+    wsOut.Cells(outR + 1, 4).Value = safeString(inputArr(inR, 35))
+
+    steuernVal = 0
+    steuernWhg = ""
+
+    If steuernVal = 0 And steuernWhg = "" Then
+        wsOut.Cells(outR + 1, 5).Value = ""
+    Else
+        wsOut.Cells(outR + 1, 5).Value = steuernVal
+        wsOut.Cells(outR + 1, 5).NumberFormat = "# ### ### ### ### ##0.00"
+    End If
+    wsOut.Cells(outR + 1, 8).Value = steuernWhg
+
+    If safeString(inputArr(inR, 36)) = "" Then
+        wsOut.Cells(outR + 1, 9).Value = ""
+    Else
+        wsOut.Cells(outR + 1, 9).Value = extractNumber(inputArr(inR, 36))
+        wsOut.Cells(outR + 1, 9).NumberFormat = "# ### ### ### ### ##0.00"
+    End If
+
+    wsOut.Cells(outR + 1, 12).Value = safeString(inputArr(inR, 37))
+
+    If safeString(inputArr(inR, 73)) = "" And safeString(inputArr(inR, 38)) = "" Then
+        wsOut.Cells(outR + 1, 13).Value = ""
+    Else
+        wsOut.Cells(outR + 1, 13).Value = extractNumber(inputArr(inR, 73)) + extractNumber(inputArr(inR, 38))
+        wsOut.Cells(outR + 1, 13).NumberFormat = "# ### ### ### ### ##0.00"
+    End If
+
+    If safeString(inputArr(inR, 38)) <> "" Then
+        wsOut.Cells(outR + 1, 15).Value = safeString(inputArr(inR, 39))
+    ElseIf safeString(inputArr(inR, 73)) <> "" Then
+        wsOut.Cells(outR + 1, 15).Value = safeString(inputArr(inR, 74))
+    Else
+        wsOut.Cells(outR + 1, 15).Value = ""
+    End If
+
+    finalWhg = safeString(inputArr(inR, 33))
+    If finalWhg = "" Then finalWhg = safeString(inputArr(inR, 53))
+
+    useFormula = True
+
+    If UCase(whgRow1) = UCase(finalWhg) Then
+        If safeString(inputArr(inR, 52)) <> "" And safeString(inputArr(inR, 52)) <> "0" Then
+            useFormula = False
+            If colP = "S" Then
+                If colQ = "PURCHASE" Then
+                    wsOut.Cells(outR + 1, 16).Value = extractNumber(inputArr(inR, 52))
+                ElseIf colQ = "REPURCHASE" Then
+                    wsOut.Cells(outR + 1, 16).Value = extractNumberWithSign(inputArr(inR, 52))
+                Else
+                    useFormula = True
+                End If
+            ElseIf colA = "EX" Or colA = "CN" Then
+                If colP = "P" Then
+                    wsOut.Cells(outR + 1, 16).Value = extractNumber(inputArr(inR, 52))
+                ElseIf colP = "R" Then
+                    wsOut.Cells(outR + 1, 16).Value = extractNumberWithSign(inputArr(inR, 52))
+                End If
+            Else
+                If colP = "R" Then
+                    wsOut.Cells(outR + 1, 16).Value = extractNumber(inputArr(inR, 52))
+                Else
+                    wsOut.Cells(outR + 1, 16).Value = extractNumberWithSign(inputArr(inR, 52))
+                End If
+            End If
+        End If
+    End If
+
+    If useFormula = True Then
+        If colP = "S" Then
+            If colQ = "PURCHASE" Then
+                wsOut.Cells(outR + 1, 16).Value = extractNumber(inputArr(inR, 28)) + _
+                    extractNumber(inputArr(inR, 38)) + _
+                    extractNumber(inputArr(inR, 34)) + _
+                    extractNumber(inputArr(inR, 73)) + _
+                    extractNumber(inputArr(inR, 32)) + _
+                    extractNumber(inputArr(inR, 36)) + _
+                    extractNumber(inputArr(inR, 110)) - _
+                    extractNumber(inputArr(inR, 44))
+            ElseIf colQ = "REPURCHASE" Then
+                wsOut.Cells(outR + 1, 16).Value = extractNumberWithSign(inputArr(inR, 28)) + _
+                    extractNumberWithSign(inputArr(inR, 38)) + _
+                    extractNumberWithSign(inputArr(inR, 34)) + _
+                    extractNumberWithSign(inputArr(inR, 73)) + _
+                    extractNumberWithSign(inputArr(inR, 32)) + _
+                    extractNumberWithSign(inputArr(inR, 36)) - _
+                    extractNumberWithSign(inputArr(inR, 110)) - _
+                    extractNumberWithSign(inputArr(inR, 44))
+            End If
+        ElseIf colA = "EX" Or colA = "CN" Then
+            If colP = "P" Then
+                wsOut.Cells(outR + 1, 16).Value = extractNumber(inputArr(inR, 28)) + _
+                    extractNumber(inputArr(inR, 38)) + _
+                    extractNumber(inputArr(inR, 34)) + _
+                    extractNumber(inputArr(inR, 73)) + _
+                    extractNumber(inputArr(inR, 32)) + _
+                    extractNumber(inputArr(inR, 36)) - _
+                    extractNumber(inputArr(inR, 110)) - _
+                    extractNumber(inputArr(inR, 44))
+            ElseIf colP = "R" Then
+                wsOut.Cells(outR + 1, 16).Value = extractNumberWithSign(inputArr(inR, 28)) + _
+                    extractNumberWithSign(inputArr(inR, 38)) + _
+                    extractNumberWithSign(inputArr(inR, 34)) + _
+                    extractNumberWithSign(inputArr(inR, 73)) + _
+                    extractNumberWithSign(inputArr(inR, 32)) - _
+                    extractNumberWithSign(inputArr(inR, 36)) - _
+                    extractNumberWithSign(inputArr(inR, 110)) + _
+                    extractNumberWithSign(inputArr(inR, 44))
+            End If
+        Else
+            If colP = "R" Then
+                wsOut.Cells(outR + 1, 16).Value = extractNumber(inputArr(inR, 28)) + _
+                    extractNumber(inputArr(inR, 38)) + _
+                    extractNumber(inputArr(inR, 34)) + _
+                    extractNumber(inputArr(inR, 73)) + _
+                    extractNumber(inputArr(inR, 32)) + _
+                    extractNumber(inputArr(inR, 36)) + _
+                    extractNumber(inputArr(inR, 110)) - _
+                    extractNumber(inputArr(inR, 44))
+            Else
+                wsOut.Cells(outR + 1, 16).Value = extractNumberWithSign(inputArr(inR, 28)) + _
+                    extractNumberWithSign(inputArr(inR, 38)) + _
+                    extractNumberWithSign(inputArr(inR, 34)) + _
+                    extractNumberWithSign(inputArr(inR, 73)) + _
+                    extractNumberWithSign(inputArr(inR, 32)) + _
+                    extractNumberWithSign(inputArr(inR, 36)) - _
+                    extractNumberWithSign(inputArr(inR, 110)) - _
+                    extractNumberWithSign(inputArr(inR, 44))
+            End If
+        End If
+    End If
+
+    If wsOut.Cells(outR + 1, 16).Value = Int(wsOut.Cells(outR + 1, 16).Value) Then
+        wsOut.Cells(outR + 1, 16).NumberFormat = "# ### ### ### ##0"
+    Else
+        wsOut.Cells(outR + 1, 16).NumberFormat = "# ### ### ### ##0.00"
+    End If
+
+    valBW = extractNumber(inputArr(inR, 75))
+    wsOut.Cells(outR + 1, 19).Value = valBW
+    If valBW = Int(valBW) Then
+        wsOut.Cells(outR + 1, 19).NumberFormat = "# ### ### ### ##0"
+    Else
+        wsOut.Cells(outR + 1, 19).NumberFormat = "# ### ### ### ##0.00"
+    End If
+
+    wsOut.Cells(outR + 1, 20).Value = finalWhg
+
+    If safeString(inputArr(inR, 61)) <> "" Then
+        wsOut.Cells(outR + 1, 21).Value = extractNumber(inputArr(inR, 61))
+    Else
+        wsOut.Cells(outR + 1, 21).Value = 1
+    End If
+    wsOut.Cells(outR + 1, 21).NumberFormat = "General"
+
+    With wsOut.Range(wsOut.Cells(outR, 1), wsOut.Cells(outR + 1, 22)).Borders
+        .LineStyle = xlContinuous
+        .Weight = xlHairline
+    End With
+
+    With wsOut.Cells(outR, 5)
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+        .IndentLevel = 0
+    End With
+
+    wsOut.Cells(outR, 1).IndentLevel = 1
+    wsOut.Cells(outR, 2).IndentLevel = 1
+    wsOut.Cells(outR, 11).IndentLevel = 1
+    wsOut.Cells(outR, 13).IndentLevel = 1
+    wsOut.Cells(outR, 18).IndentLevel = 1
+
+    wsOut.Cells(outR + 1, 1).IndentLevel = 1
+    wsOut.Cells(outR + 1, 4).IndentLevel = 1
+    wsOut.Cells(outR + 1, 8).IndentLevel = 1
+    wsOut.Cells(outR + 1, 12).IndentLevel = 1
+    wsOut.Cells(outR + 1, 15).IndentLevel = 1
+    wsOut.Cells(outR + 1, 20).IndentLevel = 1
+
+ExitSub:
+    If blnSettingsCaptured Then
+        Application.DisplayAlerts = blnPreviousDisplayAlerts
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "inR;outR", _
+        inR, _
+        outR
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ws As Excel.Worksheet
+' Returns:       ---
+' Description:   Builds the fixed two-row report header layout.
+'-------------------------------------------------------------------------------
+Public Sub buildPerfectHeaders(ws As Excel.Worksheet)
+    Const METHOD_NAME As String = "buildPerfectHeaders"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnPreviousDisplayAlerts As Boolean
+    Dim blnSettingsCaptured As Boolean
+
+    On Error GoTo ErrorHandler
+
+    blnPreviousDisplayAlerts = Application.DisplayAlerts
+    blnSettingsCaptured = True
+
+    Application.DisplayAlerts = False
+
+    With ws
+        .Cells(5, 1).Value = "Depotnr."
+        .Cells(5, 2).Value = "Fondsbezeichnung"
+        .Cells(5, 5).Value = "Geschaeftsart"
+        .Cells(5, 7).Value = "Schlusstag"
+        .Cells(5, 9).Value = "Valutatag"
+        .Cells(5, 10).Value = "WKN"
+        .Cells(5, 11).Value = "ISIN"
+        .Cells(5, 13).Value = "Wertpapierbezeichnung"
+        .Cells(5, 16).Value = "Nominale /Stuecke"
+        .Cells(5, 18).Value = "Whg"
+        .Cells(5, 19).Value = "Kurs"
+        .Cells(5, 20).Value = "Stueckzinsen"
+
+        .Range("B5:D5").Merge
+        .Range("E5:F5").Merge
+        .Range("G5:H5").Merge
+        .Range("K5:L5").Merge
+        .Range("M5:O5").Merge
+        .Range("P5:Q5").Merge
+        .Range("T5:V5").Merge
+
+        .Cells(6, 1).Value = "Transaktionsnr."
+        .Cells(6, 2).Value = "Maklergebuehren"
+        .Cells(6, 4).Value = "Whg"
+        .Cells(6, 5).Value = "Steuern"
+        .Cells(6, 8).Value = "Whg"
+        .Cells(6, 9).Value = "Abwicklungsprov."
+        .Cells(6, 12).Value = "Whg"
+        .Cells(6, 13).Value = "Spesen"
+        .Cells(6, 15).Value = "Whg"
+        .Cells(6, 16).Value = "ausm. Betrag in Whg"
+        .Cells(6, 19).Value = "ausm. Betrag in Abrech. Whg"
+        .Cells(6, 20).Value = "Whg"
+        .Cells(6, 21).Value = "Devisenkurs"
+
+        .Range("B6:C6").Merge
+        .Range("E6:G6").Merge
+        .Range("I6:K6").Merge
+        .Range("M6:N6").Merge
+        .Range("P6:R6").Merge
+        .Range("U6:V6").Merge
+
+        .Rows("5:6").RowHeight = 18
+        With .Range("A5:V6")
+            .Interior.Color = RGB(160, 160, 160)
+            .Font.Bold = True
+            .HorizontalAlignment = xlCenter
+            .VerticalAlignment = xlCenter
+            .Borders.LineStyle = xlContinuous
+            .Borders.Weight = xlHairline
+        End With
+    End With
+
+ExitSub:
+    If blnSettingsCaptured Then
+        Application.DisplayAlerts = blnPreviousDisplayAlerts
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    folderPath As String
+' Returns:       ---
+' Description:   Creates the requested folder when it does not already exist.
+'-------------------------------------------------------------------------------
+Public Sub CreateFolderIfMissing(folderPath As String)
+    Const METHOD_NAME As String = "CreateFolderIfMissing"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fso As Object
+
+    On Error GoTo ErrorHandler
+
+    If folderPath = "" Then GoTo ExitSub
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(folderPath) Then
+        CreateObject("WScript.Shell").Run "cmd /c mkdir """ & folderPath & """", 0, True
+    End If
+
+ExitSub:
+    Set fso = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath", _
+        folderPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal srcFolder As String, ByVal dstFolder As String
+' Returns:       ---
+' Description:   Copies generated files from the staging folder to the target folder.
+'-------------------------------------------------------------------------------
+Public Sub fastCopyFiles(ByVal srcFolder As String, ByVal dstFolder As String)
+    Const METHOD_NAME As String = "fastCopyFiles"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim cmd As String
+    Dim shell As Object
+    Dim srcTrimmed As String
+    Dim dstTrimmed As String
+    Dim fso As Object
+
+    On Error GoTo ErrorHandler
+
+    srcTrimmed = srcFolder
+    dstTrimmed = dstFolder
+    If Right(srcTrimmed, 1) = "\" Then srcTrimmed = Left(srcTrimmed, Len(srcTrimmed) - 1)
+    If Right(dstTrimmed, 1) = "\" Then dstTrimmed = Left(dstTrimmed, Len(dstTrimmed) - 1)
+
+    cmd = "robocopy """ & srcTrimmed & """ """ & dstTrimmed & """ " & _
+          "/MT:8 /R:1 /W:1 /NP /NJH /NJS /NDL /NC /NS /NFL"
+
+    Set shell = CreateObject("WScript.Shell")
+    shell.Run cmd, 0, True
+
+ExitSub:
+    Set shell = Nothing
+    Set fso = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    On Error Resume Next
+    If Dir(srcFolder & "*.*") <> vbNullString Then
+        fso.CopyFile srcFolder & "*.*", dstFolder, True
+    End If
+    On Error GoTo 0
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "srcFolder;dstFolder", _
+        srcFolder, _
+        dstFolder
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByRef wsMap As Excel.Worksheet
+' Returns:       Object
+' Description:   Builds the global fund mapping for all enabled KVG entries.
+'-------------------------------------------------------------------------------
+Public Function prepareGlobalMappingV2(ByRef wsMap As Excel.Worksheet) As Object
+    Const METHOD_NAME As String = "prepareGlobalMappingV2"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dict As Object
+    Dim kvgList As Object
+    Dim i As Long
+    Dim lastRowMap As Long
+    Dim folderPath As String
+    Dim baseName As String
+    Dim latestFile As String
+    Dim tempFile As String
+    Dim latestDate As Long
+    Dim currentDate As Long
+    Dim wbMapping As Excel.Workbook
+    Dim dataArr As Variant
+    Dim statusVal As String
+    Dim currentKvg As String
+    Dim cleanID As String
+    Dim matchCount As Long
+
+    On Error GoTo ErrorHandler
+
+    Set dict = CreateObject("Scripting.Dictionary")
+    Set kvgList = CreateObject("Scripting.Dictionary")
+
+
+    lastRowMap = wsMap.Cells(wsMap.Rows.Count, "A").End(xlUp).Row
+    For i = 2 To lastRowMap
+        If UCase(Trim(CStr(wsMap.Cells(i, "V").Value))) = "TRUE" Then
+            If Trim(wsMap.Cells(i, "U").Value) <> "" Then
+                kvgList(UCase(Trim(wsMap.Cells(i, "U").Value))) = True
+            End If
+        End If
+    Next i
+
+    If kvgList.Count = 0 Then
+        Err.Raise 1040, , "No KVGs found in Mapping column AB"
+    End If
+
+    folderPath = ThisWorkbook.Worksheets("Tradeversand").Range("root_Fondsliste").Value
+    baseName = ThisWorkbook.Worksheets("Tradeversand").Range("file_name_Fondsliste").Value
+    If Right(folderPath, 1) <> "\" Then folderPath = folderPath & "\"
+
+    latestFile = Dir(folderPath & baseName & "_*.xls*")
+    tempFile = latestFile
+
+    Do While tempFile <> ""
+        currentDate = ParseDateFromFileName(tempFile)
+        If currentDate > latestDate Then
+            latestDate = currentDate
+            latestFile = tempFile
+        End If
+        tempFile = Dir()
+    Loop
+
+    If latestFile = "" Then
+        Err.Raise 1041, , "Fondsliste file not found in " & folderPath
+    End If
+
+    Set wbMapping = Workbooks.Open(folderPath & latestFile, ReadOnly:=True)
+    dataArr = wbMapping.Sheets(1).UsedRange.Value
+
+    matchCount = 0
+    If IsArray(dataArr) Then
+        For i = 2 To UBound(dataArr, 1)
+            statusVal = UCase(Trim(CStr(dataArr(i, 2))))
+            currentKvg = UCase(Trim(CStr(dataArr(i, 9))))
+
+            If statusVal = "OPEN" And kvgList.Exists(currentKvg) Then
+                cleanID = Right(Replace(CStr(dataArr(i, 14)), " ", ""), 11)
+                If Not dict.Exists(cleanID) Then
+                    dict.Add cleanID, CStr(dataArr(i, 4))
+                    matchCount = matchCount + 1
+                End If
+            End If
+        Next i
+    End If
+
+    If matchCount = 0 Then
+        Err.Raise 1042, , "Dictionary is empty. Check if status is OPEN and KVG names match exactly."
+    End If
+
+    Set prepareGlobalMappingV2 = dict
+    GoTo ExitFunction
+
+ExitFunction:
+    If Not wbMapping Is Nothing Then
+        On Error Resume Next
+        wbMapping.Close SaveChanges:=False
+        On Error GoTo 0
+    End If
+    Set wbMapping = Nothing
+    Set dict = Nothing
+    Set kvgList = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set prepareGlobalMappingV2 = Nothing
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    wb As Excel.Workbook, sheetName As String
+' Returns:       Excel.Worksheet
+' Description:   Returns the requested worksheet or the first worksheet as a fallback.
+'-------------------------------------------------------------------------------
+Public Function GetWorksheet(wb As Excel.Workbook, sheetName As String) As Excel.Worksheet
+    Const METHOD_NAME As String = "GetWorksheet"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Set GetWorksheet = wb.Sheets(sheetName)
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set GetWorksheet = wb.Sheets(1)
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "sheetName", _
+        sheetName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ws As Excel.Worksheet
+' Returns:       ---
+' Description:   Clears active filters from the supplied worksheet.
+'-------------------------------------------------------------------------------
+Public Sub ClearFilters(ws As Excel.Worksheet)
+    Const METHOD_NAME As String = "ClearFilters"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If ws.AutoFilterMode Then ws.AutoFilterMode = False
+    If ws.FilterMode Then ws.ShowAllData
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    fileName As String
+' Returns:       Long
+' Description:   Extracts the date key from the standard file name.
+'-------------------------------------------------------------------------------
+Public Function ParseDateFromFileName(fileName As String) As Long
+    Const METHOD_NAME As String = "ParseDateFromFileName"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    ParseDateFromFileName = CLng(Mid(fileName, InStrRev(fileName, "_") + 1, 8))
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ParseDateFromFileName = 0
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fileName", _
+        fileName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    wb As Excel.Workbook, labelId As String
+' Returns:       ---
+' Description:   Applies the configured sensitivity label to the workbook.
+'-------------------------------------------------------------------------------
+Public Sub ApplySensitivityLabel(wb As Excel.Workbook, labelId As String)
+    Const METHOD_NAME As String = "ApplySensitivityLabel"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim labelInfo As Object
+
+    On Error GoTo ErrorHandler
+
+    Set labelInfo = wb.SensitivityLabel.CreateLabelInfo()
+    labelInfo.LabelId = labelId
+    labelInfo.SiteId = "614f9c25-bffa-42c7-86d8-964101f55fa2"
+    labelInfo.AssignmentMethod = 1
+    labelInfo.ContentBits = 2
+    labelInfo.IsEnabled = True
+    wb.SensitivityLabel.SetLabel labelInfo, labelInfo
+
+ExitSub:
+    Set labelInfo = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal pdfPath As String
+' Returns:       ---
+' Description:   Replaces selected PDF/A metadata identifiers in an existing PDF file.
+'-------------------------------------------------------------------------------
+Public Sub RemovePdfAClaimFromPdf(ByVal pdfPath As String)
+    Const METHOD_NAME As String = "RemovePdfAClaimFromPdf"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileNum As Long
+    Dim data() As Byte
+    Dim changedCount As Long
+
+    On Error GoTo ErrorHandler
+
+    If Len(Dir(pdfPath)) = 0 Then GoTo ExitSub
+
+    fileNum = FreeFile
+    Open pdfPath For Binary Access Read As #fileNum
+    If LOF(fileNum) = 0 Then
+        Close #fileNum
+        GoTo ExitSub
+    End If
+
+    ReDim data(0 To LOF(fileNum) - 1) As Byte
+    Get #fileNum, 1, data
+    Close #fileNum
+    fileNum = 0
+
+    changedCount = changedCount + ReplaceAsciiInBytes(data, "pdfaid", "pdfxid")
+    changedCount = changedCount + ReplaceAsciiInBytes(data, "pdfaExtension", "pdfxExtension")
+    changedCount = changedCount + ReplaceAsciiInBytes(data, "pdfaSchema", "pdfxSchema")
+    changedCount = changedCount + ReplaceAsciiInBytes(data, "pdfaProperty", "pdfxProperty")
+
+    changedCount = changedCount + ReplaceAsciiInBytes(data, "http://www.aiim.org/pdfa/ns/id/", "http://www.aiim.org/pdfx/ns/id/")
+    changedCount = changedCount + ReplaceAsciiInBytes(data, "http://www.aiim.org/pdfa/ns/extension/", "http://www.aiim.org/pdfx/ns/extension/")
+    changedCount = changedCount + ReplaceAsciiInBytes(data, "http://www.aiim.org/pdfa/ns/schema#", "http://www.aiim.org/pdfx/ns/schema#")
+    changedCount = changedCount + ReplaceAsciiInBytes(data, "http://www.aiim.org/pdfa/ns/property#", "http://www.aiim.org/pdfx/ns/property#")
+
+    If changedCount > 0 Then
+        fileNum = FreeFile
+        Open pdfPath For Binary Access Write As #fileNum
+        Put #fileNum, 1, data
+        Close #fileNum
+        fileNum = 0
+    End If
+
+ExitSub:
+    If fileNum > 0 Then
+        On Error Resume Next
+        Close #fileNum
+        On Error GoTo 0
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "pdfPath", _
+        pdfPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByRef data() As Byte, ByVal findText As String, ByVal replaceText As String
+' Returns:       Long
+' Description:   Replaces equal-length ASCII sequences in a byte array.
+'-------------------------------------------------------------------------------
+Public Function ReplaceAsciiInBytes(ByRef data() As Byte, ByVal findText As String, ByVal replaceText As String) As Long
+    Const METHOD_NAME As String = "ReplaceAsciiInBytes"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim findBytes() As Byte
+    Dim replaceBytes() As Byte
+    Dim i As Long
+    Dim j As Long
+    Dim maxStart As Long
+    Dim isMatch As Boolean
+    Dim changes As Long
+
+    On Error GoTo ErrorHandler
+
+    If Len(findText) = 0 Then GoTo ExitFunction
+    If Len(findText) <> Len(replaceText) Then GoTo ExitFunction
+
+    findBytes = StrConv(findText, vbFromUnicode)
+    replaceBytes = StrConv(replaceText, vbFromUnicode)
+
+    maxStart = UBound(data) - UBound(findBytes)
+    If maxStart < 0 Then GoTo ExitFunction
+
+    For i = 0 To maxStart
+        isMatch = True
+        For j = 0 To UBound(findBytes)
+            If data(i + j) <> findBytes(j) Then
+                isMatch = False
+                Exit For
+            End If
+        Next j
+
+        If isMatch Then
+            For j = 0 To UBound(replaceBytes)
+                data(i + j) = replaceBytes(j)
+            Next j
+            changes = changes + 1
+            i = i + UBound(findBytes)
+        End If
+    Next i
+
+    ReplaceAsciiInBytes = changes
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ReplaceAsciiInBytes = 0
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "findText;replaceText", _
+        findText, _
+        replaceText
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    fileName As String
+' Returns:       Boolean
+' Description:   Returns whether the named workbook is currently open.
+'-------------------------------------------------------------------------------
+Public Function IsWorkbookOpen(fileName As String) As Boolean
+    Const METHOD_NAME As String = "IsWorkbookOpen"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim wb As Excel.Workbook
+
+    On Error GoTo ErrorHandler
+
+    Set wb = Workbooks(fileName)
+    IsWorkbookOpen = True
+    GoTo ExitFunction
+
+ExitFunction:
+    Set wb = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    IsWorkbookOpen = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fileName", _
+        fileName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    cellValue As Variant
+' Returns:       Date
+' Description:   Converts a holiday cell value to a date.
+'-------------------------------------------------------------------------------
+Public Function ParseHolidayDate(cellValue As Variant) As Date
+    Const METHOD_NAME As String = "ParseHolidayDate"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strDate As String
+
+    On Error GoTo ErrorHandler
+
+    If IsNumeric(cellValue) Then
+        ParseHolidayDate = CDate(cellValue)
+    Else
+        strDate = Trim(CStr(cellValue))
+        strDate = Replace(strDate, ".", "-")
+        strDate = Replace(strDate, "/", "-")
+        If IsDate(strDate) Then ParseHolidayDate = CDate(strDate)
+    End If
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ParseHolidayDate = 0
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ws As Excel.Worksheet, fullLogoPath As String
+' Returns:       ---
+' Description:   Inserts the configured logo into the report worksheet.
+'-------------------------------------------------------------------------------
+Public Sub insertLogo(ws As Excel.Worksheet, fullLogoPath As String)
+    Const METHOD_NAME As String = "insertLogo"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fso As Object
+    Dim masterShape As Object
+    Dim targetWidth As Single
+    Dim targetHeight As Single
+
+    On Error GoTo ErrorHandler
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If fso.FileExists(fullLogoPath) Then
+        Set masterShape = ThisWorkbook.Sheets("Mapping").Shapes("MasterLogo")
+        targetWidth = masterShape.Width
+        targetHeight = masterShape.Height
+
+        ws.Shapes.AddPicture fullLogoPath, 0, -1, ws.Range("A1").Left + 5, ws.Range("A1").Top + 5, targetWidth, targetHeight
+    End If
+
+ExitSub:
+    Set fso = Nothing
+    Set masterShape = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fullLogoPath", _
+        fullLogoPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ws As Excel.Worksheet
+' Returns:       Boolean
+' Description:   Attempts to copy and paste the master logo once.
+'-------------------------------------------------------------------------------
+Private Function tryPasteLogoOnce(ws As Excel.Worksheet) As Boolean
+    Const METHOD_NAME As String = "tryPasteLogoOnce"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    ThisWorkbook.Sheets("Mapping").Shapes("MasterLogo").Copy
+    DoEvents
+
+    ws.Paste Destination:=ws.Range("A1")
+    tryPasteLogoOnce = True
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    tryPasteLogoOnce = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal val As Variant
+' Returns:       String
+' Description:   Converts a value to a trimmed string without propagating cell errors.
+'-------------------------------------------------------------------------------
+Public Function safeString(ByVal val As Variant) As String
+    Const METHOD_NAME As String = "safeString"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If IsError(val) Then
+        safeString = ""
+    Else
+        safeString = Trim(CStr(val))
+    End If
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    safeString = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal inputValue As Variant
+' Returns:       Double
+' Description:   Returns the absolute numeric value represented by the input.
+'-------------------------------------------------------------------------------
+Public Function extractNumber(ByVal inputValue As Variant) As Double
+    Const METHOD_NAME As String = "extractNumber"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim s As String
+
+    On Error GoTo ErrorHandler
+
+    If IsError(inputValue) Then GoTo ExitFunction
+    If IsEmpty(inputValue) Or inputValue = "" Then GoTo ExitFunction
+
+    If IsNumeric(inputValue) Then
+        extractNumber = Abs(CDbl(inputValue))
+        GoTo ExitFunction
+    End If
+
+    s = CStr(inputValue)
+    s = Replace(s, Chr(160), "")
+    s = Replace(s, " ", "")
+    s = Replace(s, ",", ".")
+    extractNumber = Abs(VBA.val(s))
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    extractNumber = 0
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal inputValue As Variant
+' Returns:       Double
+' Description:   Returns the signed numeric value represented by the input.
+'-------------------------------------------------------------------------------
+Public Function extractNumberWithSign(ByVal inputValue As Variant) As Double
+    Const METHOD_NAME As String = "extractNumberWithSign"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim s As String
+
+    On Error GoTo ErrorHandler
+
+    If IsError(inputValue) Then GoTo ExitFunction
+    If IsEmpty(inputValue) Or inputValue = "" Then GoTo ExitFunction
+
+    If IsNumeric(inputValue) Then
+        extractNumberWithSign = CDbl(inputValue)
+        GoTo ExitFunction
+    End If
+
+    s = CStr(inputValue)
+    s = Replace(s, Chr(160), "")
+    s = Replace(s, " ", "")
+    s = Replace(s, ",", ".")
+    extractNumberWithSign = VBA.val(s)
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    extractNumberWithSign = 0
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal inputValue As Variant
+' Returns:       Variant
+' Description:   Converts valid date input to a VBA date and otherwise returns the original value.
+'-------------------------------------------------------------------------------
+Public Function toDate(ByVal inputValue As Variant) As Variant
+    Const METHOD_NAME As String = "toDate"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If IsDate(inputValue) Then
+        toDate = CDate(inputValue)
+    Else
+        toDate = inputValue
+    End If
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    toDate = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    title As String
+' Returns:       String
+' Description:   Shows the file picker and returns the selected file path.
+'-------------------------------------------------------------------------------
+Public Function getFilePath(title As String) As String
+    Const METHOD_NAME As String = "getFilePath"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    With Application.FileDialog(msoFileDialogFilePicker)
+        .title = title
+        .Filters.Clear
+        .Filters.Add "Data Files", "*.xlsx; *.xlsm; *.csv"
+        If .Show = -1 Then getFilePath = .SelectedItems(1)
+    End With
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    getFilePath = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "title", _
+        title
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByRef inputArr As Variant, ByVal lastRow As Long, inclFree As Boolean
+' Returns:       Object
+' Description:   Returns the unique fund identifiers contained in the input array.
+'-------------------------------------------------------------------------------
+Public Function getUniqueFundIds(ByRef inputArr As Variant, ByVal lastRow As Long, inclFree As Boolean) As Object
+    Const METHOD_NAME As String = "getUniqueFundIds"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dict As Object
+    Dim i As Long
+    Dim id As String
+
+    On Error GoTo ErrorHandler
+
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    If lastRow < 2 Then
+        Set getUniqueFundIds = dict
+        GoTo ExitFunction
+    End If
+
+    For i = 2 To lastRow
+        If inclFree = True Or extractNumber(inputArr(i, 52)) <> 0 Then
+            id = Right(safeString(inputArr(i, 4)), 11)
+            If id <> "" Then
+                dict(id) = id
+            End If
+        End If
+    Next i
+
+    Set getUniqueFundIds = dict
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set getUniqueFundIds = CreateObject("Scripting.Dictionary")
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "lastRow;inclFree", _
+        lastRow, _
+        inclFree
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       Date
+' Description:   Returns the previous business day excluding configured holidays.
+'-------------------------------------------------------------------------------
+Public Function getPreviousBusinessDay() As Date
+    Const METHOD_NAME As String = "getPreviousBusinessDay"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim wsHolidays As Excel.Worksheet
+    Dim lastRow As Long
+    Dim prevDate As Date
+    Dim isHoliday As Boolean
+    Dim i As Long
+    Dim cellValue As Variant
+    Dim checkDate As Date
+
+    On Error GoTo ErrorHandler
+
+    prevDate = Int(Date) - 1
+    Set wsHolidays = GetWorksheet(ThisWorkbook, "Holidays")
+
+    Do
+        isHoliday = False
+
+        If Weekday(prevDate, vbMonday) > 5 Then
+            isHoliday = True
+        End If
+
+        If isHoliday = False And wsHolidays.Name = "Holidays" Then
+            lastRow = wsHolidays.Cells(wsHolidays.Rows.Count, "A").End(xlUp).Row
+            If lastRow >= 2 Then
+                For i = 2 To lastRow
+                    cellValue = wsHolidays.Cells(i, "A").Value
+                    checkDate = ParseHolidayDate(cellValue)
+
+                    If checkDate <> 0 Then
+                        If Format(prevDate, "yyyymmdd") = Format(checkDate, "yyyymmdd") Then
+                            isHoliday = True
+                            Exit For
+                        End If
+                    End If
+                Next i
+            End If
+        End If
+
+        If isHoliday = True Then
+            prevDate = prevDate - 1
+        Else
+            Exit Do
+        End If
+    Loop
+
+    getPreviousBusinessDay = prevDate
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    getPreviousBusinessDay = Int(Date) - 1
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByRef fondsArr As Variant
+' Returns:       Object
+' Description:   Builds the Depot number to external fund number mapping.
+'-------------------------------------------------------------------------------
+Public Function buildDepotnrToExterneFondNrMap(ByRef fondsArr As Variant) As Object
+    Const METHOD_NAME As String = "buildDepotnrToExterneFondNrMap"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dict As Object
+    Dim lastRow As Long
+    Dim r As Long
+    Dim depotnrKey As String
+    Dim externeFondNr As String
+
+    On Error GoTo ErrorHandler
+
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    If IsEmpty(fondsArr) Then
+        Set buildDepotnrToExterneFondNrMap = dict
+        GoTo ExitFunction
+    End If
+
+    lastRow = UBound(fondsArr, 1)
+
+    For r = 2 To lastRow
+        If UCase(Trim(safeString(fondsArr(r, 2)))) = "OPEN" Then
+            depotnrKey = Trim(safeString(fondsArr(r, 14)))
+            externeFondNr = Trim(safeString(fondsArr(r, 27)))
+            If depotnrKey <> "" And externeFondNr <> "" Then
+                If Not dict.Exists(depotnrKey) Then
+                    dict.Add depotnrKey, externeFondNr
+                End If
+            End If
+        End If
+    Next r
+
+    Set buildDepotnrToExterneFondNrMap = dict
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set buildDepotnrToExterneFondNrMap = CreateObject("Scripting.Dictionary")
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByRef dataArr As Variant, ByVal fullPath As String, ByRef dictFilter As Object, ByVal useExterneFondNr As Boolean, ByRef depotnrMap As Object, Optional ByVal inclFree As Boolean = True
+' Returns:       ---
+' Description:   Creates the configured FFY CSV output from the transaction array.
+'-------------------------------------------------------------------------------
+Public Sub saveArrayAsFfyCsv(ByRef dataArr As Variant, ByVal fullPath As String, _
+                      ByRef dictFilter As Object, _
+                      ByVal useExterneFondNr As Boolean, _
+                      ByRef depotnrMap As Object, _
+                      Optional ByVal inclFree As Boolean = True)
+    Const METHOD_NAME As String = "saveArrayAsFfyCsv"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileNum As Long
+    Dim lastRow As Long
+    Dim r As Long
+    Dim fundIdStr As String
+    Dim depotnrKey As String
+    Dim colAVal As String
+    Dim colBVal As String
+    Dim colDVal As String
+    Dim colEVal As String
+    Dim colFVal As String
+    Dim colGVal As String
+    Dim colKVal As String
+    Dim colPVal As String
+    Dim colRVal As String
+    Dim colSVal As String
+    Dim colTVal As String
+    Dim colHVal As Double
+    Dim colIVal As Double
+    Dim colJVal As Double
+    Dim colLVal As Double
+    Dim colNVal As Double
+    Dim colOVal As Double
+    Dim colQVal As Double
+    Dim colMValueSetting As String
+    Dim colMContent As String
+    Dim hasTrailingSep As Boolean
+    Dim stripDecimals As Boolean
+    Dim noFxDivision As Boolean
+    Dim colOOut As Double
+    Dim separator As String
+    Dim line As String
+    Dim wsMacro As Excel.Worksheet
+    Dim finalWhg As String
+    Dim whgRow1 As String
+    Dim useFormula As Boolean
+    Dim colA As String
+    Dim colB As String
+    Dim colP As String
+    Dim colQ As String
+    Dim transNr As String
+
+    On Error GoTo ErrorHandler
+
+    If dictFilter Is Nothing Then GoTo ExitSub
+
+    Set wsMacro = ThisWorkbook.Sheets("Tradeversand")
+    separator = ";"
+
+    hasTrailingSep = (UCase(Trim(safeString(wsMacro.Range("ffy_csv_trailing_sep").Value))) = "TRUE")
+    colMValueSetting = UCase(Trim(safeString(wsMacro.Range("ffy_csv_col_m_default").Value)))
+    stripDecimals = (UCase(Trim(safeString(wsMacro.Range("ffy_csv_strip_decimals").Value))) = "TRUE")
+    noFxDivision = (UCase(Trim(safeString(wsMacro.Range("ffy_csv_no_fx_division").Value))) = "TRUE")
+
+    If colMValueSetting = "EMPTY" Then
+        colMContent = ""
+    Else
+        colMContent = "0"
+    End If
+
+    lastRow = UBound(dataArr, 1)
+    fileNum = FreeFile
+    Open fullPath For Output As #fileNum
+
+    For r = 2 To lastRow
+        If Trim(safeString(dataArr(r, 4))) = "" Then GoTo nextFfyRow
+        If UCase(Trim(safeString(dataArr(r, 15)))) = "L/B" Then GoTo nextFfyRow
+        If Not inclFree And extractNumber(dataArr(r, 52)) = 0 Then GoTo nextFfyRow
+
+        fundIdStr = safeString(dataArr(r, 4))
+        If Len(fundIdStr) >= 11 Then fundIdStr = Right(fundIdStr, 11)
+
+        If dictFilter.Exists(fundIdStr) Then
+
+            colA = UCase(safeString(dataArr(r, 1)))
+            colB = UCase(safeString(dataArr(r, 2)))
+            colP = UCase(safeString(dataArr(r, 16)))
+            colQ = UCase(Trim(safeString(dataArr(r, 17))))
+
+            depotnrKey = Right(safeString(dataArr(r, 4)), 11)
+            If useExterneFondNr And Not depotnrMap Is Nothing Then
+                If depotnrMap.Exists(depotnrKey) Then
+                    colAVal = CStr(depotnrMap(depotnrKey))
+                Else
+                    colAVal = depotnrKey
+                End If
+            Else
+                colAVal = depotnrKey
+            End If
+
+            colBVal = safeString(dataArr(r, 11))
+
+            whgRow1 = safeString(dataArr(r, 29))
+            If whgRow1 = "" Then whgRow1 = safeString(dataArr(r, 21))
+            If whgRow1 = "" Then whgRow1 = safeString(dataArr(r, 76))
+            colDVal = whgRow1
+
+            colEVal = Format(toDate(dataArr(r, 9)), "dd.mm.yyyy")
+            colFVal = Format(toDate(dataArr(r, 10)), "dd.mm.yyyy")
+
+            If colP = "S" Then
+                If colQ = "PURCHASE" Then
+                    colGVal = "K"
+                ElseIf colQ = "REPURCHASE" Then
+                    colGVal = "V"
+                Else
+                    colGVal = ""
+                End If
+            ElseIf colA = "EX" Or colA = "CN" Then
+                If colP = "P" Then
+                    colGVal = "K"
+                ElseIf colP = "R" Then
+                    colGVal = "V"
+                Else
+                    colGVal = ""
+                End If
+            Else
+                If colP = "R" Then
+                    colGVal = "K"
+                ElseIf colP = "D" Then
+                    colGVal = "V"
+                Else
+                    colGVal = ""
+                End If
+            End If
+
+            colHVal = extractNumber(dataArr(r, 18))
+
+            If colA = "CN" Or colA = "EX" Then
+                colIVal = extractNumber(dataArr(r, 25))
+            Else
+                colIVal = extractNumber(dataArr(r, 20))
+            End If
+
+            finalWhg = safeString(dataArr(r, 33))
+            If finalWhg = "" Then finalWhg = safeString(dataArr(r, 53))
+
+            If safeString(dataArr(r, 61)) <> "" Then
+                colOVal = extractNumber(dataArr(r, 61))
+            ElseIf safeString(dataArr(r, 58)) <> "" Then
+                colOVal = extractNumber(dataArr(r, 58))
+            Else
+                colOVal = 0
+            End If
+
+            useFormula = True
+            colJVal = 0
+            If UCase(whgRow1) = UCase(finalWhg) Then
+                useFormula = False
+                If safeString(dataArr(r, 28)) <> "" Then
+                    If colP = "S" Then
+                        If colQ = "PURCHASE" Then
+                            colJVal = extractNumber(dataArr(r, 28))
+                        ElseIf colQ = "REPURCHASE" Then
+                            colJVal = extractNumberWithSign(dataArr(r, 28))
+                        End If
+                    ElseIf colA = "EX" Or colA = "CN" Then
+                        If colP = "P" Then
+                            colJVal = extractNumber(dataArr(r, 28))
+                        ElseIf colP = "R" Then
+                            colJVal = extractNumberWithSign(dataArr(r, 28))
+                        End If
+                    Else
+                        If colP = "R" Then
+                            colJVal = extractNumber(dataArr(r, 28))
+                        Else
+                            colJVal = extractNumberWithSign(dataArr(r, 28))
+                        End If
+                    End If
+                Else
+                    If safeString(dataArr(r, 20)) = "" Or safeString(dataArr(r, 20)) = "0" Then
+                        colJVal = 0
+                    Else
+                        If colP = "S" Then
+                            If colQ = "PURCHASE" Then
+                                colJVal = extractNumber(dataArr(r, 52))
+                            ElseIf colQ = "REPURCHASE" Then
+                                colJVal = extractNumberWithSign(dataArr(r, 52))
+                            End If
+                        ElseIf colA = "EX" Or colA = "CN" Then
+                            If colP = "P" Then
+                                colJVal = extractNumber(dataArr(r, 52))
+                            ElseIf colP = "R" Then
+                                colJVal = extractNumberWithSign(dataArr(r, 52))
+                            End If
+                        Else
+                            If colP = "R" Then
+                                colJVal = extractNumber(dataArr(r, 52))
+                            Else
+                                colJVal = extractNumberWithSign(dataArr(r, 52))
+                            End If
+                        End If
+                    End If
+                End If
+            Else
+                useFormula = False
+                If safeString(dataArr(r, 28)) = "" Then
+                    colJVal = 0
+                Else
+                    If colP = "S" Then
+                        If colQ = "PURCHASE" Then
+                            colJVal = extractNumber(dataArr(r, 28))
+                        ElseIf colQ = "REPURCHASE" Then
+                            colJVal = extractNumberWithSign(dataArr(r, 28))
+                        End If
+                    ElseIf colA = "EX" Or colA = "CN" Then
+                        If colP = "P" Then
+                            colJVal = extractNumber(dataArr(r, 28))
+                        ElseIf colP = "R" Then
+                            colJVal = extractNumberWithSign(dataArr(r, 28))
+                        End If
+                    Else
+                        If colP = "R" Then
+                            colJVal = extractNumber(dataArr(r, 28))
+                        Else
+                            colJVal = extractNumberWithSign(dataArr(r, 28))
+                        End If
+                    End If
+                End If
+            End If
+
+                If useFormula Then
+                    If colP = "S" Then
+                        If colQ = "PURCHASE" Then
+                            colJVal = extractNumber(dataArr(r, 28)) + extractNumber(dataArr(r, 38)) + _
+                                      extractNumber(dataArr(r, 34)) + extractNumber(dataArr(r, 73)) + _
+                                      extractNumber(dataArr(r, 32)) + extractNumber(dataArr(r, 36)) + _
+                                      extractNumber(dataArr(r, 110)) - extractNumber(dataArr(r, 44))
+                        ElseIf colQ = "REPURCHASE" Then
+                            colJVal = extractNumberWithSign(dataArr(r, 28)) + extractNumberWithSign(dataArr(r, 38)) + _
+                                      extractNumberWithSign(dataArr(r, 34)) + extractNumberWithSign(dataArr(r, 73)) + _
+                                      extractNumberWithSign(dataArr(r, 32)) + extractNumberWithSign(dataArr(r, 36)) - _
+                                      extractNumberWithSign(dataArr(r, 110)) - extractNumberWithSign(dataArr(r, 44))
+                        End If
+                    ElseIf colA = "EX" Or colA = "CN" Then
+                        If colP = "P" Then
+                            colJVal = extractNumber(dataArr(r, 28)) + extractNumber(dataArr(r, 38)) + _
+                                      extractNumber(dataArr(r, 34)) + extractNumber(dataArr(r, 73)) + _
+                                      extractNumber(dataArr(r, 32)) + extractNumber(dataArr(r, 36)) - _
+                                      extractNumber(dataArr(r, 110)) - extractNumber(dataArr(r, 44))
+                        ElseIf colP = "R" Then
+                            colJVal = extractNumberWithSign(dataArr(r, 28)) + extractNumberWithSign(dataArr(r, 38)) + _
+                                      extractNumberWithSign(dataArr(r, 34)) + extractNumberWithSign(dataArr(r, 73)) + _
+                                      extractNumberWithSign(dataArr(r, 32)) - extractNumberWithSign(dataArr(r, 36)) - _
+                                      extractNumberWithSign(dataArr(r, 110)) + extractNumberWithSign(dataArr(r, 44))
+                        End If
+                    Else
+                        If colP = "R" Then
+                            colJVal = extractNumber(dataArr(r, 28)) + extractNumber(dataArr(r, 38)) + _
+                                      extractNumber(dataArr(r, 34)) + extractNumber(dataArr(r, 73)) + _
+                                      extractNumber(dataArr(r, 32)) + extractNumber(dataArr(r, 36)) + _
+                                      extractNumber(dataArr(r, 110)) - extractNumber(dataArr(r, 44))
+                        Else
+                            colJVal = extractNumberWithSign(dataArr(r, 28)) + extractNumberWithSign(dataArr(r, 38)) + _
+                                      extractNumberWithSign(dataArr(r, 34)) + extractNumberWithSign(dataArr(r, 73)) + _
+                                      extractNumberWithSign(dataArr(r, 32)) + extractNumberWithSign(dataArr(r, 36)) - _
+                                      extractNumberWithSign(dataArr(r, 110)) - extractNumberWithSign(dataArr(r, 44))
+                        End If
+                    End If
+                End If
+
+                If safeString(dataArr(r, 32)) = "" Then
+                    colKVal = "0"
+                Else
+                    If UCase(whgRow1) = UCase(finalWhg) Or noFxDivision Then
+                        colKVal = formatCsvNumber(extractNumber(dataArr(r, 32)), stripDecimals)
+                    Else
+                        If colOVal <> 0 Then
+                            colKVal = formatCsvNumber(extractNumber(dataArr(r, 32)) / colOVal, stripDecimals)
+                        Else
+                            colKVal = "0"
+                        End If
+                    End If
+                End If
+
+                If safeString(dataArr(r, 34)) = "" And safeString(dataArr(r, 110)) = "" Then
+                    colLVal = 0
+                Else
+                    colLVal = extractNumber(dataArr(r, 34)) + extractNumber(dataArr(r, 110))
+                    If UCase(whgRow1) <> UCase(finalWhg) And Not noFxDivision Then
+                        If colOVal <> 0 Then
+                            colLVal = colLVal / colOVal
+                        Else
+                            colLVal = 0
+                        End If
+                    End If
+                End If
+
+                If safeString(dataArr(r, 73)) = "" And safeString(dataArr(r, 38)) = "" And safeString(dataArr(r, 36)) = "" Then
+                    colNVal = 0
+                Else
+                    colNVal = extractNumber(dataArr(r, 73)) + extractNumber(dataArr(r, 38)) + extractNumber(dataArr(r, 36))
+                    If UCase(whgRow1) <> UCase(finalWhg) And Not noFxDivision Then
+                        If colOVal <> 0 Then
+                            colNVal = colNVal / colOVal
+                        Else
+                            colNVal = 0
+                        End If
+                    End If
+                End If
+
+                If colB = "O" Then
+                    colPVal = "J"
+                Else
+                    colPVal = "N"
+                End If
+
+                colQVal = extractNumber(dataArr(r, 75))
+                colRVal = finalWhg
+
+                transNr = safeString(dataArr(r, 7))
+                If colB = "O" And Left(transNr, 1) = "P" Then transNr = transNr & "A"
+                colSVal = transNr
+
+                colTVal = safeString(dataArr(r, 19))
+
+                If noFxDivision Then
+                    If colOVal <> 0 Then
+                        colOOut = 1 / colOVal
+                    Else
+                        colOOut = 0
+                    End If
+                Else
+                    colOOut = colOVal
+                End If
+
+                line = cleanString(colAVal, stripDecimals) & separator & _
+                       cleanString(colBVal, stripDecimals) & separator & _
+                       " " & separator & _
+                       cleanString(colDVal, stripDecimals) & separator & _
+                       colEVal & separator & _
+                       colFVal & separator & _
+                       cleanString(colGVal, stripDecimals) & separator & _
+                       formatCsvNumber(colHVal, stripDecimals) & separator & _
+                       formatCsvNumber(colIVal, stripDecimals) & separator & _
+                       formatCsvNumber(colJVal, stripDecimals) & separator & _
+                       cleanString(colKVal, stripDecimals) & separator & _
+                       formatCsvNumber(colLVal, stripDecimals) & separator & _
+                       colMContent & separator & _
+                       formatCsvNumber(colNVal, stripDecimals) & separator & _
+                       formatCsvNumber(colOOut, stripDecimals) & separator & _
+                       cleanString(colPVal, stripDecimals) & separator & _
+                       formatCsvNumber(colQVal, stripDecimals) & separator & _
+                       cleanString(colRVal, stripDecimals) & separator & _
+                       cleanString(colSVal, stripDecimals) & separator & _
+                       cleanString(colTVal, stripDecimals)
+
+                If hasTrailingSep Then line = line & separator
+
+                Print #fileNum, line
+            End If
+nextFfyRow:
+        Next r
+
+ExitSub:
+        On Error Resume Next
+        If fileNum > 0 Then Close #fileNum
+        On Error GoTo 0
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fullPath;useExterneFondNr;inclFree", _
+        fullPath, _
+        useExterneFondNr, _
+        inclFree
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByRef dataArr As Variant, ByVal fullPath As String, Optional dictFilter As Object = Nothing, Optional ByVal inclFree As Boolean = True
+' Returns:       ---
+' Description:   Creates the standard CSV output from the transaction array.
+'-------------------------------------------------------------------------------
+Public Sub saveArrayAsCsv(ByRef dataArr As Variant, ByVal fullPath As String, Optional dictFilter As Object = Nothing, Optional ByVal inclFree As Boolean = True)
+    Const METHOD_NAME As String = "saveArrayAsCsv"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileNum As Long
+    Dim lastRow As Long
+    Dim lastCol As Long
+    Dim r As Long
+    Dim c As Long
+    Dim csvLine As String
+    Dim cellVal As Variant
+    Dim fundIdStr As String
+    Dim outputLines() As String
+    Dim lineCount As Long
+
+    On Error GoTo ErrorHandler
+
+    If Not IsArray(dataArr) Then GoTo ExitSub
+    lastRow = UBound(dataArr, 1)
+    lastCol = UBound(dataArr, 2)
+    If lastRow < 1 Or lastCol < 1 Then GoTo ExitSub
+
+    ReDim outputLines(1 To lastRow)
+    lineCount = 0
+
+    For r = 1 To lastRow
+        If r > 1 And Not dictFilter Is Nothing Then
+            fundIdStr = Right(Trim(CStr(dataArr(r, 4))), 11)
+            If Not dictFilter.Exists(fundIdStr) Then GoTo nextRow
+        End If
+        If r > 1 Then
+            If UCase(Trim(safeString(dataArr(r, 15)))) = "L/B" Then GoTo nextRow
+        End If
+        If r > 1 And Not inclFree Then
+            If extractNumber(dataArr(r, 52)) = 0 Then GoTo nextRow
+        End If
+
+        csvLine = ""
+        For c = 1 To lastCol
+            cellVal = dataArr(r, c)
+            If IsError(cellVal) Or IsEmpty(cellVal) Then
+                csvLine = csvLine & ";"
+            ElseIf VarType(cellVal) = vbDate Then
+                csvLine = csvLine & Format(cellVal, "dd-mm-yyyy") & ";"
+            ElseIf IsNumeric(cellVal) Then
+                csvLine = csvLine & Replace(CStr(cellVal), ",", ".") & ";"
+            Else
+                csvLine = csvLine & Replace(Replace(CStr(cellVal), vbCrLf, " "), vbLf, " ") & ";"
+            End If
+        Next c
+
+        If Len(csvLine) > 0 Then csvLine = Left(csvLine, Len(csvLine) - 1)
+
+        lineCount = lineCount + 1
+        outputLines(lineCount) = csvLine
+nextRow:
+    Next r
+
+    If lineCount > 0 Then
+        ReDim Preserve outputLines(1 To lineCount)
+        fileNum = FreeFile
+        Open fullPath For Output As #fileNum
+        Print #fileNum, Join(outputLines, vbCrLf)
+        Close #fileNum
+    End If
+
+ExitSub:
+    On Error Resume Next
+    If fileNum > 0 Then Close #fileNum
+    On Error GoTo 0
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fullPath;inclFree", _
+        fullPath, _
+        inclFree
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    targetCell As Excel.Range, textValue As String
+' Returns:       ---
+' Description:   Disables dynamic shrink-to-fit while preserving the legacy public entry point.
+'-------------------------------------------------------------------------------
+Public Sub shrinkFontIfTooLong(targetCell As Excel.Range, textValue As String)
+    Const METHOD_NAME As String = "shrinkFontIfTooLong"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If targetCell Is Nothing Then
+        Err.Raise 1001, METHOD_NAME, "The target cell is required."
+    End If
+
+    If targetCell.MergeCells Then
+        targetCell.MergeArea.ShrinkToFit = False
+    Else
+        targetCell.ShrinkToFit = False
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "textLength", _
+        Len(textValue)
+
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       Excel.Workbook
+' Description:   Creates a new workbook and retries once after a transient failure.
+'-------------------------------------------------------------------------------
+Private Function createWorkbookSafe() As Excel.Workbook
+    Const METHOD_NAME As String = "createWorkbookSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnRetried As Boolean
+
+    On Error GoTo ErrorHandler
+
+RetryCreate:
+    Set createWorkbookSafe = Workbooks.Add
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    If Not blnRetried Then
+        blnRetried = True
+        VBA.Err.Clear
+        Application.Wait Now + TimeValue("0:00:01")
+        Resume RetryCreate
+    End If
+    Set createWorkbookSafe = Nothing
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal folderPath As String, ByVal filePattern As String
+' Returns:       ---
+' Description:   Deletes files matching the supplied pattern from the target folder.
+'-------------------------------------------------------------------------------
+Private Sub ClearFolderContentSafe(ByVal folderPath As String, ByVal filePattern As String)
+    Const METHOD_NAME As String = "ClearFolderContentSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fso As Object
+    Dim fileName As String
+
+    On Error GoTo ErrorHandler
+
+    If folderPath = "" Or folderPath = "\" Then GoTo ExitSub
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    fileName = Dir(folderPath & filePattern)
+    Do While fileName <> ""
+        fso.DeleteFile folderPath & fileName, True
+        fileName = Dir()
+    Loop
+
+ExitSub:
+    Set fso = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;filePattern", _
+        folderPath, _
+        filePattern
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       Double
+' Description:   Returns the current Excel process working-set size in megabytes.
+'-------------------------------------------------------------------------------
+Public Function GetExcelRAMUsageMB() As Double
+    Const METHOD_NAME As String = "GetExcelRAMUsageMB"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim objWMI As Object
+    Dim colProcs As Object
+    Dim objProc As Object
+    Dim currentPID As Long
+
+    On Error GoTo ErrorHandler
+
+    currentPID = GetCurrentProcessId()
+
+    Set objWMI = GetObject("winmgmts:\\.\root\cimv2")
+    Set colProcs = objWMI.ExecQuery("Select WorkingSetSize From Win32_Process Where ProcessId = " & currentPID)
+
+    For Each objProc In colProcs
+        GetExcelRAMUsageMB = Round(objProc.WorkingSetSize / 1048576, 2)
+    Next objProc
+
+ExitFunction:
+    Set colProcs = Nothing
+    Set objWMI = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetExcelRAMUsageMB = -1
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ---
+' Returns:       ---
+' Description:   Requests Windows to trim the current Excel process working set.
+'-------------------------------------------------------------------------------
+Public Sub flushSystemRAM()
+    Const METHOD_NAME As String = "flushSystemRAM"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Call EmptyWorkingSet(GetCurrentProcess())
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal folderPath As String, ByVal clientName As String
+' Returns:       Boolean
+' Description:   Checks whether a target path contains the expected client name.
+'-------------------------------------------------------------------------------
+Private Function assertClientInPath(ByVal folderPath As String, ByVal clientName As String) As Boolean
+    Const METHOD_NAME As String = "assertClientInPath"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If folderPath = "" Or folderPath = "\" Then
+        assertClientInPath = True
+        GoTo ExitFunction
+    End If
+
+    assertClientInPath = (InStr(1, LCase(folderPath), LCase(clientName)) > 0)
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    assertClientInPath = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;clientName", _
+        folderPath, _
+        clientName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByRef fArr As Variant
+' Returns:       Object
+' Description:   Builds the Depot number to fund description mapping.
+'-------------------------------------------------------------------------------
+Public Function buildFondsbezeichnungMap(ByRef fArr As Variant) As Object
+    Const METHOD_NAME As String = "buildFondsbezeichnungMap"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dict As Object
+    Dim lastRow As Long
+    Dim r As Long
+    Dim depotnrKey As String
+    Dim fondsName As String
+
+    On Error GoTo ErrorHandler
+
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    If IsEmpty(fArr) Then
+        Set buildFondsbezeichnungMap = dict
+        GoTo ExitFunction
+    End If
+
+    lastRow = UBound(fArr, 1)
+    For r = 2 To lastRow
+        If UCase(Trim(safeString(fArr(r, 2)))) = "OPEN" Then
+            depotnrKey = Replace(Trim(safeString(fArr(r, 14))), " ", "")
+            If Len(depotnrKey) >= 11 Then depotnrKey = Right(depotnrKey, 11)
+
+            fondsName = Trim(safeString(fArr(r, 5)))
+
+            If depotnrKey <> "" And fondsName <> "" Then
+                If Not dict.Exists(depotnrKey) Then
+                    dict.Add depotnrKey, fondsName
+                End If
+            End If
+        End If
+    Next r
+
+    Set buildFondsbezeichnungMap = dict
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set buildFondsbezeichnungMap = CreateObject("Scripting.Dictionary")
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal val As Double, ByVal stripDec As Boolean
+' Returns:       String
+' Description:   Formats a numeric value for the configured FFY CSV representation.
+'-------------------------------------------------------------------------------
+Public Function formatCsvNumber(ByVal val As Double, ByVal stripDec As Boolean) As String
+    Const METHOD_NAME As String = "formatCsvNumber"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim result As String
+
+    On Error GoTo ErrorHandler
+
+    If val = 0 Then
+        result = "0"
+    ElseIf val = Int(val) Then
+        result = Replace(CStr(CLng(val)), ".", ",")
+    Else
+        result = Replace(CStr(val), ".", ",")
+    End If
+
+    If stripDec Then
+        result = Replace(result, ",", "")
+        result = Replace(result, ".", "")
+    End If
+
+    formatCsvNumber = result
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    formatCsvNumber = "0"
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "stripDec", _
+        stripDec
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal val As String, ByVal stripDec As Boolean
+' Returns:       String
+' Description:   Removes decimal separators from text when configured.
+'-------------------------------------------------------------------------------
+Public Function cleanString(ByVal val As String, ByVal stripDec As Boolean) As String
+    Const METHOD_NAME As String = "cleanString"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If stripDec Then
+        val = Replace(val, ".", "")
+        val = Replace(val, ",", "")
+    End If
+
+    cleanString = val
+    GoTo ExitFunction
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    cleanString = val
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "stripDec", _
+        stripDec
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-04
+' Parameters:    ByVal csvFullPath As String, ByVal pdfFullPath As String
+' Returns:       ---
+' Description:   Converts the generated FFY CSV file to a formatted PDF report.
+'-------------------------------------------------------------------------------
+Public Sub convertFfyCsvToPdf(ByVal csvFullPath As String, ByVal pdfFullPath As String)
+    Const METHOD_NAME As String = "convertFfyCsvToPdf"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim blnPreviousDisplayAlerts As Boolean
+    Dim blnSettingsCaptured As Boolean
+    Dim wbCsv As Excel.Workbook
+    Dim wsCsv As Excel.Worksheet
+    Dim csvFileName As String
+    Dim c As Long
+
+    On Error GoTo ErrorHandler
+
+    blnPreviousDisplayAlerts = Application.DisplayAlerts
+    blnSettingsCaptured = True
+
+    If Dir(csvFullPath) = "" Then Err.Raise 1010, , "CSV file not found for PDF conversion: " & csvFullPath
+
+    csvFileName = Mid(csvFullPath, InStrRev(csvFullPath, "\") + 1)
+
+    Application.DisplayAlerts = False
+
+    Workbooks.OpenText fileName:=csvFullPath, DataType:=xlDelimited, Semicolon:=True, Local:=True
+    Set wbCsv = Workbooks(csvFileName)
+    Set wsCsv = wbCsv.Sheets(1)
+
+    With wsCsv
+        .Cells.Font.Name = "Times New Roman"
+        .Cells.Font.Size = 8
+
+        With .UsedRange.Borders
+            .LineStyle = xlContinuous
+            .Weight = xlHairline
+        End With
+
+        .Columns.AutoFit
+
+        For c = 1 To .UsedRange.Columns.Count
+            .Columns(c).ColumnWidth = .Columns(c).ColumnWidth + 1
+        Next c
+
+        With .PageSetup
+            .Orientation = xlLandscape
+            .LeftMargin = Application.CentimetersToPoints(0.7)
+            .RightMargin = Application.CentimetersToPoints(0.7)
+            .TopMargin = Application.CentimetersToPoints(1)
+            .BottomMargin = Application.CentimetersToPoints(1)
+            .Zoom = False
+            .FitToPagesWide = 1
+            .FitToPagesTall = False
+            .RightFooter = "&""Times New Roman,Regular""&8&P/&N"
+        End With
+
+    End With
+
+    Call ApplySensitivityLabel(wbCsv, "8ffbc0b8-e97b-47d1-beac-cb0955d66f3b")
+
+    If Not QueueWorksheetForPowerPdf(wsCsv, pdfFullPath) Then
+        Err.Raise 1015, METHOD_NAME, _
+                  "Power PDF print job could not be queued for FFY PDF. " & _
+                  GetPowerPdfLastErrorDescription()
+    End If
+
+ExitSub:
+    If Not wbCsv Is Nothing Then
+        On Error Resume Next
+        wbCsv.Close SaveChanges:=False
+        On Error GoTo 0
+    End If
+    Set wsCsv = Nothing
+    Set wbCsv = Nothing
+    If blnSettingsCaptured Then
+        Application.DisplayAlerts = blnPreviousDisplayAlerts
+    End If
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "csvFullPath;pdfFullPath", _
+        csvFullPath, _
+        pdfFullPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+

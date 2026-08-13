@@ -1,0 +1,1650 @@
+Option Explicit
+
+Private Const CLASS_NAME As String = "modMasterController"
+Private Const LAST_TRANSACTION_COLUMN As Long = 110
+Private Const ARCHIVE_INPUT_FILES_AFTER_LOAD As Boolean = False ' Set to True after testing.
+
+Private gblnDeferredCompletionPending As Boolean
+Private gblnDeferredRunAll As Boolean
+Private gcolPendingEmailRequests As Collection
+Private glngLastClientErrorNumber As Long
+Private gstrDeferredBatchSummary As String
+Private gstrDeferredOriginalResultsFileName As String
+Private gstrLastClientErrorDescription As String
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Runs the complete Tradeversand process for one KVG or all enabled KVGs.
+'-------------------------------------------------------------------------------
+Public Sub executeMasterProcess()
+    Const METHOD_NAME As String = "executeMasterProcess"
+    Dim activeKvgCount As Long
+    Dim archiveErrorMessage As String
+    Dim batchSummary As String
+    Dim blnApplicationStateCaptured As Boolean
+    Dim clientDict As Object
+    Dim clientResult As String
+    Dim destFolder As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim filePaths As Variant
+    Dim fondslisteArr As Variant
+    Dim inputDataArr As Variant
+    Dim kvgProcessedIndex As Long
+    Dim lastRow As Long
+    Dim originalCalculation As Excel.XlCalculation
+    Dim runAll As Boolean
+    Dim sendAfter As Boolean
+    Dim targetKvg As String
+    Dim varPath As Variant
+    Dim wsMacro As Excel.Worksheet
+    Dim wsMap As Excel.Worksheet
+    Dim rowIndex As Long
+    Dim strOriginalResultsFileName As String
+
+    On Error GoTo ErrorHandler
+
+    originalCalculation = Application.Calculation
+    blnApplicationStateCaptured = True
+    batchSummary = vbNullString
+
+    If GetPowerPdfPendingCount() > 0 Then
+        Err.Raise 1025, METHOD_NAME, "A previous Power PDF batch is still running. Wait until it finishes before starting another run."
+    End If
+
+    Call ResetDeferredCompletionState
+    Call SetPowerPdfCompletionCallback(vbNullString)
+
+    Application.Calculation = xlCalculationAutomatic
+
+    Call cleanupOrphanedTempFolders
+
+    Set wsMacro = ThisWorkbook.Worksheets("Tradeversand")
+    Set wsMap = ThisWorkbook.Worksheets("Mapping")
+
+    strOriginalResultsFileName = CStr(wsMacro.Range("results_file_name").Value)
+    gstrDeferredOriginalResultsFileName = strOriginalResultsFileName
+
+    runAll = wsMacro.Range("run_all_kvg").Value
+    sendAfter = wsMacro.Range("email_after_creation").Value
+
+    filePaths = Application.GetOpenFilename( _
+        FileFilter:="Excel Files (*.xls*), *.xls*", _
+        Title:="Select XLSX files with data", _
+        MultiSelect:=True)
+
+    If VarType(filePaths) = vbBoolean Then
+        GoTo ExitSub
+    End If
+
+    inputDataArr = loadTransactionDataToArr(filePaths)
+
+    If IsEmpty(inputDataArr) Then
+        GoTo ExitSub
+    End If
+
+    destFolder = getRangeValueSafe(wsMacro, "cfg_DestFolder")
+
+    If ARCHIVE_INPUT_FILES_AFTER_LOAD And Len(destFolder) > 0 Then
+        DoEvents
+        Application.Wait Now + TimeValue("0:00:01")
+
+        For Each varPath In filePaths
+            archiveErrorMessage = vbNullString
+
+            If Not moveInputFile(CStr(varPath), destFolder, archiveErrorMessage) Then
+                errorManager.display archiveErrorMessage
+            End If
+        Next varPath
+    End If
+
+    fondslisteArr = loadFondslisteToArray(wsMacro)
+
+    If IsEmpty(fondslisteArr) Then
+        GoTo ExitSub
+    End If
+
+    If runAll Then
+        activeKvgCount = countActiveKvgRows(wsMap)
+        Call warnAboutOrphanChildren(wsMap)
+    Else
+        activeKvgCount = 1
+    End If
+
+    Call progressInit(activeKvgCount)
+
+    If Not runAll Then
+        targetKvg = Trim$(CStr(wsMacro.Range("kvg_name").Value))
+        Set clientDict = buildClientDictFromArray(fondslisteArr, targetKvg)
+
+        If clientDict.Count = 0 Then
+            Err.Raise 1001, METHOD_NAME, "No OPEN funds for KVG: " & targetKvg
+        End If
+
+        Call progressStartKvg(1, targetKvg)
+
+        batchSummary = runProcessForClient( _
+            CStr(wsMacro.Range("results_file_name").Value), _
+            inputDataArr, _
+            clientDict, _
+            sendAfter, _
+            fondslisteArr)
+
+        If batchSummary = "ERROR" Then
+            If glngLastClientErrorNumber = 0 Then
+                glngLastClientErrorNumber = 1001
+            End If
+            Err.Raise glngLastClientErrorNumber, METHOD_NAME, gstrLastClientErrorDescription
+        End If
+    Else
+        lastRow = wsMap.Cells(wsMap.Rows.Count, "A").End(xlUp).Row
+
+        For rowIndex = 2 To lastRow
+            If UCase$(Trim$(CStr(wsMap.Cells(rowIndex, "V").Value))) = "TRUE" _
+                Or UCase$(Trim$(CStr(wsMap.Cells(rowIndex, "V").Value))) = "PRAWDA" Then
+
+                If Len(Trim$(CStr(wsMap.Cells(rowIndex, "W").Value))) > 0 Then
+                    Debug.Print "Skipping row " & rowIndex & " (" & wsMap.Cells(rowIndex, "A").Value & "): has merge_into, will be handled by parent."
+                    GoTo NextRow
+                End If
+
+                wsMacro.Range("results_file_name").Value = wsMap.Cells(rowIndex, "A").Value
+
+                Application.Calculate
+                DoEvents
+                Application.Wait Now + TimeValue("0:00:01")
+
+                targetKvg = Trim$(CStr(wsMap.Cells(rowIndex, "U").Value))
+                Set clientDict = buildClientDictFromArray(fondslisteArr, targetKvg)
+
+                If clientDict.Count > 0 Then
+                    kvgProcessedIndex = kvgProcessedIndex + 1
+                    Call progressStartKvg(kvgProcessedIndex, targetKvg)
+
+                    clientResult = runProcessForClient( _
+                        CStr(wsMap.Cells(rowIndex, "A").Value), _
+                        inputDataArr, _
+                        clientDict, _
+                        sendAfter, _
+                        fondslisteArr)
+
+                    batchSummary = batchSummary & _
+                                   CStr(wsMap.Cells(rowIndex, "A").Value) & ": " & _
+                                   clientResult & _
+                                   vbCrLf
+
+                    If clientResult = "ERROR" Then
+                        If glngLastClientErrorNumber = 1015 _
+                            Or (glngLastClientErrorNumber >= 1020 And glngLastClientErrorNumber <= 1029) Then
+                            Err.Raise glngLastClientErrorNumber, METHOD_NAME, gstrLastClientErrorDescription
+                        End If
+                    End If
+                End If
+
+                Set clientDict = Nothing
+                Call flushSystemRAM
+            End If
+NextRow:
+        Next rowIndex
+    End If
+
+    Erase inputDataArr
+
+    gstrDeferredBatchSummary = batchSummary
+    gblnDeferredRunAll = runAll
+    gblnDeferredCompletionPending = True
+
+    Call SetPowerPdfCompletionCallback("CompleteTradeversandAfterPowerPdf")
+
+    If GetPowerPdfPendingCount() > 0 Then
+        Call FinishPowerPdfBatch
+    Else
+        Call CompleteTradeversandAfterPowerPdf
+    End If
+
+ExitSub:
+    Call progressClear
+
+    If IsArray(inputDataArr) Then
+        Erase inputDataArr
+    End If
+
+    If IsArray(fondslisteArr) Then
+        Erase fondslisteArr
+    End If
+
+    If Not wsMacro Is Nothing Then
+        If Len(strOriginalResultsFileName) > 0 Then
+            wsMacro.Range("results_file_name").Value = strOriginalResultsFileName
+            Application.Calculate
+            DoEvents
+        End If
+    End If
+
+    If blnApplicationStateCaptured Then
+        Application.Calculation = originalCalculation
+    End If
+
+    Application.StatusBar = False
+
+    Set clientDict = Nothing
+    Set wsMap = Nothing
+    Set wsMacro = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "runAll;targetKvg;processedKvgCount", _
+        runAll, _
+        targetKvg, _
+        kvgProcessedIndex
+    errorManager.save
+    errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Sends deferred client e-mails after all queued PDF files are available.
+'-------------------------------------------------------------------------------
+Public Sub CompleteTradeversandAfterPowerPdf()
+    Const METHOD_NAME As String = "CompleteTradeversandAfterPowerPdf"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim wksConfig As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    If Not gblnDeferredCompletionPending Then
+        GoTo ExitSub
+    End If
+
+    Call SendDeferredEmailRequests
+
+    If gblnDeferredRunAll Then
+        MsgBox _
+            "Process finished." & vbCrLf & vbCrLf & "Summary:" & vbCrLf & gstrDeferredBatchSummary, _
+            vbInformation, _
+            "Batch Summary"
+    Else
+        MsgBox _
+            "Process finished." & vbCrLf & "Generated: " & gstrDeferredBatchSummary, _
+            vbInformation, _
+            "Success"
+    End If
+
+ExitSub:
+    On Error Resume Next
+    Set wksConfig = ThisWorkbook.Worksheets("Tradeversand")
+    If Len(gstrDeferredOriginalResultsFileName) > 0 Then
+        wksConfig.Range("results_file_name").Value = gstrDeferredOriginalResultsFileName
+        Application.Calculate
+        DoEvents
+    End If
+    Application.StatusBar = False
+    Set wksConfig = Nothing
+    On Error GoTo 0
+    Call ResetDeferredCompletionState
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ByVal blnHasChild As Boolean, ByVal strClientName As String, ByVal strChildName As String, ByVal blnUseChildOwnPaths As Boolean
+' Returns:       ---
+' Description:   Adds one client e-mail request to the post-PDF completion queue.
+'-------------------------------------------------------------------------------
+Private Sub QueueClientEmailRequest(ByVal blnHasChild As Boolean, _
+                                    ByVal strClientName As String, _
+                                    ByVal strChildName As String, _
+                                    ByVal blnUseChildOwnPaths As Boolean)
+    Const METHOD_NAME As String = "QueueClientEmailRequest"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If gcolPendingEmailRequests Is Nothing Then
+        Set gcolPendingEmailRequests = New Collection
+    End If
+
+    gcolPendingEmailRequests.Add Array( _
+        blnHasChild, _
+        strClientName, _
+        strChildName, _
+        blnUseChildOwnPaths)
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "clientName;childName;useChildOwnPaths", _
+        strClientName, _
+        strChildName, _
+        blnUseChildOwnPaths
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Processes every queued e-mail request using the correct client configuration.
+'-------------------------------------------------------------------------------
+Private Sub SendDeferredEmailRequests()
+    Const METHOD_NAME As String = "SendDeferredEmailRequests"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strPreviousResultsFileName As String
+    Dim varRequest As Variant
+    Dim wksConfig As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    If gcolPendingEmailRequests Is Nothing Then
+        GoTo ExitSub
+    End If
+
+    If gcolPendingEmailRequests.Count = 0 Then
+        GoTo ExitSub
+    End If
+
+    Set wksConfig = ThisWorkbook.Worksheets("Tradeversand")
+    strPreviousResultsFileName = CStr(wksConfig.Range("results_file_name").Value)
+
+    For Each varRequest In gcolPendingEmailRequests
+        wksConfig.Range("results_file_name").Value = CStr(varRequest(1))
+        Application.Calculate
+        DoEvents
+
+        If CBool(varRequest(0)) Then
+            Call processAndSendTradeversand_withChild( _
+                CStr(varRequest(1)), _
+                CStr(varRequest(2)), _
+                CBool(varRequest(3)))
+        Else
+            Call processAndSendTradeversand
+        End If
+    Next varRequest
+
+ExitSub:
+    On Error Resume Next
+    If Not wksConfig Is Nothing Then
+        wksConfig.Range("results_file_name").Value = strPreviousResultsFileName
+        Application.Calculate
+        DoEvents
+    End If
+    Set wksConfig = Nothing
+    On Error GoTo 0
+    If errNumber <> 0 Then
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Clears deferred completion and e-mail state before or after one batch.
+'-------------------------------------------------------------------------------
+Private Sub ResetDeferredCompletionState()
+    Const METHOD_NAME As String = "ResetDeferredCompletionState"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Set gcolPendingEmailRequests = Nothing
+    gblnDeferredCompletionPending = False
+    gblnDeferredRunAll = False
+    glngLastClientErrorNumber = 0
+    gstrDeferredBatchSummary = vbNullString
+    gstrDeferredOriginalResultsFileName = vbNullString
+    gstrLastClientErrorDescription = vbNullString
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    clientName As String, inArr As Variant, cDict As Object, sendNow As Boolean, fondsArr As Variant
+' Returns:       String
+' Description:   Generates reports and optional e-mails for one parent client and its configured child.
+'-------------------------------------------------------------------------------
+Private Function runProcessForClient(ByVal clientName As String, _
+                                     ByRef inArr As Variant, _
+                                     ByRef cDict As Object, _
+                                     ByVal sendNow As Boolean, _
+                                     ByRef fondsArr As Variant) As String
+    Const METHOD_NAME As String = "runProcessForClient"
+    Dim blnPreviousScreenUpdating As Boolean
+    Dim blnScreenUpdatingCaptured As Boolean
+    Dim childCsvNr As String
+    Dim childCsvNrToUse As String
+    Dim childCsvPrefix As String
+    Dim childDict As Object
+    Dim childFileName As String
+    Dim childKvg As String
+    Dim childPdfXlsxPrefix As String
+    Dim childRow As Long
+    Dim clientStats As String
+    Dim combinedDict As Object
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim hasFfy As Boolean
+    Dim hasXlsx As Boolean
+    Dim originalFileName As String
+    Dim ownCsvName As Boolean
+    Dim ownCsvNr As Boolean
+    Dim ownPaths As Boolean
+    Dim ownPdfXlsxName As Boolean
+    Dim resultsNameTouched As Boolean
+    Dim separateCsv As Boolean
+    Dim totalCsv As Long
+    Dim totalFfy As Long
+    Dim totalPdf As Long
+    Dim totalXlsx As Long
+    Dim wsMacro As Excel.Worksheet
+    Dim wsMap As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    glngLastClientErrorNumber = 0
+    gstrLastClientErrorDescription = vbNullString
+    blnPreviousScreenUpdating = Application.ScreenUpdating
+    blnScreenUpdatingCaptured = True
+    Application.ScreenUpdating = False
+    resultsNameTouched = False
+    totalCsv = 0
+    totalPdf = 0
+    totalXlsx = 0
+    hasXlsx = False
+    totalFfy = 0
+    hasFfy = False
+
+    Set wsMacro = ThisWorkbook.Worksheets("Tradeversand")
+    Set wsMap = ThisWorkbook.Worksheets("Mapping")
+
+    childRow = findChildRowForParent(wsMap, clientName)
+
+    If childRow = 0 Then
+        Call generatePerfectReportsV3(inArr, cDict, clientStats, fondsArr:=fondsArr)
+        Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
+
+        If sendNow Then
+            Call QueueClientEmailRequest(False, clientName, vbNullString, False)
+        End If
+
+        runProcessForClient = totalCsv & " CSV, " & totalPdf & " PDF"
+
+        If hasXlsx Then
+            runProcessForClient = runProcessForClient & ", " & totalXlsx & " XLSX"
+        End If
+
+        If hasFfy Then
+            runProcessForClient = runProcessForClient & ", " & totalFfy & " FFY"
+        End If
+
+        GoTo ExitFunction
+    End If
+
+    childFileName = Trim$(CStr(wsMap.Cells(childRow, "A").Value))
+    childKvg = Trim$(CStr(wsMap.Cells(childRow, "U").Value))
+
+    originalFileName = CStr(wsMacro.Range("results_file_name").Value)
+    wsMacro.Range("results_file_name").Value = childFileName
+    resultsNameTouched = True
+    Application.Calculate
+    DoEvents
+
+    ownPdfXlsxName = readChildBoolean(wsMacro, "child_use_own_pdf_xlsx_name")
+    separateCsv = readChildBoolean(wsMacro, "child_separate_csv")
+    ownCsvName = readChildBoolean(wsMacro, "child_use_own_csv_name")
+    ownCsvNr = readChildBoolean(wsMacro, "child_use_own_csv_nr")
+    ownPaths = readChildBoolean(wsMacro, "child_use_own_paths")
+    childCsvNr = CStr(wsMacro.Range("csv_name_nr").Value)
+
+    wsMacro.Range("results_file_name").Value = originalFileName
+    resultsNameTouched = False
+    Application.Calculate
+    DoEvents
+
+    Set childDict = buildClientDictFromArray(fondsArr, childKvg)
+
+    If separateCsv And Not ownCsvName And Not ownCsvNr Then
+        Err.Raise _
+            1051, _
+            METHOD_NAME, _
+            "Invalid child config for parent '" & clientName & _
+            "': child_separate_csv=TRUE requires either child_use_own_csv_name=TRUE or " & _
+            "child_use_own_csv_nr=TRUE (otherwise both CSVs would have the same filename and overwrite each other)."
+    End If
+
+    If Not ownPdfXlsxName And Not separateCsv And Not ownPaths Then
+        Set combinedDict = mergeDictionaries(cDict, childDict)
+        Call generatePerfectReportsV3(inArr, combinedDict, clientStats, fondsArr:=fondsArr)
+        Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
+    ElseIf Not separateCsv Then
+        Set combinedDict = mergeDictionaries(cDict, childDict)
+
+        Call generatePerfectReportsV3( _
+            inArr, _
+            combinedDict, _
+            clientStats, _
+            skipCsv:=False, _
+            skipFfyCsv:=False, _
+            skipPdfXlsx:=True, _
+            pdfXlsxPrefixOverride:=vbNullString, _
+            csvPrefixOverride:=vbNullString, _
+            ffyPrefixOverride:=vbNullString, _
+            csvNrOverride:=vbNullString, _
+            isChildPass:=False, _
+            fondsArr:=fondsArr)
+
+        Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
+
+        Call generatePerfectReportsV3( _
+            inArr, _
+            cDict, _
+            clientStats, _
+            skipCsv:=True, _
+            skipFfyCsv:=True, _
+            skipPdfXlsx:=False, _
+            pdfXlsxPrefixOverride:=vbNullString, _
+            csvPrefixOverride:=vbNullString, _
+            ffyPrefixOverride:=vbNullString, _
+            csvNrOverride:=vbNullString, _
+            isChildPass:=True, _
+            fondsArr:=fondsArr)
+
+        Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
+
+        If ownPdfXlsxName Then
+            childPdfXlsxPrefix = childFileName
+        Else
+            childPdfXlsxPrefix = clientName
+        End If
+
+        If ownPaths Then
+            wsMacro.Range("results_file_name").Value = childFileName
+            resultsNameTouched = True
+            Application.Calculate
+            DoEvents
+        End If
+
+        Call generatePerfectReportsV3( _
+            inArr, _
+            childDict, _
+            clientStats, _
+            skipCsv:=True, _
+            skipFfyCsv:=True, _
+            skipPdfXlsx:=False, _
+            pdfXlsxPrefixOverride:=childPdfXlsxPrefix, _
+            csvPrefixOverride:=vbNullString, _
+            ffyPrefixOverride:=vbNullString, _
+            csvNrOverride:=vbNullString, _
+            isChildPass:=True, _
+            fondsArr:=fondsArr)
+
+        Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
+
+        If ownPaths Then
+            wsMacro.Range("results_file_name").Value = originalFileName
+            resultsNameTouched = False
+            Application.Calculate
+            DoEvents
+        End If
+    Else
+        Call generatePerfectReportsV3( _
+            inArr, _
+            cDict, _
+            clientStats, _
+            skipCsv:=False, _
+            skipFfyCsv:=False, _
+            skipPdfXlsx:=False, _
+            pdfXlsxPrefixOverride:=vbNullString, _
+            csvPrefixOverride:=vbNullString, _
+            ffyPrefixOverride:=vbNullString, _
+            csvNrOverride:=vbNullString, _
+            isChildPass:=False, _
+            fondsArr:=fondsArr)
+
+        Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
+
+        If ownPdfXlsxName Then
+            childPdfXlsxPrefix = childFileName
+        Else
+            childPdfXlsxPrefix = clientName
+        End If
+
+        If ownCsvName Then
+            childCsvPrefix = childFileName
+        Else
+            childCsvPrefix = clientName
+        End If
+
+        If ownCsvNr Then
+            childCsvNrToUse = childCsvNr
+        Else
+            childCsvNrToUse = vbNullString
+        End If
+
+        If ownPaths Then
+            wsMacro.Range("results_file_name").Value = childFileName
+            resultsNameTouched = True
+            Application.Calculate
+            DoEvents
+        End If
+
+        Call generatePerfectReportsV3( _
+            inArr, _
+            childDict, _
+            clientStats, _
+            skipCsv:=False, _
+            skipFfyCsv:=False, _
+            skipPdfXlsx:=False, _
+            pdfXlsxPrefixOverride:=childPdfXlsxPrefix, _
+            csvPrefixOverride:=childCsvPrefix, _
+            ffyPrefixOverride:=childCsvPrefix, _
+            csvNrOverride:=childCsvNrToUse, _
+            isChildPass:=True, _
+            fondsArr:=fondsArr)
+
+        Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
+
+        If ownPaths Then
+            wsMacro.Range("results_file_name").Value = originalFileName
+            resultsNameTouched = False
+            Application.Calculate
+            DoEvents
+        End If
+    End If
+
+    If sendNow Then
+        Call QueueClientEmailRequest(True, clientName, childFileName, ownPaths)
+    End If
+
+    runProcessForClient = totalCsv & " CSV, " & totalPdf & " PDF"
+
+    If hasXlsx Then
+        runProcessForClient = runProcessForClient & ", " & totalXlsx & " XLSX"
+    End If
+
+    If hasFfy Then
+        runProcessForClient = runProcessForClient & ", " & totalFfy & " FFY"
+    End If
+
+ExitFunction:
+    If resultsNameTouched Then
+        wsMacro.Range("results_file_name").Value = originalFileName
+        Application.Calculate
+        DoEvents
+    End If
+
+    If blnScreenUpdatingCaptured Then
+        Application.ScreenUpdating = blnPreviousScreenUpdating
+    End If
+    Set combinedDict = Nothing
+    Set childDict = Nothing
+    Set wsMap = Nothing
+    Set wsMacro = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    glngLastClientErrorNumber = errNumber
+    gstrLastClientErrorDescription = errDescription
+    runProcessForClient = "ERROR"
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "clientName;childFileName;sendNow;ownPaths", _
+        clientName, _
+        childFileName, _
+        sendNow, _
+        ownPaths
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    stats As String, totalCsv As Long, totalPdf As Long, totalXlsx As Long, hasXlsx As Boolean, totalFfy As Long, hasFfy As Boolean
+' Returns:       ---
+' Description:   Adds report counts from one generator statistics string to running totals.
+'-------------------------------------------------------------------------------
+Private Sub accumulateStats(ByVal stats As String, _
+                            ByRef totalCsv As Long, _
+                            ByRef totalPdf As Long, _
+                            ByRef totalXlsx As Long, _
+                            ByRef hasXlsx As Boolean, _
+                            ByRef totalFfy As Long, _
+                            ByRef hasFfy As Boolean)
+    Const METHOD_NAME As String = "accumulateStats"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim numberText As String
+    Dim numberValue As Long
+    Dim partIndex As Long
+    Dim parts() As String
+    Dim token As String
+
+    On Error GoTo ErrorHandler
+
+    If Len(Trim$(stats)) = 0 Then
+        GoTo ExitSub
+    End If
+
+    parts = Split(stats, ",")
+
+    For partIndex = LBound(parts) To UBound(parts)
+        token = Trim$(parts(partIndex))
+        numberText = Trim$(Split(token, " ")(0))
+
+        If IsNumeric(numberText) Then
+            numberValue = CLng(numberText)
+
+            If InStr(1, token, "FFY", vbTextCompare) > 0 Then
+                totalFfy = totalFfy + numberValue
+                hasFfy = True
+            ElseIf InStr(1, token, "CSV", vbTextCompare) > 0 Then
+                totalCsv = totalCsv + numberValue
+            ElseIf InStr(1, token, "PDF", vbTextCompare) > 0 Then
+                totalPdf = totalPdf + numberValue
+            ElseIf InStr(1, token, "XLSX", vbTextCompare) > 0 Then
+                totalXlsx = totalXlsx + numberValue
+                hasXlsx = True
+            End If
+        End If
+    Next partIndex
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "stats", _
+        stats
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    wsMap As Excel.Worksheet, parentFileName As String
+' Returns:       Long
+' Description:   Returns the first child row that points to the requested parent client.
+'-------------------------------------------------------------------------------
+Private Function findChildRowForParent(ByRef wsMap As Excel.Worksheet, _
+                                       ByVal parentFileName As String) As Long
+    Const METHOD_NAME As String = "findChildRowForParent"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim firstMatch As Long
+    Dim lastRow As Long
+    Dim matchCount As Long
+    Dim mergeTarget As String
+    Dim rowIndex As Long
+
+    On Error GoTo ErrorHandler
+
+    firstMatch = 0
+    matchCount = 0
+    lastRow = wsMap.Cells(wsMap.Rows.Count, "A").End(xlUp).Row
+
+    For rowIndex = 2 To lastRow
+        mergeTarget = Trim$(CStr(wsMap.Cells(rowIndex, "W").Value))
+
+        If Len(mergeTarget) > 0 And mergeTarget = parentFileName Then
+            matchCount = matchCount + 1
+
+            If firstMatch = 0 Then
+                firstMatch = rowIndex
+            End If
+        End If
+    Next rowIndex
+
+    If matchCount > 1 Then
+        MsgBox _
+            "WARNING: Found " & matchCount & " children pointing to parent '" & parentFileName & "'." & _
+            "Current implementation supports only ONE child per parent. " & _
+            "Only the first child (Mapping row " & firstMatch & ") will be processed.", _
+            vbExclamation, _
+            "Multiple children detected"
+    End If
+
+    findChildRowForParent = firstMatch
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    findChildRowForParent = 0
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "parentFileName", _
+        parentFileName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    wsMap As Excel.Worksheet
+' Returns:       ---
+' Description:   Warns about child rows whose parent is missing or disabled.
+'-------------------------------------------------------------------------------
+Private Sub warnAboutOrphanChildren(ByRef wsMap As Excel.Worksheet)
+    Const METHOD_NAME As String = "warnAboutOrphanChildren"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim found As Boolean
+    Dim lastRow As Long
+    Dim mergeTarget As String
+    Dim orphans As String
+    Dim parentFlag As String
+    Dim parentName As String
+    Dim parentRow As Long
+    Dim rowIndex As Long
+
+    On Error GoTo ErrorHandler
+
+    orphans = vbNullString
+    lastRow = wsMap.Cells(wsMap.Rows.Count, "A").End(xlUp).Row
+
+    For rowIndex = 2 To lastRow
+        mergeTarget = Trim$(CStr(wsMap.Cells(rowIndex, "W").Value))
+
+        If Len(mergeTarget) > 0 Then
+            found = False
+
+            For parentRow = 2 To lastRow
+                parentName = Trim$(CStr(wsMap.Cells(parentRow, "A").Value))
+
+                If parentName = mergeTarget Then
+                    parentFlag = UCase$(Trim$(CStr(wsMap.Cells(parentRow, "V").Value)))
+
+                    If parentFlag = "TRUE" Or parentFlag = "PRAWDA" Then
+                        found = True
+                        Exit For
+                    End If
+                End If
+            Next parentRow
+
+            If Not found Then
+                orphans = orphans & _
+                          vbCrLf & _
+                          "  - Mapping row " & rowIndex & ": '" & _
+                          Trim$(CStr(wsMap.Cells(rowIndex, "A").Value)) & _
+                          "' points to '" & mergeTarget & _
+                          "' but the parent is missing or not flagged TRUE in column V"
+            End If
+        End If
+    Next rowIndex
+
+    If Len(orphans) > 0 Then
+        MsgBox _
+            "WARNING: Found orphan child rows that will NOT be processed:" & orphans, _
+            vbExclamation, _
+            "Orphan child rows detected"
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    wsMacro As Excel.Worksheet, rangeName As String
+' Returns:       Boolean
+' Description:   Reads a child configuration flag from a named range.
+'-------------------------------------------------------------------------------
+Private Function readChildBoolean(ByRef wsMacro As Excel.Worksheet, _
+                                  ByVal rangeName As String) As Boolean
+    Const METHOD_NAME As String = "readChildBoolean"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim value As Variant
+
+    On Error GoTo ErrorHandler
+
+    value = wsMacro.Range(rangeName).Value
+    readChildBoolean = UCase$(Trim$(CStr(value))) = "TRUE" _
+                       Or UCase$(Trim$(CStr(value))) = "PRAWDA" _
+                       Or value = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    readChildBoolean = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "rangeName", _
+        rangeName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    d1 As Object, d2 As Object
+' Returns:       Object
+' Description:   Returns a merged dictionary in which the first dictionary wins key collisions.
+'-------------------------------------------------------------------------------
+Private Function mergeDictionaries(ByRef d1 As Object, ByRef d2 As Object) As Object
+    Const METHOD_NAME As String = "mergeDictionaries"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim key As Variant
+    Dim merged As Object
+
+    On Error GoTo ErrorHandler
+
+    Set merged = CreateObject("Scripting.Dictionary")
+
+    For Each key In d1.Keys
+        merged.Add key, d1(key)
+    Next key
+
+    For Each key In d2.Keys
+        If Not merged.Exists(key) Then
+            merged.Add key, d2(key)
+        End If
+    Next key
+
+    Set mergeDictionaries = merged
+
+ExitFunction:
+    Set merged = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set mergeDictionaries = CreateObject("Scripting.Dictionary")
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    wsMap As Excel.Worksheet
+' Returns:       Long
+' Description:   Counts enabled parent KVG rows in the Mapping worksheet.
+'-------------------------------------------------------------------------------
+Private Function countActiveKvgRows(ByRef wsMap As Excel.Worksheet) As Long
+    Const METHOD_NAME As String = "countActiveKvgRows"
+    Dim countValue As Long
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lastRow As Long
+    Dim rowIndex As Long
+
+    On Error GoTo ErrorHandler
+
+    lastRow = wsMap.Cells(wsMap.Rows.Count, "A").End(xlUp).Row
+
+    For rowIndex = 2 To lastRow
+        If UCase$(Trim$(CStr(wsMap.Cells(rowIndex, "V").Value))) = "TRUE" _
+            Or UCase$(Trim$(CStr(wsMap.Cells(rowIndex, "V").Value))) = "PRAWDA" Then
+
+            If Len(Trim$(CStr(wsMap.Cells(rowIndex, "W").Value))) = 0 Then
+                countValue = countValue + 1
+            End If
+        End If
+    Next rowIndex
+
+    countActiveKvgRows = countValue
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    countActiveKvgRows = 0
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fileArray As Variant
+' Returns:       Variant
+' Description:   Loads selected transaction files and returns one deduplicated in-memory array.
+'-------------------------------------------------------------------------------
+Public Function loadTransactionDataToArr(ByVal fileArray As Variant) As Variant
+    Const METHOD_NAME As String = "loadTransactionDataToArr"
+    Dim currentRow As Long
+    Dim dictUnique As Object
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileDataArr() As Variant
+    Dim fileIndex As Long
+    Dim fileLastRow() As Long
+    Dim headerCopied As Boolean
+    Dim lastRow As Long
+    Dim masterArr() As Variant
+    Dim columnIndex As Long
+    Dim rowIndex As Long
+    Dim totalRows As Long
+    Dim uniqueKey As String
+    Dim wb As Excel.Workbook
+    Dim ws As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    Set dictUnique = CreateObject("Scripting.Dictionary")
+
+    ReDim fileDataArr(LBound(fileArray) To UBound(fileArray))
+    ReDim fileLastRow(LBound(fileArray) To UBound(fileArray))
+
+    totalRows = 1
+    headerCopied = False
+
+    For fileIndex = LBound(fileArray) To UBound(fileArray)
+        Set wb = Workbooks.Open(CStr(fileArray(fileIndex)), ReadOnly:=True)
+        Set ws = wb.Sheets(1)
+
+        If ws.AutoFilterMode Then
+            ws.AutoFilterMode = False
+        End If
+
+        If ws.FilterMode Then
+            ws.ShowAllData
+        End If
+
+        lastRow = ws.Cells(ws.Rows.Count, "D").End(xlUp).Row
+        fileLastRow(fileIndex) = lastRow
+
+        If lastRow >= 1 Then
+            fileDataArr(fileIndex) = ws.Range( _
+                ws.Cells(1, 1), _
+                ws.Cells(lastRow, LAST_TRANSACTION_COLUMN)).Value
+
+            If lastRow > 1 Then
+                For rowIndex = 2 To lastRow
+                    uniqueKey = CStr(fileDataArr(fileIndex)(rowIndex, 1)) & "|" & _
+                                CStr(fileDataArr(fileIndex)(rowIndex, 2)) & "|" & _
+                                CStr(fileDataArr(fileIndex)(rowIndex, 6)) & "|" & _
+                                CStr(fileDataArr(fileIndex)(rowIndex, 7))
+
+                    If Not dictUnique.Exists(uniqueKey) Then
+                        dictUnique.Add uniqueKey, 1
+                        totalRows = totalRows + 1
+                    End If
+                Next rowIndex
+            End If
+        End If
+
+        wb.Close SaveChanges:=False
+        Set ws = Nothing
+        Set wb = Nothing
+    Next fileIndex
+
+    If totalRows = 1 Then
+        loadTransactionDataToArr = Empty
+        GoTo ExitFunction
+    End If
+
+    ReDim masterArr(1 To totalRows, 1 To LAST_TRANSACTION_COLUMN)
+
+    dictUnique.RemoveAll
+    currentRow = 2
+
+    For fileIndex = LBound(fileArray) To UBound(fileArray)
+        If IsArray(fileDataArr(fileIndex)) Then
+            lastRow = fileLastRow(fileIndex)
+
+            If Not headerCopied Then
+                For columnIndex = 1 To LAST_TRANSACTION_COLUMN
+                    masterArr(1, columnIndex) = fileDataArr(fileIndex)(1, columnIndex)
+                Next columnIndex
+
+                headerCopied = True
+            End If
+
+            If lastRow > 1 Then
+                For rowIndex = 2 To lastRow
+                    uniqueKey = CStr(fileDataArr(fileIndex)(rowIndex, 1)) & "|" & _
+                                CStr(fileDataArr(fileIndex)(rowIndex, 2)) & "|" & _
+                                CStr(fileDataArr(fileIndex)(rowIndex, 6)) & "|" & _
+                                CStr(fileDataArr(fileIndex)(rowIndex, 7))
+
+                    If Not dictUnique.Exists(uniqueKey) Then
+                        dictUnique.Add uniqueKey, 1
+
+                        For columnIndex = 1 To LAST_TRANSACTION_COLUMN
+                            masterArr(currentRow, columnIndex) = fileDataArr(fileIndex)(rowIndex, columnIndex)
+                        Next columnIndex
+
+                        currentRow = currentRow + 1
+                    End If
+                Next rowIndex
+            End If
+        End If
+    Next fileIndex
+
+    loadTransactionDataToArr = masterArr
+
+ExitFunction:
+    If Not wb Is Nothing Then
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+    End If
+
+    Set ws = Nothing
+    Set wb = Nothing
+    Set dictUnique = Nothing
+
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    loadTransactionDataToArr = Empty
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    wsMacro As Excel.Worksheet
+' Returns:       Variant
+' Description:   Loads the latest Fondsliste workbook into an in-memory array.
+'-------------------------------------------------------------------------------
+Public Function loadFondslisteToArray(ByRef wsMacro As Excel.Worksheet) As Variant
+    Const METHOD_NAME As String = "loadFondslisteToArray"
+    Dim baseName As String
+    Dim currentDate As Long
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim folderPath As String
+    Dim latestDate As Long
+    Dim latestFile As String
+    Dim tempFile As String
+    Dim wbMapping As Excel.Workbook
+
+    On Error GoTo ErrorHandler
+
+    folderPath = CStr(wsMacro.Range("root_Fondsliste").Value)
+    baseName = CStr(wsMacro.Range("file_name_Fondsliste").Value)
+
+    If Right$(folderPath, 1) <> "\" Then
+        folderPath = folderPath & "\"
+    End If
+
+    latestFile = Dir$(folderPath & baseName & "_*.xls*")
+    tempFile = latestFile
+
+    Do While Len(tempFile) > 0
+        currentDate = ParseDateFromFileName(tempFile)
+
+        If currentDate > latestDate Then
+            latestDate = currentDate
+            latestFile = tempFile
+        End If
+
+        tempFile = Dir$()
+    Loop
+
+    If Len(latestFile) = 0 Then
+        Err.Raise 1010, METHOD_NAME, "Fondsliste file not found in " & folderPath
+    End If
+
+    Set wbMapping = Workbooks.Open(folderPath & latestFile, ReadOnly:=True)
+    loadFondslisteToArray = wbMapping.Sheets(1).UsedRange.Value
+
+ExitFunction:
+    If Not wbMapping Is Nothing Then
+        On Error Resume Next
+        wbMapping.Close SaveChanges:=False
+        On Error GoTo 0
+    End If
+
+    Set wbMapping = Nothing
+
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    loadFondslisteToArray = Empty
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;baseName", _
+        folderPath, _
+        baseName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    dataArr As Variant, targetKvg As String
+' Returns:       Object
+' Description:   Returns OPEN funds belonging to one KVG as a fund-name dictionary.
+'-------------------------------------------------------------------------------
+Public Function buildClientDictFromArray(ByRef dataArr As Variant, _
+                                         ByVal targetKvg As String) As Object
+    Const METHOD_NAME As String = "buildClientDictFromArray"
+    Dim cleanId As String
+    Dim currentKvg As String
+    Dim dict As Object
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim rowIndex As Long
+    Dim statusValue As String
+
+    On Error GoTo ErrorHandler
+
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    If Not IsArray(dataArr) Then
+        GoTo ExitFunction
+    End If
+
+    For rowIndex = 2 To UBound(dataArr, 1)
+        statusValue = UCase$(Trim$(CStr(dataArr(rowIndex, 2))))
+        currentKvg = UCase$(Trim$(CStr(dataArr(rowIndex, 9))))
+
+        If statusValue = "OPEN" And currentKvg = UCase$(targetKvg) Then
+            cleanId = Right$(Replace$(CStr(dataArr(rowIndex, 14)), " ", vbNullString), 11)
+
+            If Not dict.Exists(cleanId) Then
+                dict.Add cleanId, CStr(dataArr(rowIndex, 4))
+            End If
+        End If
+    Next rowIndex
+
+ExitFunction:
+    Set buildClientDictFromArray = dict
+    Set dict = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set buildClientDictFromArray = CreateObject("Scripting.Dictionary")
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "targetKvg", _
+        targetKvg
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Deletes stale Tradeversand temporary folders left by interrupted runs.
+'-------------------------------------------------------------------------------
+Private Sub cleanupOrphanedTempFolders()
+    Const METHOD_NAME As String = "cleanupOrphanedTempFolders"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fso As Object
+    Dim isDeleted As Boolean
+    Dim subFolder As Object
+    Dim tempFolder As Object
+    Dim tempPath As String
+
+    On Error GoTo ErrorHandler
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    tempPath = Environ$("TEMP")
+
+    If Not fso.FolderExists(tempPath) Then
+        GoTo ExitSub
+    End If
+
+    Set tempFolder = fso.GetFolder(tempPath)
+
+    For Each subFolder In tempFolder.SubFolders
+        If Left$(subFolder.Name, 10) = "MacroXlsx_" _
+            Or Left$(subFolder.Name, 9) = "MacroPdf_" Then
+            isDeleted = tryDeleteFolderSafe(fso, subFolder.Path)
+        End If
+    Next subFolder
+
+ExitSub:
+    Set subFolder = Nothing
+    Set tempFolder = Nothing
+    Set fso = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "tempPath", _
+        tempPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fsoObj As Object, targetPath As String
+' Returns:       Boolean
+' Description:   Attempts to delete one folder recursively.
+'-------------------------------------------------------------------------------
+Private Function tryDeleteFolderSafe(ByRef fsoObj As Object, _
+                                     ByVal targetPath As String) As Boolean
+    Const METHOD_NAME As String = "tryDeleteFolderSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    fsoObj.DeleteFolder targetPath, True
+    tryDeleteFolderSafe = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    tryDeleteFolderSafe = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "targetPath", _
+        targetPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    sourcePath As String, destFolder As String, errorMessage As String
+' Returns:       Boolean
+' Description:   Archives one input file after verifying that its copy exists.
+'-------------------------------------------------------------------------------
+Private Function moveInputFile(ByVal sourcePath As String, _
+                               ByVal destFolder As String, _
+                               ByRef errorMessage As String) As Boolean
+    Const METHOD_NAME As String = "moveInputFile"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileName As String
+    Dim fso As Object
+    Dim targetPath As String
+
+    On Error GoTo ErrorHandler
+
+    moveInputFile = False
+    errorMessage = vbNullString
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    destFolder = Trim$(destFolder)
+
+    If Right$(destFolder, 1) <> "\" Then
+        destFolder = destFolder & "\"
+    End If
+
+    If Not fso.FolderExists(destFolder) Then
+        CreateObject("WScript.Shell").Run "cmd /c mkdir """ & destFolder & """", 0, True
+    End If
+
+    fileName = fso.GetFileName(sourcePath)
+    targetPath = destFolder & fileName
+
+    If fso.FileExists(targetPath) Then
+        targetPath = destFolder & _
+                     fso.GetBaseName(fileName) & _
+                     "_" & _
+                     Format$(Now, "hhmmss") & _
+                     "." & _
+                     fso.GetExtensionName(fileName)
+    End If
+
+    fso.CopyFile sourcePath, targetPath, True
+    DoEvents
+
+    If fso.FileExists(targetPath) Then
+        fso.DeleteFile sourcePath, True
+        Debug.Print "Success: File archived to " & targetPath
+        moveInputFile = True
+    Else
+        Err.Raise 999, METHOD_NAME, "Copy verification failed. Source not deleted."
+    End If
+
+ExitFunction:
+    Set fso = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    moveInputFile = False
+    errorMessage = "Critical: Could not archive input file!" & vbCrLf & _
+                   "Source: " & sourcePath & vbCrLf & _
+                   "Dest:   " & destFolder & vbCrLf & _
+                   "Error:  " & errDescription
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "sourcePath;destinationFolder;targetPath", _
+        sourcePath, _
+        destFolder, _
+        targetPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ws As Excel.Worksheet, rangeName As String
+' Returns:       String
+' Description:   Reads one named range as text and returns an empty string if it is unavailable.
+'-------------------------------------------------------------------------------
+Private Function getRangeValueSafe(ByRef ws As Excel.Worksheet, _
+                                   ByVal rangeName As String) As String
+    Const METHOD_NAME As String = "getRangeValueSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    getRangeValueSafe = Trim$(CStr(ws.Range(rangeName).Value))
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    getRangeValueSafe = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "rangeName", _
+        rangeName
+    errorManager.save
+    Resume ExitFunction
+End Function

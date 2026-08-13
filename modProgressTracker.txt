@@ -1,0 +1,309 @@
+Option Explicit
+
+Private Const CLASS_NAME As String = "modProgressTracker"
+
+Private mTotalKvgs As Long
+Private mCurrentKvgIndex As Long
+Private mCurrentKvgName As String
+Private mTotalFunds As Long
+Private mCurrentFundIndex As Long
+Private mCurrentFundName As String
+Private mSubStage As String
+Private mStartTime As Double
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    totalKvgs As Long
+' Returns:       ---
+' Description:   Initializes progress tracking for a new Tradeversand batch.
+'-------------------------------------------------------------------------------
+Public Sub progressInit(totalKvgs As Long)
+    Const METHOD_NAME As String = "progressInit"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mTotalKvgs = totalKvgs
+    mCurrentKvgIndex = 0
+    mCurrentKvgName = vbNullString
+    mTotalFunds = 0
+    mCurrentFundIndex = 0
+    mCurrentFundName = vbNullString
+    mSubStage = vbNullString
+    mStartTime = Timer
+
+    Call refreshStatusBar
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "totalKvgs", _
+        totalKvgs
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    kvgIndex As Long, kvgName As String
+' Returns:       ---
+' Description:   Starts progress tracking for one KVG.
+'-------------------------------------------------------------------------------
+Public Sub progressStartKvg(kvgIndex As Long, kvgName As String)
+    Const METHOD_NAME As String = "progressStartKvg"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mCurrentKvgIndex = kvgIndex
+    mCurrentKvgName = kvgName
+    mTotalFunds = 0
+    mCurrentFundIndex = 0
+    mCurrentFundName = vbNullString
+    mSubStage = vbNullString
+
+    Call refreshStatusBar
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "kvgIndex;kvgName", _
+        kvgIndex, _
+        kvgName
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    totalFunds As Long
+' Returns:       ---
+' Description:   Stores the total number of funds for the current KVG.
+'-------------------------------------------------------------------------------
+Public Sub progressSetTotalFunds(totalFunds As Long)
+    Const METHOD_NAME As String = "progressSetTotalFunds"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mTotalFunds = totalFunds
+    Call refreshStatusBar
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "totalFunds", _
+        totalFunds
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fundIndex As Long, fundName As String
+' Returns:       ---
+' Description:   Starts progress tracking for one fund.
+'-------------------------------------------------------------------------------
+Public Sub progressStartFund(fundIndex As Long, fundName As String)
+    Const METHOD_NAME As String = "progressStartFund"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mCurrentFundIndex = fundIndex
+    mCurrentFundName = fundName
+    mSubStage = vbNullString
+
+    Call refreshStatusBar
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fundIndex;fundName", _
+        fundIndex, _
+        fundName
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    stageName As String
+' Returns:       ---
+' Description:   Updates the optional sub-stage shown in the status bar.
+'-------------------------------------------------------------------------------
+Public Sub progressSubStage(stageName As String)
+    Const METHOD_NAME As String = "progressSubStage"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mSubStage = stageName
+    Call refreshStatusBar
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "stageName", _
+        stageName
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Releases the Excel status bar after progress tracking finishes.
+'-------------------------------------------------------------------------------
+Public Sub progressClear()
+    Const METHOD_NAME As String = "progressClear"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Application.StatusBar = False
+    mTotalKvgs = 0
+    mCurrentKvgIndex = 0
+    mCurrentKvgName = vbNullString
+    mTotalFunds = 0
+    mCurrentFundIndex = 0
+    mCurrentFundName = vbNullString
+    mSubStage = vbNullString
+    mStartTime = 0
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Renders the current progress state in the Excel status bar.
+'-------------------------------------------------------------------------------
+Private Sub refreshStatusBar()
+    Const METHOD_NAME As String = "refreshStatusBar"
+    Dim errorManager As New ErrorManager
+    Dim elapsed As Double
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim statusText As String
+
+    On Error GoTo ErrorHandler
+
+    elapsed = Timer - mStartTime
+    statusText = "Tradeversand"
+
+    If mTotalKvgs > 0 Then
+        statusText = statusText & " | KVG " & mCurrentKvgIndex & "/" & mTotalKvgs
+        If Len(mCurrentKvgName) > 0 Then
+            statusText = statusText & ": " & mCurrentKvgName
+        End If
+    End If
+
+    If mTotalFunds > 0 Then
+        statusText = statusText & " | Fund " & mCurrentFundIndex & "/" & mTotalFunds
+        If Len(mCurrentFundName) > 0 Then
+            statusText = statusText & ": " & mCurrentFundName
+        End If
+    End If
+
+    If Len(mSubStage) > 0 Then
+        statusText = statusText & " | " & mSubStage
+    End If
+
+    statusText = statusText & " | Elapsed " & Format$(elapsed / 86400, "hh:mm:ss")
+    Application.StatusBar = statusText
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub

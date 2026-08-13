@@ -1,0 +1,1396 @@
+Option Explicit
+
+Private Const CLASS_NAME As String = "modEmailSender"
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    ---
+' Returns:       ---
+' Description:   Creates, sends or displays configured Tradeversand e-mails and archives their attachments.
+'-------------------------------------------------------------------------------
+Public Sub processAndSendTradeversand()
+    Const METHOD_NAME As String = "processAndSendTradeversand"
+    Dim attachFfy As Boolean
+    Dim attachFfyPdf As Boolean
+    Dim autoSend As Boolean
+    Dim blnStatusBarCaptured As Boolean
+    Dim bodyText As String
+    Dim clientName As String
+    Dim csvExcludeSubstring As String
+    Dim csvRequireSubstring As String
+    Dim emailTitle As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fso As Object
+    Dim inclCsv As Boolean
+    Dim inclFfy As Boolean
+    Dim inclPdf As Boolean
+    Dim inclXlsx As Boolean
+    Dim jobs As Collection
+    Dim maxAtt As Long
+    Dim onlyFfy As Boolean
+    Dim outApp As Object
+    Dim pathCsvArch As String
+    Dim pathCsvRes As String
+    Dim pathPdfArch As String
+    Dim pathPdfRes As String
+    Dim pathXlsxArch As String
+    Dim pathXlsxRes As String
+    Dim pdfExc As String
+    Dim pdfReq As String
+    Dim recipCc As String
+    Dim recipTo As String
+    Dim senderEmail As String
+    Dim separateMails As Boolean
+    Dim totalMoved As Long
+    Dim varPreviousStatusBar As Variant
+    Dim wsConfig As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    varPreviousStatusBar = Application.StatusBar
+    blnStatusBarCaptured = True
+    totalMoved = 0
+
+    Set wsConfig = ThisWorkbook.Worksheets("Tradeversand")
+    wsConfig.Calculate
+    DoEvents
+
+    With wsConfig
+        clientName = Trim$(CStr(.Range("results_file_name").Value))
+        emailTitle = Trim$(CStr(.Range("email_title").Value))
+        bodyText = CStr(.Range("email_body").Value)
+        pathXlsxRes = formatFolderPath(CStr(.Range("results_path_xlsx").Value))
+        pathPdfRes = formatFolderPath(CStr(.Range("results_path_pdf").Value))
+        pathCsvRes = formatFolderPath(CStr(.Range("results_path_csv").Value))
+        pathXlsxArch = formatFolderPath(CStr(.Range("archive_path_xlsx").Value))
+        pathPdfArch = formatFolderPath(CStr(.Range("archive_path_pdf").Value))
+        pathCsvArch = formatFolderPath(CStr(.Range("archive_path_csv").Value))
+        senderEmail = Trim$(CStr(.Range("sender_email").Value))
+        recipTo = Trim$(CStr(.Range("recipient_email").Value))
+        recipCc = Trim$(CStr(.Range("recipient_cc").Value))
+        inclPdf = getSafeBoolean(.Range("create_pdf_file").Value)
+        inclXlsx = getSafeBoolean(.Range("create_xlsx_file").Value)
+        inclCsv = getSafeBoolean(.Range("create_csv_file").Value)
+        autoSend = getSafeBoolean(.Range("auto_email").Value)
+        separateMails = getSafeBoolean(.Range("csv_pdf_separate_emails").Value)
+        inclFfy = getSafeBoolean(.Range("create_ffy_csv_file").Value)
+        attachFfy = getSafeBoolean(.Range("attach_ffy_to_email").Value)
+        attachFfyPdf = getSafeBoolean(.Range("attach_ffy_pdf_to_email").Value)
+        onlyFfy = getSafeBoolean(.Range("attach_only_ffy_csv").Value)
+        maxAtt = getSafeLong(.Range("max_attachments_per_mail").Value)
+    End With
+
+    If Len(clientName) = 0 Then
+        Err.Raise 1001, METHOD_NAME, "Client name is missing in 'results_file_name'."
+    End If
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set outApp = CreateObject("Outlook.Application")
+
+    csvRequireSubstring = vbNullString
+    csvExcludeSubstring = vbNullString
+
+    If inclFfy And onlyFfy Then
+        inclCsv = True
+        csvExcludeSubstring = "_new_version"
+    ElseIf inclFfy And Not attachFfy Then
+        csvRequireSubstring = "_new_version"
+    End If
+
+    pdfReq = vbNullString
+    pdfExc = vbNullString
+
+    If inclPdf And Not attachFfyPdf Then
+        pdfReq = "_PDF_"
+    ElseIf Not inclPdf And attachFfyPdf Then
+        pdfExc = "_PDF_"
+    End If
+
+    If Not separateMails Then
+        Set jobs = New Collection
+
+        If inclCsv Then
+            jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", clientName, csvRequireSubstring, csvExcludeSubstring)
+        End If
+
+        If inclPdf Or attachFfyPdf Then
+            jobs.Add makeJob(fso, pathPdfRes, pathPdfArch, "pdf", clientName, pdfReq, pdfExc)
+        End If
+
+        If inclXlsx Then
+            jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", clientName)
+        End If
+
+        totalMoved = totalMoved + sendFilesBatched( _
+            fso, _
+            outApp, _
+            senderEmail, _
+            recipTo, _
+            recipCc, _
+            emailTitle, _
+            bodyText, _
+            jobs, _
+            maxAtt, _
+            autoSend)
+    Else
+        If inclCsv Then
+            Set jobs = New Collection
+            jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", clientName, csvRequireSubstring, csvExcludeSubstring)
+            totalMoved = totalMoved + sendFilesBatched( _
+                fso, _
+                outApp, _
+                senderEmail, _
+                recipTo, _
+                recipCc, _
+                emailTitle, _
+                bodyText, _
+                jobs, _
+                maxAtt, _
+                autoSend)
+        End If
+
+        If inclPdf Or inclXlsx Or attachFfyPdf Then
+            Set jobs = New Collection
+
+            If inclPdf Or attachFfyPdf Then
+                jobs.Add makeJob(fso, pathPdfRes, pathPdfArch, "pdf", clientName, pdfReq, pdfExc)
+            End If
+
+            If inclXlsx Then
+                jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", clientName)
+            End If
+
+            totalMoved = totalMoved + sendFilesBatched( _
+                fso, _
+                outApp, _
+                senderEmail, _
+                recipTo, _
+                recipCc, _
+                emailTitle, _
+                bodyText, _
+                jobs, _
+                maxAtt, _
+                autoSend)
+        End If
+    End If
+
+ExitSub:
+    If blnStatusBarCaptured Then
+        Application.StatusBar = varPreviousStatusBar
+    End If
+
+    Set jobs = Nothing
+    Set fso = Nothing
+    Set outApp = Nothing
+    Set wsConfig = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "clientName", _
+        clientName
+    errorManager.save
+    errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    parentName As String, childName As String, useChildOwnPaths As Boolean, optional
+' Returns:       ---
+' Description:   Sends and archives reports for a parent client and its configured child client.
+'-------------------------------------------------------------------------------
+Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, _
+                                                ByVal childName As String, _
+                                                Optional ByVal useChildOwnPaths As Boolean = False)
+    Const METHOD_NAME As String = "processAndSendTradeversand_withChild"
+    Dim allowedPrefixes As String
+    Dim attachFfy As Boolean
+    Dim attachFfyPdf As Boolean
+    Dim autoSend As Boolean
+    Dim blnStatusBarCaptured As Boolean
+    Dim bodyText As String
+    Dim childOnlyPrefix As String
+    Dim childPathCsvArch As String
+    Dim childPathCsvRes As String
+    Dim childPathPdfArch As String
+    Dim childPathPdfRes As String
+    Dim childPathXlsxArch As String
+    Dim childPathXlsxRes As String
+    Dim csvExcludeSubstring As String
+    Dim csvRequireSubstring As String
+    Dim emailTitle As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fso As Object
+    Dim inclCsv As Boolean
+    Dim inclFfy As Boolean
+    Dim inclPdf As Boolean
+    Dim inclXlsx As Boolean
+    Dim jobs As Collection
+    Dim maxAtt As Long
+    Dim onlyFfy As Boolean
+    Dim originalFileName As String
+    Dim outApp As Object
+    Dim parentOnlyPrefix As String
+    Dim pathCsvArch As String
+    Dim pathCsvRes As String
+    Dim pathPdfArch As String
+    Dim pathPdfRes As String
+    Dim pathXlsxArch As String
+    Dim pathXlsxRes As String
+    Dim pdfExc As String
+    Dim pdfReq As String
+    Dim recipCc As String
+    Dim recipTo As String
+    Dim resultsNameTouched As Boolean
+    Dim senderEmail As String
+    Dim separateMails As Boolean
+    Dim totalMoved As Long
+    Dim varPreviousStatusBar As Variant
+    Dim wsConfig As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    varPreviousStatusBar = Application.StatusBar
+    blnStatusBarCaptured = True
+    totalMoved = 0
+    resultsNameTouched = False
+
+    Set wsConfig = ThisWorkbook.Worksheets("Tradeversand")
+    wsConfig.Calculate
+    DoEvents
+
+    With wsConfig
+        emailTitle = Trim$(CStr(.Range("email_title").Value))
+        bodyText = CStr(.Range("email_body").Value)
+        pathXlsxRes = formatFolderPath(CStr(.Range("results_path_xlsx").Value))
+        pathPdfRes = formatFolderPath(CStr(.Range("results_path_pdf").Value))
+        pathCsvRes = formatFolderPath(CStr(.Range("results_path_csv").Value))
+        pathXlsxArch = formatFolderPath(CStr(.Range("archive_path_xlsx").Value))
+        pathPdfArch = formatFolderPath(CStr(.Range("archive_path_pdf").Value))
+        pathCsvArch = formatFolderPath(CStr(.Range("archive_path_csv").Value))
+        senderEmail = Trim$(CStr(.Range("sender_email").Value))
+        recipTo = Trim$(CStr(.Range("recipient_email").Value))
+        recipCc = Trim$(CStr(.Range("recipient_cc").Value))
+        inclPdf = getSafeBoolean(.Range("create_pdf_file").Value)
+        inclXlsx = getSafeBoolean(.Range("create_xlsx_file").Value)
+        inclCsv = getSafeBoolean(.Range("create_csv_file").Value)
+        autoSend = getSafeBoolean(.Range("auto_email").Value)
+        separateMails = getSafeBoolean(.Range("csv_pdf_separate_emails").Value)
+        inclFfy = getSafeBoolean(.Range("create_ffy_csv_file").Value)
+        attachFfy = getSafeBoolean(.Range("attach_ffy_to_email").Value)
+        attachFfyPdf = getSafeBoolean(.Range("attach_ffy_pdf_to_email").Value)
+        onlyFfy = getSafeBoolean(.Range("attach_only_ffy_csv").Value)
+        maxAtt = getSafeLong(.Range("max_attachments_per_mail").Value)
+    End With
+
+    If Len(Trim$(parentName)) = 0 Then
+        Err.Raise 1001, METHOD_NAME, "Parent client name is missing."
+    End If
+
+    csvRequireSubstring = vbNullString
+    csvExcludeSubstring = vbNullString
+
+    If inclFfy And onlyFfy Then
+        inclCsv = True
+        csvExcludeSubstring = "_new_version"
+    ElseIf inclFfy And Not attachFfy Then
+        csvRequireSubstring = "_new_version"
+    End If
+
+    pdfReq = vbNullString
+    pdfExc = vbNullString
+
+    If inclPdf And Not attachFfyPdf Then
+        pdfReq = "_PDF_"
+    ElseIf Not inclPdf And attachFfyPdf Then
+        pdfExc = "_PDF_"
+    End If
+
+    If Len(Trim$(childName)) = 0 Then
+        allowedPrefixes = parentName
+    Else
+        allowedPrefixes = parentName & ";" & childName
+    End If
+
+    parentOnlyPrefix = parentName
+    childOnlyPrefix = childName
+
+    If useChildOwnPaths And Len(Trim$(childName)) > 0 Then
+        originalFileName = CStr(wsConfig.Range("results_file_name").Value)
+        wsConfig.Range("results_file_name").Value = childName
+        resultsNameTouched = True
+        Application.Calculate
+        DoEvents
+
+        With wsConfig
+            childPathXlsxRes = formatFolderPath(CStr(.Range("results_path_xlsx").Value))
+            childPathPdfRes = formatFolderPath(CStr(.Range("results_path_pdf").Value))
+            childPathCsvRes = formatFolderPath(CStr(.Range("results_path_csv").Value))
+            childPathXlsxArch = formatFolderPath(CStr(.Range("archive_path_xlsx").Value))
+            childPathPdfArch = formatFolderPath(CStr(.Range("archive_path_pdf").Value))
+            childPathCsvArch = formatFolderPath(CStr(.Range("archive_path_csv").Value))
+        End With
+
+        wsConfig.Range("results_file_name").Value = originalFileName
+        resultsNameTouched = False
+        Application.Calculate
+        DoEvents
+    End If
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set outApp = CreateObject("Outlook.Application")
+
+    If Not separateMails Then
+        Set jobs = New Collection
+
+        If useChildOwnPaths Then
+            If inclCsv Then
+                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", parentOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
+            End If
+
+            If inclPdf Or attachFfyPdf Then
+                jobs.Add makeJob(fso, pathPdfRes, pathPdfArch, "pdf", parentOnlyPrefix, pdfReq, pdfExc)
+            End If
+
+            If inclXlsx Then
+                jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", parentOnlyPrefix)
+            End If
+
+            If inclCsv Then
+                jobs.Add makeJob(fso, childPathCsvRes, childPathCsvArch, "csv", childOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
+            End If
+
+            If inclPdf Or attachFfyPdf Then
+                jobs.Add makeJob(fso, childPathPdfRes, childPathPdfArch, "pdf", childOnlyPrefix, pdfReq, pdfExc)
+            End If
+
+            If inclXlsx Then
+                jobs.Add makeJob(fso, childPathXlsxRes, childPathXlsxArch, "xlsx", childOnlyPrefix)
+            End If
+        Else
+            If inclCsv Then
+                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", allowedPrefixes, csvRequireSubstring, csvExcludeSubstring)
+            End If
+
+            If inclPdf Or attachFfyPdf Then
+                jobs.Add makeJob(fso, pathPdfRes, pathPdfArch, "pdf", allowedPrefixes, pdfReq, pdfExc)
+            End If
+
+            If inclXlsx Then
+                jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", allowedPrefixes)
+            End If
+        End If
+
+        totalMoved = totalMoved + sendFilesBatched( _
+            fso, _
+            outApp, _
+            senderEmail, _
+            recipTo, _
+            recipCc, _
+            emailTitle, _
+            bodyText, _
+            jobs, _
+            maxAtt, _
+            autoSend)
+    Else
+        If inclCsv Then
+            Set jobs = New Collection
+
+            If useChildOwnPaths Then
+                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", parentOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
+                jobs.Add makeJob(fso, childPathCsvRes, childPathCsvArch, "csv", childOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
+            Else
+                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", allowedPrefixes, csvRequireSubstring, csvExcludeSubstring)
+            End If
+
+            totalMoved = totalMoved + sendFilesBatched( _
+                fso, _
+                outApp, _
+                senderEmail, _
+                recipTo, _
+                recipCc, _
+                emailTitle, _
+                bodyText, _
+                jobs, _
+                maxAtt, _
+                autoSend)
+        End If
+
+        If inclPdf Or inclXlsx Or attachFfyPdf Then
+            Set jobs = New Collection
+
+            If useChildOwnPaths Then
+                If inclPdf Or attachFfyPdf Then
+                    jobs.Add makeJob(fso, pathPdfRes, pathPdfArch, "pdf", parentOnlyPrefix, pdfReq, pdfExc)
+                End If
+
+                If inclXlsx Then
+                    jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", parentOnlyPrefix)
+                End If
+
+                If inclPdf Or attachFfyPdf Then
+                    jobs.Add makeJob(fso, childPathPdfRes, childPathPdfArch, "pdf", childOnlyPrefix, pdfReq, pdfExc)
+                End If
+
+                If inclXlsx Then
+                    jobs.Add makeJob(fso, childPathXlsxRes, childPathXlsxArch, "xlsx", childOnlyPrefix)
+                End If
+            Else
+                If inclPdf Or attachFfyPdf Then
+                    jobs.Add makeJob(fso, pathPdfRes, pathPdfArch, "pdf", allowedPrefixes, pdfReq, pdfExc)
+                End If
+
+                If inclXlsx Then
+                    jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", allowedPrefixes)
+                End If
+            End If
+
+            totalMoved = totalMoved + sendFilesBatched( _
+                fso, _
+                outApp, _
+                senderEmail, _
+                recipTo, _
+                recipCc, _
+                emailTitle, _
+                bodyText, _
+                jobs, _
+                maxAtt, _
+                autoSend)
+        End If
+    End If
+
+ExitSub:
+    If resultsNameTouched Then
+        wsConfig.Range("results_file_name").Value = originalFileName
+        Application.Calculate
+        DoEvents
+    End If
+
+    If blnStatusBarCaptured Then
+        Application.StatusBar = varPreviousStatusBar
+    End If
+
+    Set jobs = Nothing
+    Set fso = Nothing
+    Set outApp = Nothing
+    Set wsConfig = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "parentName;childName;useChildOwnPaths", _
+        parentName, _
+        childName, _
+        useChildOwnPaths
+    errorManager.save
+    errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fso As Object, sPath As String, aPath As String, ext As String, clientName As String, requireSubstring As String, optional, excludeSubstring As String, optional
+' Returns:       Variant
+' Description:   Creates one attachment and archive job definition.
+'-------------------------------------------------------------------------------
+Private Function makeJob(ByRef fso As Object, _
+                         ByVal sPath As String, _
+                         ByVal aPath As String, _
+                         ByVal ext As String, _
+                         ByVal clientName As String, _
+                         Optional ByVal requireSubstring As String = vbNullString, _
+                         Optional ByVal excludeSubstring As String = vbNullString) As Variant
+    Const METHOD_NAME As String = "makeJob"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    makeJob = Array( _
+        sPath, _
+        aPath, _
+        ext, _
+        collectFiles(fso, sPath, ext, clientName, requireSubstring, excludeSubstring))
+
+ExitFunction:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    makeJob = Empty
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "sourcePath;archivePath;extension;clientName", _
+        sPath, _
+        aPath, _
+        ext, _
+        clientName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fsoObj As Object, sPath As String, ext As String, clientName As String, requireSubstring As String, excludeSubstring As String
+' Returns:       Collection
+' Description:   Returns files matching the configured extension, prefixes and substring filters.
+'-------------------------------------------------------------------------------
+Private Function collectFiles(ByRef fsoObj As Object, _
+                              ByVal sPath As String, _
+                              ByVal ext As String, _
+                              ByVal clientName As String, _
+                              ByVal requireSubstring As String, _
+                              ByVal excludeSubstring As String) As Collection
+    Const METHOD_NAME As String = "collectFiles"
+    Dim allowedPrefixes() As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileItem As Object
+    Dim lcExclude As String
+    Dim lcFileName As String
+    Dim lcPrefix As String
+    Dim lcRequire As String
+    Dim lngPrefix As Long
+    Dim prefixMatches As Boolean
+    Dim result As Collection
+    Dim sourceFolder As Object
+
+    On Error GoTo ErrorHandler
+
+    Set result = New Collection
+    Set collectFiles = result
+
+    If Not fsoObj.FolderExists(sPath) Then
+        GoTo ExitFunction
+    End If
+
+    allowedPrefixes = Split(clientName, ";")
+
+    For lngPrefix = LBound(allowedPrefixes) To UBound(allowedPrefixes)
+        allowedPrefixes(lngPrefix) = LCase$(Trim$(allowedPrefixes(lngPrefix)))
+    Next lngPrefix
+
+    lcRequire = LCase$(Trim$(requireSubstring))
+    lcExclude = LCase$(Trim$(excludeSubstring))
+    Set sourceFolder = fsoObj.GetFolder(sPath)
+
+    For Each fileItem In sourceFolder.Files
+        If LCase$(fsoObj.GetExtensionName(fileItem.Name)) = LCase$(ext) Then
+            lcFileName = LCase$(fileItem.Name)
+            prefixMatches = False
+
+            For lngPrefix = LBound(allowedPrefixes) To UBound(allowedPrefixes)
+                lcPrefix = allowedPrefixes(lngPrefix)
+
+                If Len(lcPrefix) > 0 Then
+                    If Left$(lcFileName, Len(lcPrefix) + 1) = lcPrefix & "-" Then
+                        prefixMatches = True
+                        Exit For
+                    End If
+                End If
+            Next lngPrefix
+
+            If prefixMatches And Len(lcRequire) > 0 Then
+                If InStr(1, lcFileName, lcRequire, vbBinaryCompare) = 0 Then
+                    prefixMatches = False
+                End If
+            End If
+
+            If prefixMatches And Len(lcExclude) > 0 Then
+                If InStr(1, lcFileName, lcExclude, vbBinaryCompare) > 0 Then
+                    prefixMatches = False
+                End If
+            End If
+
+            If prefixMatches Then
+                result.Add fileItem.Path
+            End If
+        End If
+    Next fileItem
+
+    Set collectFiles = result
+
+ExitFunction:
+    Set fileItem = Nothing
+    Set sourceFolder = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set collectFiles = result
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "sourcePath;extension;clientName", _
+        sPath, _
+        ext, _
+        clientName
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fso As Object, outApp As Object, sFrom As String, sTo As String, sCc As String, sSub As String, sBody As String, jobs As Collection, maxAtt As Long, autoSend As Boolean
+' Returns:       Long
+' Description:   Creates attachment batches, finalizes their e-mails and archives the source files.
+'-------------------------------------------------------------------------------
+Private Function sendFilesBatched(ByRef fso As Object, _
+                                  ByRef outApp As Object, _
+                                  ByVal sFrom As String, _
+                                  ByVal sTo As String, _
+                                  ByVal sCc As String, _
+                                  ByVal sSub As String, _
+                                  ByVal sBody As String, _
+                                  ByRef jobs As Collection, _
+                                  ByVal maxAtt As Long, _
+                                  ByVal autoSend As Boolean) As Long
+    Const METHOD_NAME As String = "sendFilesBatched"
+    Dim allFiles As Collection
+    Dim batchIndex As Long
+    Dim endIndex As Long
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileIndex As Long
+    Dim filePath As Variant
+    Dim job As Variant
+    Dim jobFiles As Collection
+    Dim mailItem As Object
+    Dim moved As Long
+    Dim numberOfBatches As Long
+    Dim perBatch As Long
+    Dim subjectText As String
+    Dim totalFiles As Long
+    Dim varPreviousStatusBar As Variant
+
+    On Error GoTo ErrorHandler
+
+    varPreviousStatusBar = Application.StatusBar
+    Set allFiles = New Collection
+    sendFilesBatched = 0
+    moved = 0
+
+    If jobs Is Nothing Then
+        GoTo ExitFunction
+    End If
+
+    If jobs.Count = 0 Then
+        GoTo ExitFunction
+    End If
+
+    For Each job In jobs
+        For Each filePath In job(3)
+            allFiles.Add filePath
+        Next filePath
+    Next job
+
+    totalFiles = allFiles.Count
+
+    If totalFiles = 0 Then
+        GoTo ExitFunction
+    End If
+
+    perBatch = maxAtt
+
+    If perBatch <= 0 Then
+        perBatch = totalFiles
+    End If
+
+    numberOfBatches = (totalFiles + perBatch - 1) \ perBatch
+
+    For batchIndex = 1 To numberOfBatches
+        If numberOfBatches > 1 Then
+            subjectText = sSub & " (Part " & batchIndex & "/" & numberOfBatches & ")"
+        Else
+            subjectText = sSub
+        End If
+
+        Set mailItem = createBaseMail(outApp, sFrom, sTo, sCc, subjectText, sBody)
+        endIndex = batchIndex * perBatch
+
+        If endIndex > totalFiles Then
+            endIndex = totalFiles
+        End If
+
+        For fileIndex = (batchIndex - 1) * perBatch + 1 To endIndex
+            Application.StatusBar = "Attaching " & fileIndex & " of " & totalFiles & "..."
+            DoEvents
+            mailItem.Attachments.Add CStr(allFiles(fileIndex))
+        Next fileIndex
+
+        Call finalizeMail(mailItem, autoSend)
+    Next batchIndex
+
+    For Each job In jobs
+        Set jobFiles = job(3)
+        moved = moved + archiveJob( _
+            fso, _
+            jobFiles, _
+            CStr(job(0)), _
+            CStr(job(1)), _
+            CStr(job(2)))
+    Next job
+
+    sendFilesBatched = moved
+
+ExitFunction:
+    Application.StatusBar = varPreviousStatusBar
+    Set mailItem = Nothing
+    Set jobFiles = Nothing
+    Set allFiles = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    sendFilesBatched = moved
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "subject;maxAttachments;autoSend;movedCount", _
+        sSub, _
+        maxAtt, _
+        autoSend, _
+        moved
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fsoObj As Object, filesColl As Collection, sPath As String, aPath As String, ext As String
+' Returns:       Long
+' Description:   Moves one job's source files to its dated archive folder.
+'-------------------------------------------------------------------------------
+Private Function archiveJob(ByRef fsoObj As Object, _
+                            ByRef filesColl As Collection, _
+                            ByVal sPath As String, _
+                            ByVal aPath As String, _
+                            ByVal ext As String) As Long
+    Const METHOD_NAME As String = "archiveJob"
+    Dim baseName As String
+    Dim dest As String
+    Dim dynamicArchivePath As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileName As String
+    Dim filePath As Variant
+    Dim isArchiveReady As Boolean
+    Dim moveSucceeded As Boolean
+    Dim movedCounter As Long
+    Dim remainingCount As Long
+    Dim totalFiles As Long
+    Dim varPreviousStatusBar As Variant
+
+    On Error GoTo ErrorHandler
+
+    varPreviousStatusBar = Application.StatusBar
+    archiveJob = 0
+    movedCounter = 0
+
+    If filesColl Is Nothing Then
+        GoTo ExitFunction
+    End If
+
+    If filesColl.Count = 0 Then
+        GoTo ExitFunction
+    End If
+
+    If Len(aPath) > 0 And aPath <> "\" Then
+        dynamicArchivePath = aPath & _
+                             Format$(Date, "yyyy") & "\" & _
+                             Format$(Date, "mm") & "\" & _
+                             Format$(Date, "dd") & "\"
+        Call ensureFolderExists(fsoObj, dynamicArchivePath)
+        aPath = dynamicArchivePath
+        isArchiveReady = True
+    Else
+        isArchiveReady = False
+    End If
+
+    totalFiles = filesColl.Count
+
+    If Not isArchiveReady Then
+        GoTo ExitFunction
+    End If
+
+    Application.StatusBar = "Finalizing... Moving all " & UCase$(ext) & " files at once."
+    DoEvents
+    Application.Wait Now + TimeValue("0:00:02")
+
+    Call fastMoveFiles(sPath, aPath, ext)
+
+    remainingCount = countFilesByExt(fsoObj, sPath, ext)
+
+    If remainingCount = 0 Then
+        movedCounter = totalFiles
+    Else
+        movedCounter = totalFiles - remainingCount
+
+        For Each filePath In filesColl
+            If Len(Dir$(CStr(filePath))) > 0 Then
+                fileName = Mid$(CStr(filePath), InStrRev(CStr(filePath), "\") + 1)
+                dest = aPath & fileName
+
+                If Len(Dir$(dest)) > 0 Then
+                    baseName = Left$(fileName, InStrRev(fileName, ".") - 1)
+                    dest = aPath & baseName & "_" & Format$(Now, "hhmmss") & "." & ext
+                End If
+
+                moveSucceeded = tryRename(CStr(filePath), dest)
+
+                If Not moveSucceeded Then
+                    moveSucceeded = tryMoveFile(fsoObj, CStr(filePath), dest)
+                End If
+
+                If moveSucceeded Then
+                    movedCounter = movedCounter + 1
+                End If
+            End If
+        Next filePath
+    End If
+
+    archiveJob = movedCounter
+
+ExitFunction:
+    Application.StatusBar = varPreviousStatusBar
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    archiveJob = movedCounter
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "sourcePath;archivePath;extension;movedCount", _
+        sPath, _
+        aPath, _
+        ext, _
+        movedCounter
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    outApp As Object, sFrom As String, sTo As String, sCc As String, sSub As String, sBody As String
+' Returns:       Object
+' Description:   Creates an Outlook mail item with the configured sender, recipients and subject.
+'-------------------------------------------------------------------------------
+Private Function createBaseMail(ByRef outApp As Object, _
+                                ByVal sFrom As String, _
+                                ByVal sTo As String, _
+                                ByVal sCc As String, _
+                                ByVal sSub As String, _
+                                ByVal sBody As String) As Object
+    Const METHOD_NAME As String = "createBaseMail"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim outMail As Object
+
+    On Error GoTo ErrorHandler
+
+    Set outMail = outApp.CreateItem(0)
+
+    With outMail
+        If Len(sFrom) > 0 Then
+            .SentOnBehalfOfName = sFrom
+        End If
+
+        .To = sTo
+        .Cc = sCc
+        .Subject = sSub
+        .Sensitivity = 1
+        .PropertyAccessor.SetProperty _
+            "http://schemas.microsoft.com/mapi/string/{00020386-0000-0000-C000-000000000046}/msip_labels", _
+            "MSIP_Label_"
+    End With
+
+    Set createBaseMail = outMail
+
+ExitFunction:
+    Set outMail = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    Set createBaseMail = Nothing
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "subject", _
+        sSub
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    mailObj As Object, bAuto As Boolean
+' Returns:       ---
+' Description:   Adds the configured HTML body and sends or displays the mail item.
+'-------------------------------------------------------------------------------
+Private Sub finalizeMail(ByRef mailObj As Object, ByVal bAuto As Boolean)
+    Const METHOD_NAME As String = "finalizeMail"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim formattedBody As String
+    Dim wsMacro As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    Set wsMacro = ThisWorkbook.Worksheets("Tradeversand")
+
+    mailObj.Display
+    formattedBody = Replace$(CStr(wsMacro.Range("email_body").Value), vbLf, "<br>")
+    mailObj.HTMLBody = "<p style='font-family:Arial; font-size:11pt;'>" & _
+                       formattedBody & _
+                       "</p><br>" & _
+                       mailObj.HTMLBody
+
+    If bAuto Then
+        mailObj.Send
+    End If
+
+ExitSub:
+    Set wsMacro = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "autoSend", _
+        bAuto
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    srcPath As String, destPath As String
+' Returns:       Boolean
+' Description:   Attempts to move a file through the native VBA rename operation.
+'-------------------------------------------------------------------------------
+Private Function tryRename(ByVal srcPath As String, ByVal destPath As String) As Boolean
+    Const METHOD_NAME As String = "tryRename"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Name srcPath As destPath
+    tryRename = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    tryRename = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "sourcePath;destinationPath", _
+        srcPath, _
+        destPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fsoObj As Object, srcPath As String, destPath As String
+' Returns:       Boolean
+' Description:   Attempts to move a file through FileSystemObject.
+'-------------------------------------------------------------------------------
+Private Function tryMoveFile(ByRef fsoObj As Object, _
+                             ByVal srcPath As String, _
+                             ByVal destPath As String) As Boolean
+    Const METHOD_NAME As String = "tryMoveFile"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    fsoObj.MoveFile srcPath, destPath
+    tryMoveFile = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    tryMoveFile = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "sourcePath;destinationPath", _
+        srcPath, _
+        destPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fsoObj As Object, folderPath As String
+' Returns:       ---
+' Description:   Creates a complete folder tree when it does not already exist.
+'-------------------------------------------------------------------------------
+Private Sub ensureFolderExists(ByRef fsoObj As Object, ByVal folderPath As String)
+    Const METHOD_NAME As String = "ensureFolderExists"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim parentPath As String
+
+    On Error GoTo ErrorHandler
+
+    If Len(folderPath) = 0 Or folderPath = "\" Then
+        GoTo ExitSub
+    End If
+
+    If Right$(folderPath, 1) = "\" Then
+        folderPath = Left$(folderPath, Len(folderPath) - 1)
+    End If
+
+    If fsoObj.FolderExists(folderPath) Then
+        GoTo ExitSub
+    End If
+
+    parentPath = fsoObj.GetParentFolderName(folderPath)
+
+    If Len(parentPath) > 0 And Not fsoObj.FolderExists(parentPath) Then
+        Call ensureFolderExists(fsoObj, parentPath)
+    End If
+
+    fsoObj.CreateFolder folderPath
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath", _
+        folderPath
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    p As String
+' Returns:       String
+' Description:   Returns a normalized folder path ending with a backslash.
+'-------------------------------------------------------------------------------
+Private Function formatFolderPath(ByVal p As String) As String
+    Const METHOD_NAME As String = "formatFolderPath"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    p = Trim$(p)
+
+    If Len(p) > 0 And Right$(p, 1) <> "\" Then
+        formatFolderPath = p & "\"
+    Else
+        formatFolderPath = p
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    formatFolderPath = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    v As Variant
+' Returns:       Boolean
+' Description:   Converts supported Boolean, numeric and localized text values to Boolean.
+'-------------------------------------------------------------------------------
+Private Function getSafeBoolean(ByVal v As Variant) As Boolean
+    Const METHOD_NAME As String = "getSafeBoolean"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim upperValue As String
+
+    On Error GoTo ErrorHandler
+
+    upperValue = UCase$(Trim$(CStr(v)))
+    getSafeBoolean = upperValue = "TRUE" _
+                     Or upperValue = "1" _
+                     Or upperValue = "PRAWDA" _
+                     Or upperValue = "TAK"
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    getSafeBoolean = False
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    v As Variant
+' Returns:       Long
+' Description:   Converts a configured value to Long and returns zero for blank or invalid input.
+'-------------------------------------------------------------------------------
+Private Function getSafeLong(ByVal v As Variant) As Long
+    Const METHOD_NAME As String = "getSafeLong"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If Len(Trim$(CStr(v))) = 0 Then
+        getSafeLong = 0
+    Else
+        getSafeLong = CLng(v)
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    getSafeLong = 0
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    srcFolder As String, dstFolder As String, ext As String
+' Returns:       ---
+' Description:   Moves files of one extension through Robocopy.
+'-------------------------------------------------------------------------------
+Private Sub fastMoveFiles(ByVal srcFolder As String, _
+                          ByVal dstFolder As String, _
+                          ByVal ext As String)
+    Const METHOD_NAME As String = "fastMoveFiles"
+    Dim cmd As String
+    Dim dstTrimmed As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim shell As Object
+    Dim srcTrimmed As String
+
+    On Error GoTo ErrorHandler
+
+    srcTrimmed = srcFolder
+    dstTrimmed = dstFolder
+
+    If Right$(srcTrimmed, 1) = "\" Then
+        srcTrimmed = Left$(srcTrimmed, Len(srcTrimmed) - 1)
+    End If
+
+    If Right$(dstTrimmed, 1) = "\" Then
+        dstTrimmed = Left$(dstTrimmed, Len(dstTrimmed) - 1)
+    End If
+
+    cmd = "robocopy """ & srcTrimmed & """ """ & dstTrimmed & """ ""*." & ext & """ " & _
+          "/MOV /MT:8 /R:1 /W:1 /NP /NJH /NJS /NDL /NC /NS /NFL"
+
+    Set shell = CreateObject("WScript.Shell")
+    shell.Run cmd, 0, True
+
+ExitSub:
+    Set shell = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "sourceFolder;destinationFolder;extension", _
+        srcFolder, _
+        dstFolder, _
+        ext
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-05
+' Parameters:    fsoObj As Object, folderPath As String, ext As String
+' Returns:       Long
+' Description:   Counts files with the requested extension in a folder.
+'-------------------------------------------------------------------------------
+Private Function countFilesByExt(ByRef fsoObj As Object, _
+                                 ByVal folderPath As String, _
+                                 ByVal ext As String) As Long
+    Const METHOD_NAME As String = "countFilesByExt"
+    Dim countValue As Long
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileItem As Object
+    Dim folder As Object
+
+    On Error GoTo ErrorHandler
+
+    countValue = 0
+
+    If Not fsoObj.FolderExists(folderPath) Then
+        countFilesByExt = 0
+        GoTo ExitFunction
+    End If
+
+    Set folder = fsoObj.GetFolder(folderPath)
+
+    For Each fileItem In folder.Files
+        If LCase$(fsoObj.GetExtensionName(fileItem.Name)) = LCase$(ext) Then
+            countValue = countValue + 1
+        End If
+    Next fileItem
+
+    countFilesByExt = countValue
+
+ExitFunction:
+    Set fileItem = Nothing
+    Set folder = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    countFilesByExt = 0
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "folderPath;extension", _
+        folderPath, _
+        ext
+    errorManager.save
+    Resume ExitFunction
+End Function

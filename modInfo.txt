@@ -1,0 +1,10 @@
+Option Explicit
+
+'-------------------------------------------------------------------------------
+' JIRA REFERENCE:
+' TOOL VERSION:     1.0.0
+' TOOL DESCRIPTION: Generates and distributes Tradeversand reports and KVG backup outputs.
+' CHANGE LOG:
+' PASSWORD:
+' BACKUP POLICY:    Remember to commit the project to Git and create backups.
+'-------------------------------------------------------------------------------
