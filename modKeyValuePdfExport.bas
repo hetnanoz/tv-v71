@@ -60,6 +60,7 @@ Public Function GenerateKeyValuePdfFromWorksheet(ByVal targetPath As String, ByV
     Dim lngTradeCount As Long
     Dim strDocument As String
     Dim strLogoHex As String
+    Dim strStaticContent As String
 
     On Error GoTo ErrorHandler
 
@@ -83,12 +84,15 @@ Public Function GenerateKeyValuePdfFromWorksheet(ByVal targetPath As String, ByV
         Err.Raise 1013, METHOD_NAME, "The report logo could not be prepared as a JPEG image."
     End If
 
-    If Not BuildAllPageContents( wksSource, arrTopRows, arrBottomRows, lngTradeCount, colPageContents) Then
-
-        Err.Raise 1024, METHOD_NAME, "The key-value PDF page contents could not be built."
+    If Not BuildStaticPageContent(strStaticContent) Then
+        Err.Raise 1024, METHOD_NAME, "The shared static key-value PDF content could not be built."
     End If
 
-    If Not BuildPdfDocument(colPageContents, strLogoHex, lngLogoWidth, lngLogoHeight, lngLogoComponents, strDocument) Then
+    If Not BuildAllPageContents(wksSource, arrTopRows, arrBottomRows, lngTradeCount, colPageContents) Then
+        Err.Raise 1024, METHOD_NAME, "The dynamic key-value PDF page contents could not be built."
+    End If
+
+    If Not BuildPdfDocument(strStaticContent, colPageContents, strLogoHex, lngLogoWidth, lngLogoHeight, lngLogoComponents, strDocument) Then
         Err.Raise 1024, METHOD_NAME, "The PDF object structure or XREF table could not be built."
     End If
 
@@ -141,7 +145,75 @@ ErrorHandler:
 End Function
 
 '-------------------------------------------------------------------------------
-' Builds one content stream per transaction. No page contains more than one trade.
+' Builds the immutable page layer once for the whole document: logo, table rules
+' and the 25 KEY labels. Every page references this same PDF content stream.
+'-------------------------------------------------------------------------------
+Private Function BuildStaticPageContent(ByRef strStaticContent As String) As Boolean
+
+    Const METHOD_NAME As String = "BuildStaticPageContent"
+    Dim arrKeys As Variant
+    Dim dblBaselineY As Double
+    Dim dblCurrentY As Double
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngIndex As Long
+    Dim strContent As String
+    Dim strKey As String
+
+    On Error GoTo ErrorHandler
+
+    BuildStaticPageContent = False
+    strStaticContent = vbNullString
+
+    arrKeys = Array( "Depotnr.", "Fondsbezeichnung", "Geschaeftsart", "Schlusstag", "Valutatag", "WKN", "ISIN", "Wertpapierbezeichnung", "Nominale/Stuecke", "Whg (Nominale/Stuecke)", "Kurs", "Stueckzinsen", "Transaktionsnr.", "Maklergebuehren", "Whg (Maklergebuehren)", "Steuern", "Whg (Steuern)", "Abwicklungsprovision", "Whg (Abwicklungsprovision)", "Spesen", "Whg (Spesen)", "ausm. Betrag in Whg", "ausm. Betrag in Abrech. Whg", "Whg", "Devisenkurs")
+
+    If UBound(arrKeys) - LBound(arrKeys) + 1 <> ROW_COUNT Then
+        Err.Raise 1024, METHOD_NAME, "The fixed KEY list does not contain exactly 25 rows."
+    End If
+
+    strContent = "q" & vbCrLf & PdfNumber(LOGO_WIDTH) & " 0 0 " & PdfNumber(LOGO_HEIGHT) & " " & PdfNumber(LOGO_X) & " " & PdfNumber(LOGO_Y) & " cm" & vbCrLf & "/Im0 Do" & vbCrLf & "Q" & vbCrLf
+    strContent = strContent & "0 g" & vbCrLf & "0 G" & vbCrLf & PdfNumber(LINE_WIDTH) & " w" & vbCrLf
+
+    ' Horizontal boundaries: 26 lines for 25 rows.
+    For lngIndex = 0 To ROW_COUNT
+        dblCurrentY = TABLE_TOP_Y - (CDbl(lngIndex) * ROW_HEIGHT)
+        strContent = strContent & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(dblCurrentY) & " m " & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(dblCurrentY) & " l S" & vbCrLf
+    Next lngIndex
+
+    ' Three vertical rules. Each is drawn once, so there are no overlapping cell borders.
+    strContent = strContent & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf & PdfNumber(TABLE_DIVIDER_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & PdfNumber(TABLE_DIVIDER_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf
+
+    For lngIndex = 0 To ROW_COUNT - 1
+        strKey = CStr(arrKeys(lngIndex))
+        dblBaselineY = TABLE_TOP_Y - (CDbl(lngIndex + 1) * ROW_HEIGHT) + TEXT_BASELINE_FROM_BOTTOM
+        strContent = strContent & BuildTextCommand("/F0", KEY_FONT_SIZE, TABLE_LEFT_X + TEXT_LEFT_PADDING, dblBaselineY, strKey)
+    Next lngIndex
+
+    If Len(strContent) = 0 Then
+        Err.Raise 1024, METHOD_NAME, "The shared static content stream is empty."
+    End If
+
+    strStaticContent = strContent
+    BuildStaticPageContent = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    BuildStaticPageContent = False
+    strStaticContent = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "keyIndex", lngIndex
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Builds only the dynamic content stream for each transaction. The immutable
+' logo/table/KEY layer is stored once and shared by every PDF page.
 '-------------------------------------------------------------------------------
 Private Function BuildAllPageContents( ByVal wksSource As Excel.Worksheet, ByRef arrTopRows() As Long, ByRef arrBottomRows() As Long, ByVal lngTradeCount As Long, ByRef colPageContents As Collection) As Boolean
 
@@ -187,75 +259,55 @@ ErrorHandler:
 End Function
 
 '-------------------------------------------------------------------------------
-' Builds a single fixed 25-row KEY/VALUE page. Lines are emitted once using m/l/S.
+' Builds only page-specific VALUE text, pagination and the optional final footer.
+' The table geometry, logo and KEY labels are supplied by the shared static stream.
 '-------------------------------------------------------------------------------
 Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Worksheet, ByVal lngTopRow As Long, ByVal lngBottomRow As Long, ByVal lngPageNumber As Long, ByVal lngPageCount As Long) As String
 
     Const METHOD_NAME As String = "BuildSingleTransactionPageContent"
-    Dim arrKeys As Variant
     Dim arrColumns As Variant
     Dim arrRowOffsets As Variant
     Dim dblBaselineY As Double
-    Dim dblCurrentY As Double
     Dim dblFontSize As Double
+    Dim dblPageNumberX As Double
     Dim dblValueAvailableWidth As Double
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
     Dim lngIndex As Long
     Dim lngSourceRow As Long
-    Dim dblPageNumberX As Double
     Dim strContent As String
     Dim strPageNumber As String
-    Dim strKey As String
     Dim strValue As String
 
     On Error GoTo ErrorHandler
 
     BuildSingleTransactionPageContent = vbNullString
 
-    arrKeys = Array( "Depotnr.", "Fondsbezeichnung", "Geschaeftsart", "Schlusstag", "Valutatag", "WKN", "ISIN", "Wertpapierbezeichnung", "Nominale/Stuecke", "Whg (Nominale/Stuecke)", "Kurs", "Stueckzinsen", "Transaktionsnr.", "Maklergebuehren", "Whg (Maklergebuehren)", "Steuern", "Whg (Steuern)", "Abwicklungsprovision", "Whg (Abwicklungsprovision)", "Spesen", "Whg (Spesen)", "ausm. Betrag in Whg", "ausm. Betrag in Abrech. Whg", "Whg", "Devisenkurs")
-
     arrColumns = Array( 1, 2, 5, 7, 9, 10, 11, 13, 16, 18, 19, 20, 1, 2, 4, 5, 8, 9, 12, 13, 15, 16, 19, 20, 21)
-
     arrRowOffsets = Array( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
 
-    If UBound(arrKeys) - LBound(arrKeys) + 1 <> ROW_COUNT Then
-        Err.Raise 1024, METHOD_NAME, "The fixed KEY list does not contain exactly 25 rows."
+    If UBound(arrColumns) - LBound(arrColumns) + 1 <> ROW_COUNT Then
+        Err.Raise 1024, METHOD_NAME, "The fixed VALUE column map does not contain exactly 25 rows."
     End If
 
-    strContent = "q" & vbCrLf & PdfNumber(LOGO_WIDTH) & " 0 0 " & PdfNumber(LOGO_HEIGHT) & " " & PdfNumber(LOGO_X) & " " & PdfNumber(LOGO_Y) & " cm" & vbCrLf & "/Im0 Do" & vbCrLf & "Q" & vbCrLf
-    strContent = strContent & "0 g" & vbCrLf & "0 G" & vbCrLf & PdfNumber(LINE_WIDTH) & " w" & vbCrLf
-
-    ' Horizontal boundaries: 26 lines for 25 rows.
-    For lngIndex = 0 To ROW_COUNT
-        dblCurrentY = TABLE_TOP_Y - (CDbl(lngIndex) * ROW_HEIGHT)
-        strContent = strContent & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(dblCurrentY) & " m " & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(dblCurrentY) & " l S" & vbCrLf
-    Next lngIndex
-
-    ' Three vertical rules. Each is drawn once, so there are no overlapping cell borders.
-    strContent = strContent & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf & PdfNumber(TABLE_DIVIDER_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & PdfNumber(TABLE_DIVIDER_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(TABLE_BOTTOM_Y) & " m " & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(TABLE_TOP_Y) & " l S" & vbCrLf
+    If UBound(arrRowOffsets) - LBound(arrRowOffsets) + 1 <> ROW_COUNT Then
+        Err.Raise 1024, METHOD_NAME, "The fixed VALUE row map does not contain exactly 25 rows."
+    End If
 
     dblValueAvailableWidth = TABLE_RIGHT_X - TABLE_DIVIDER_X - TEXT_LEFT_PADDING - VALUE_RIGHT_PADDING
 
     For lngIndex = 0 To ROW_COUNT - 1
-        strKey = CStr(arrKeys(lngIndex))
-
         If CLng(arrRowOffsets(lngIndex)) = 0 Then
             lngSourceRow = lngTopRow
         Else
             lngSourceRow = lngBottomRow
         End If
 
-        strValue = GetWorksheetDisplayText( wksSource.Cells(lngSourceRow, CLng(arrColumns(lngIndex))))
-
+        strValue = GetWorksheetDisplayText(wksSource.Cells(lngSourceRow, CLng(arrColumns(lngIndex))))
         dblBaselineY = TABLE_TOP_Y - (CDbl(lngIndex + 1) * ROW_HEIGHT) + TEXT_BASELINE_FROM_BOTTOM
-
-        strContent = strContent & BuildTextCommand( "/F0", KEY_FONT_SIZE, TABLE_LEFT_X + TEXT_LEFT_PADDING, dblBaselineY, strKey)
-
         dblFontSize = ResolveValueFontSize(strValue, dblValueAvailableWidth)
-
-        strContent = strContent & BuildTextCommand( "/F1", dblFontSize, TABLE_DIVIDER_X + TEXT_LEFT_PADDING, dblBaselineY, strValue)
+        strContent = strContent & BuildTextCommand("/F1", dblFontSize, TABLE_DIVIDER_X + TEXT_LEFT_PADDING, dblBaselineY, strValue)
     Next lngIndex
 
     If lngPageNumber = lngPageCount Then
@@ -276,7 +328,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     BuildSingleTransactionPageContent = vbNullString
 
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "topRow;bottomRow;pageNumber;pageCount;keyIndex", lngTopRow, lngBottomRow, lngPageNumber, lngPageCount, lngIndex
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "topRow;bottomRow;pageNumber;pageCount;valueIndex", lngTopRow, lngBottomRow, lngPageNumber, lngPageCount, lngIndex
     errorManager.save
     Resume ExitFunction
 End Function
@@ -796,9 +848,10 @@ End Function
 ' Creates a classic PDF 1.4 object/xref structure. Every stream is ASCII only,
 ' so VBA Len() equals the byte offset used in the xref table.
 '-------------------------------------------------------------------------------
-Private Function BuildPdfDocument(ByVal colPageContents As Collection, ByVal strLogoHex As String, ByVal lngLogoWidth As Long, ByVal lngLogoHeight As Long, ByVal lngLogoComponents As Long, ByRef strDocument As String) As Boolean
+Private Function BuildPdfDocument(ByVal strStaticContent As String, ByVal colPageContents As Collection, ByVal strLogoHex As String, ByVal lngLogoWidth As Long, ByVal lngLogoHeight As Long, ByVal lngLogoComponents As Long, ByRef strDocument As String) As Boolean
 
     Const METHOD_NAME As String = "BuildPdfDocument"
+    Const STATIC_CONTENT_OBJECT As Long = 6
     Dim arrOffsets() As Long
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -820,8 +873,12 @@ Private Function BuildPdfDocument(ByVal colPageContents As Collection, ByVal str
     BuildPdfDocument = False
     strDocument = vbNullString
 
+    If Len(strStaticContent) = 0 Then
+        Err.Raise 1001, METHOD_NAME, "Shared static page content is required."
+    End If
+
     If colPageContents Is Nothing Then
-        Err.Raise 1001, METHOD_NAME, "Page contents are required."
+        Err.Raise 1001, METHOD_NAME, "Dynamic page contents are required."
     End If
 
     If colPageContents.Count <= 0 Then
@@ -833,11 +890,11 @@ Private Function BuildPdfDocument(ByVal colPageContents As Collection, ByVal str
     End If
 
     lngPageCount = colPageContents.Count
-    lngObjectCount = 5 + (lngPageCount * 2)
+    lngObjectCount = STATIC_CONTENT_OBJECT + (lngPageCount * 2)
     ReDim arrOffsets(0 To lngObjectCount)
 
-    For lngPage = 1 To colPageContents.Count
-        lngPageObject = 6 + ((lngPage - 1) * 2)
+    For lngPage = 1 To lngPageCount
+        lngPageObject = 7 + ((lngPage - 1) * 2)
         strKids = strKids & CStr(lngPageObject) & " 0 R "
     Next lngPage
 
@@ -850,17 +907,17 @@ Private Function BuildPdfDocument(ByVal colPageContents As Collection, ByVal str
 
     lngObject = 2
     arrOffsets(lngObject) = Len(strDocument)
-    strObject = "2 0 obj" & vbCrLf & "<< /Type /Pages /Count " & CStr(colPageContents.Count) & " /Kids [" & Trim$(strKids) & "] >>" & vbCrLf & "endobj" & vbCrLf
+    strObject = "2 0 obj" & vbCrLf & "<< /Type /Pages /Count " & CStr(lngPageCount) & " /Kids [" & Trim$(strKids) & "] >>" & vbCrLf & "endobj" & vbCrLf
     strDocument = strDocument & strObject
 
     lngObject = 3
     arrOffsets(lngObject) = Len(strDocument)
-    strObject = "3 0 obj" & vbCrLf & "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold " & "/Encoding /WinAnsiEncoding >>" & vbCrLf & "endobj" & vbCrLf
+    strObject = "3 0 obj" & vbCrLf & "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold /Encoding /WinAnsiEncoding >>" & vbCrLf & "endobj" & vbCrLf
     strDocument = strDocument & strObject
 
     lngObject = 4
     arrOffsets(lngObject) = Len(strDocument)
-    strObject = "4 0 obj" & vbCrLf & "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman " & "/Encoding /WinAnsiEncoding >>" & vbCrLf & "endobj" & vbCrLf
+    strObject = "4 0 obj" & vbCrLf & "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>" & vbCrLf & "endobj" & vbCrLf
     strDocument = strDocument & strObject
 
     Select Case lngLogoComponents
@@ -877,13 +934,18 @@ Private Function BuildPdfDocument(ByVal colPageContents As Collection, ByVal str
     strObject = "5 0 obj" & vbCrLf & "<< /Type /XObject /Subtype /Image /Width " & CStr(lngLogoWidth) & " /Height " & CStr(lngLogoHeight) & " /ColorSpace " & strColorSpace & " /BitsPerComponent 8 /Filter [/ASCIIHexDecode /DCTDecode] /Length " & CStr(Len(strLogoHex)) & " >>" & vbCrLf & "stream" & vbCrLf & strLogoHex & vbCrLf & "endstream" & vbCrLf & "endobj" & vbCrLf
     strDocument = strDocument & strObject
 
-    For lngPage = 1 To colPageContents.Count
-        lngPageObject = 6 + ((lngPage - 1) * 2)
+    lngObject = STATIC_CONTENT_OBJECT
+    arrOffsets(lngObject) = Len(strDocument)
+    strObject = CStr(STATIC_CONTENT_OBJECT) & " 0 obj" & vbCrLf & "<< /Length " & CStr(Len(strStaticContent)) & " >>" & vbCrLf & "stream" & vbCrLf & strStaticContent & "endstream" & vbCrLf & "endobj" & vbCrLf
+    strDocument = strDocument & strObject
+
+    For lngPage = 1 To lngPageCount
+        lngPageObject = 7 + ((lngPage - 1) * 2)
         lngContentObject = lngPageObject + 1
         strStream = CStr(colPageContents(lngPage))
 
         arrOffsets(lngPageObject) = Len(strDocument)
-        strObject = CStr(lngPageObject) & " 0 obj" & vbCrLf & "<< /Type /Page /Parent 2 0 R " & "/MediaBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & "/CropBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & "/Resources << /Font << /F0 3 0 R /F1 4 0 R >> /XObject << /Im0 5 0 R >> >> " & "/Contents " & CStr(lngContentObject) & " 0 R >>" & vbCrLf & "endobj" & vbCrLf
+        strObject = CStr(lngPageObject) & " 0 obj" & vbCrLf & "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] /CropBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] /Resources << /Font << /F0 3 0 R /F1 4 0 R >> /XObject << /Im0 5 0 R >> >> /Contents [" & CStr(STATIC_CONTENT_OBJECT) & " 0 R " & CStr(lngContentObject) & " 0 R] >>" & vbCrLf & "endobj" & vbCrLf
         strDocument = strDocument & strObject
 
         arrOffsets(lngContentObject) = Len(strDocument)
