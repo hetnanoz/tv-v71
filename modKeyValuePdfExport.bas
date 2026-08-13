@@ -4,6 +4,10 @@ Private Const CLASS_NAME As String = "modKeyValuePdfExport"
 Private Const PDF_HEADER As String = "%PDF-1.4"
 Private Const PDF_PAGE_WIDTH As Double = 1368#
 Private Const PDF_PAGE_HEIGHT As Double = 684#
+Private Const LOGO_X As Double = 40.52
+Private Const LOGO_Y As Double = 654#
+Private Const LOGO_WIDTH As Double = 85.52
+Private Const LOGO_HEIGHT As Double = 17.96
 
 Private Const TABLE_LEFT_X As Double = 40.52
 Private Const TABLE_DIVIDER_X As Double = 365.04
@@ -42,8 +46,12 @@ Public Function GenerateKeyValuePdfFromWorksheet( ByVal targetPath As String, By
     Dim errDescription As String
     Dim errNumber As Long
     Dim lngFileNumber As Long
+    Dim lngLogoComponents As Long
+    Dim lngLogoHeight As Long
+    Dim lngLogoWidth As Long
     Dim lngTradeCount As Long
     Dim strDocument As String
+    Dim strLogoHex As String
 
     On Error GoTo ErrorHandler
 
@@ -63,12 +71,16 @@ Public Function GenerateKeyValuePdfFromWorksheet( ByVal targetPath As String, By
         Err.Raise 1001, METHOD_NAME, "No transaction row pairs were found in the report worksheet."
     End If
 
+    If Not PrepareLogoImage(wksSource, strLogoHex, lngLogoWidth, lngLogoHeight, lngLogoComponents) Then
+        Err.Raise 1013, METHOD_NAME, "The report logo could not be prepared as a JPEG image."
+    End If
+
     If Not BuildAllPageContents( wksSource, arrTopRows, arrBottomRows, lngTradeCount, colPageContents) Then
 
         Err.Raise 1024, METHOD_NAME, "The key-value PDF page contents could not be built."
     End If
 
-    If Not BuildPdfDocument(colPageContents, strDocument) Then
+    If Not BuildPdfDocument(colPageContents, strLogoHex, lngLogoWidth, lngLogoHeight, lngLogoComponents, strDocument) Then
         Err.Raise 1024, METHOD_NAME, "The PDF object structure or XREF table could not be built."
     End If
 
@@ -202,7 +214,8 @@ Private Function BuildSingleTransactionPageContent( ByVal wksSource As Excel.Wor
         Err.Raise 1024, METHOD_NAME, "The fixed KEY list does not contain exactly 25 rows."
     End If
 
-    strContent = "0 g" & vbCrLf & "0 G" & vbCrLf & PdfNumber(LINE_WIDTH) & " w" & vbCrLf
+    strContent = "q" & vbCrLf & PdfNumber(LOGO_WIDTH) & " 0 0 " & PdfNumber(LOGO_HEIGHT) & " " & PdfNumber(LOGO_X) & " " & PdfNumber(LOGO_Y) & " cm" & vbCrLf & "/Im0 Do" & vbCrLf & "Q" & vbCrLf
+    strContent = strContent & "0 g" & vbCrLf & "0 G" & vbCrLf & PdfNumber(LINE_WIDTH) & " w" & vbCrLf
 
     ' Horizontal boundaries: 26 lines for 25 rows.
     For lngIndex = 0 To ROW_COUNT
@@ -530,11 +543,324 @@ ErrorHandler:
     Resume ExitFunction
 End Function
 
+\n'-------------------------------------------------------------------------------
+' Exports the already inserted worksheet logo to JPEG and prepares it as a PDF
+' image XObject. The same image object is reused on every transaction page.
+'-------------------------------------------------------------------------------
+Private Function PrepareLogoImage(ByVal wksSource As Excel.Worksheet, ByRef strLogoHex As String, ByRef lngLogoWidth As Long, ByRef lngLogoHeight As Long, ByRef lngLogoComponents As Long) As Boolean
+    Const METHOD_NAME As String = "PrepareLogoImage"
+    Dim arrBytes() As Byte
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strTempPath As String
+
+    On Error GoTo ErrorHandler
+
+    PrepareLogoImage = False
+    strLogoHex = vbNullString
+    lngLogoWidth = 0
+    lngLogoHeight = 0
+    lngLogoComponents = 0
+
+    If wksSource Is Nothing Then
+        Err.Raise 1001, METHOD_NAME, "The report worksheet is required to prepare the logo."
+    End If
+
+    strTempPath = Environ$("TEMP") & "\\Tradeversand_KeyValueLogo_" & Format$(Now, "yyyymmdd_hhnnss") & "_" & Format$(CLng(Timer * 100), "00000000") & ".jpg"
+
+    If Not ExportWorksheetLogoToJpeg(wksSource, strTempPath) Then
+        Err.Raise 1013, METHOD_NAME, "The worksheet logo could not be exported to JPEG."
+    End If
+
+    arrBytes = ReadFileBytes(strTempPath)
+
+    If Not GetJpegInformation(arrBytes, lngLogoWidth, lngLogoHeight, lngLogoComponents) Then
+        Err.Raise 1013, METHOD_NAME, "The prepared logo is not a supported JPEG image."
+    End If
+
+    strLogoHex = BytesToAsciiHex(arrBytes)
+
+    If Len(strLogoHex) <= 1 Then
+        Err.Raise 1013, METHOD_NAME, "The prepared logo contains no image data."
+    End If
+
+    PrepareLogoImage = True
+
+ExitFunction:
+    If Len(strTempPath) > 0 Then
+        DeleteFileIfPresent strTempPath
+    End If
+    Set wksSource = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    PrepareLogoImage = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "tempPath", strTempPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Exports the first picture shape from wsOut to a temporary JPEG. processFundZeroTemplate
+' inserts the same Tradeversand logo into this worksheet before PDF generation.
+'-------------------------------------------------------------------------------
+Private Function ExportWorksheetLogoToJpeg(ByVal wksSource As Excel.Worksheet, ByVal targetJpegPath As String) As Boolean
+    Const METHOD_NAME As String = "ExportWorksheetLogoToJpeg"
+    Dim chartLogo As Excel.ChartObject
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngShape As Long
+    Dim shpLogo As Excel.Shape
+
+    On Error GoTo ErrorHandler
+
+    ExportWorksheetLogoToJpeg = False
+
+    If wksSource Is Nothing Then
+        Err.Raise 1001, METHOD_NAME, "The report worksheet is required."
+    End If
+
+    For lngShape = 1 To wksSource.Shapes.Count
+        If wksSource.Shapes(lngShape).Type = 13 Or wksSource.Shapes(lngShape).Type = 11 Then
+            Set shpLogo = wksSource.Shapes(lngShape)
+            Exit For
+        End If
+    Next lngShape
+
+    If shpLogo Is Nothing Then
+        Err.Raise 1013, METHOD_NAME, "No picture shape was found on the report worksheet."
+    End If
+
+    Set chartLogo = wksSource.ChartObjects.Add(Left:=shpLogo.Left, Top:=shpLogo.Top, Width:=shpLogo.Width, Height:=shpLogo.Height)
+    shpLogo.CopyPicture Appearance:=xlScreen, Format:=xlPicture
+    DoEvents
+    chartLogo.Chart.Paste
+    DoEvents
+    ExportWorksheetLogoToJpeg = chartLogo.Chart.Export(Filename:=targetJpegPath, FilterName:="JPG")
+
+    If Not ExportWorksheetLogoToJpeg Then
+        Err.Raise 1013, METHOD_NAME, "Excel could not export the worksheet logo to JPEG."
+    End If
+
+ExitFunction:
+    If Not chartLogo Is Nothing Then
+        DeleteChartObjectSafe chartLogo
+    End If
+    Set shpLogo = Nothing
+    Set chartLogo = Nothing
+    Set wksSource = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ExportWorksheetLogoToJpeg = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "targetJpegPath", targetJpegPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Deletes the temporary chart used for picture export without error suppression.
+'-------------------------------------------------------------------------------
+Private Sub DeleteChartObjectSafe(ByRef chartLogo As Excel.ChartObject)
+    Const METHOD_NAME As String = "DeleteChartObjectSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If Not chartLogo Is Nothing Then
+        chartLogo.Delete
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Reads a complete binary file into a byte array.
+'-------------------------------------------------------------------------------
+Private Function ReadFileBytes(ByVal filePath As String) As Byte()
+    Const METHOD_NAME As String = "ReadFileBytes"
+    Dim arrBytes() As Byte
+    Dim blnFileOpened As Boolean
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngFileNumber As Long
+    Dim lngSize As Long
+
+    On Error GoTo ErrorHandler
+
+    If Len(Dir$(filePath)) = 0 Then
+        Err.Raise 1010, METHOD_NAME, "The requested file does not exist."
+    End If
+
+    lngFileNumber = FreeFile
+    Open filePath For Binary Access Read Lock Read As #lngFileNumber
+    blnFileOpened = True
+    lngSize = LOF(lngFileNumber)
+
+    If lngSize <= 0 Then
+        Err.Raise 1011, METHOD_NAME, "The requested file is empty."
+    End If
+
+    ReDim arrBytes(0 To lngSize - 1)
+    Get #lngFileNumber, 1, arrBytes
+    Close #lngFileNumber
+    blnFileOpened = False
+    ReadFileBytes = arrBytes
+
+ExitFunction:
+    If blnFileOpened Then
+        CloseFileHandle lngFileNumber
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ReDim arrBytes(0 To 0)
+    ReadFileBytes = arrBytes
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "filePath", filePath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Extracts JPEG dimensions and component count from a SOF marker.
+'-------------------------------------------------------------------------------
+Private Function GetJpegInformation(ByRef arrBytes() As Byte, ByRef lngWidth As Long, ByRef lngHeight As Long, ByRef lngComponents As Long) As Boolean
+    Const METHOD_NAME As String = "GetJpegInformation"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngMarker As Long
+    Dim lngPosition As Long
+    Dim lngSegmentLength As Long
+
+    On Error GoTo ErrorHandler
+
+    GetJpegInformation = False
+    lngWidth = 0
+    lngHeight = 0
+    lngComponents = 0
+
+    If UBound(arrBytes) < 10 Then GoTo ExitFunction
+    If arrBytes(0) <> &HFF Or arrBytes(1) <> &HD8 Then GoTo ExitFunction
+
+    lngPosition = 2
+
+    Do While lngPosition <= UBound(arrBytes) - 8
+        Do While lngPosition <= UBound(arrBytes) And arrBytes(lngPosition) <> &HFF
+            lngPosition = lngPosition + 1
+        Loop
+
+        Do While lngPosition <= UBound(arrBytes) And arrBytes(lngPosition) = &HFF
+            lngPosition = lngPosition + 1
+        Loop
+
+        If lngPosition > UBound(arrBytes) Then Exit Do
+
+        lngMarker = CLng(arrBytes(lngPosition))
+        lngPosition = lngPosition + 1
+
+        If lngMarker = &HD9 Or lngMarker = &HDA Then Exit Do
+        If lngMarker = &H1 Or (lngMarker >= &HD0 And lngMarker <= &HD7) Then GoTo ContinueLoop
+        If lngPosition + 1 > UBound(arrBytes) Then Exit Do
+
+        lngSegmentLength = CLng(arrBytes(lngPosition)) * 256 + CLng(arrBytes(lngPosition + 1))
+
+        Select Case lngMarker
+            Case &HC0, &HC1, &HC2, &HC3, &HC5, &HC6, &HC7, &HC9, &HCA, &HCB, &HCD, &HCE, &HCF
+                If lngPosition + 7 <= UBound(arrBytes) Then
+                    lngHeight = CLng(arrBytes(lngPosition + 3)) * 256 + CLng(arrBytes(lngPosition + 4))
+                    lngWidth = CLng(arrBytes(lngPosition + 5)) * 256 + CLng(arrBytes(lngPosition + 6))
+                    lngComponents = CLng(arrBytes(lngPosition + 7))
+                    GetJpegInformation = (lngWidth > 0 And lngHeight > 0 And lngComponents > 0)
+                    GoTo ExitFunction
+                End If
+        End Select
+
+        If lngSegmentLength < 2 Then Exit Do
+        lngPosition = lngPosition + lngSegmentLength
+ContinueLoop:
+    Loop
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetJpegInformation = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Converts JPEG bytes to an ASCIIHex stream terminated by greater-than.
+'-------------------------------------------------------------------------------
+Private Function BytesToAsciiHex(ByRef arrBytes() As Byte) As String
+    Const METHOD_NAME As String = "BytesToAsciiHex"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngIndex As Long
+    Dim lngLength As Long
+    Dim strHex As String
+
+    On Error GoTo ErrorHandler
+
+    BytesToAsciiHex = vbNullString
+    lngLength = UBound(arrBytes) - LBound(arrBytes) + 1
+    If lngLength <= 0 Then GoTo ExitFunction
+
+    strHex = String$(lngLength * 2, "0")
+
+    For lngIndex = 0 To lngLength - 1
+        Mid$(strHex, (lngIndex * 2) + 1, 2) = Right$("0" & Hex$(arrBytes(LBound(arrBytes) + lngIndex)), 2)
+    Next lngIndex
+
+    BytesToAsciiHex = strHex & ">"
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    BytesToAsciiHex = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
 '-------------------------------------------------------------------------------
 ' Creates a classic PDF 1.4 object/xref structure. Every stream is ASCII only,
 ' so VBA Len() equals the byte offset used in the xref table.
 '-------------------------------------------------------------------------------
-Private Function BuildPdfDocument( ByVal colPageContents As Collection, ByRef strDocument As String) As Boolean
+Private Function BuildPdfDocument(ByVal colPageContents As Collection, ByVal strLogoHex As String, ByVal lngLogoWidth As Long, ByVal lngLogoHeight As Long, ByVal lngLogoComponents As Long, ByRef strDocument As String) As Boolean
 
     Const METHOD_NAME As String = "BuildPdfDocument"
     Dim arrOffsets() As Long
@@ -548,6 +874,7 @@ Private Function BuildPdfDocument( ByVal colPageContents As Collection, ByRef st
     Dim lngPageCount As Long
     Dim lngPageObject As Long
     Dim lngStartXref As Long
+    Dim strColorSpace As String
     Dim strKids As String
     Dim strObject As String
     Dim strStream As String
@@ -565,12 +892,16 @@ Private Function BuildPdfDocument( ByVal colPageContents As Collection, ByRef st
         Err.Raise 1001, METHOD_NAME, "At least one page is required."
     End If
 
+    If Len(strLogoHex) <= 1 Or lngLogoWidth <= 0 Or lngLogoHeight <= 0 Or lngLogoComponents <= 0 Then
+        Err.Raise 1013, METHOD_NAME, "Valid JPEG logo data is required."
+    End If
+
     lngPageCount = colPageContents.Count
-    lngObjectCount = 4 + (lngPageCount * 2)
+    lngObjectCount = 5 + (lngPageCount * 2)
     ReDim arrOffsets(0 To lngObjectCount)
 
     For lngPage = 1 To colPageContents.Count
-        lngPageObject = 5 + ((lngPage - 1) * 2)
+        lngPageObject = 6 + ((lngPage - 1) * 2)
         strKids = strKids & CStr(lngPageObject) & " 0 R "
     Next lngPage
 
@@ -596,13 +927,27 @@ Private Function BuildPdfDocument( ByVal colPageContents As Collection, ByRef st
     strObject = "4 0 obj" & vbCrLf & "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman " & "/Encoding /WinAnsiEncoding >>" & vbCrLf & "endobj" & vbCrLf
     strDocument = strDocument & strObject
 
+    Select Case lngLogoComponents
+        Case 1
+            strColorSpace = "/DeviceGray"
+        Case 4
+            strColorSpace = "/DeviceCMYK"
+        Case Else
+            strColorSpace = "/DeviceRGB"
+    End Select
+
+    lngObject = 5
+    arrOffsets(lngObject) = Len(strDocument)
+    strObject = "5 0 obj" & vbCrLf & "<< /Type /XObject /Subtype /Image /Width " & CStr(lngLogoWidth) & " /Height " & CStr(lngLogoHeight) & " /ColorSpace " & strColorSpace & " /BitsPerComponent 8 /Filter [/ASCIIHexDecode /DCTDecode] /Length " & CStr(Len(strLogoHex)) & " >>" & vbCrLf & "stream" & vbCrLf & strLogoHex & vbCrLf & "endstream" & vbCrLf & "endobj" & vbCrLf
+    strDocument = strDocument & strObject
+
     For lngPage = 1 To colPageContents.Count
-        lngPageObject = 5 + ((lngPage - 1) * 2)
+        lngPageObject = 6 + ((lngPage - 1) * 2)
         lngContentObject = lngPageObject + 1
         strStream = CStr(colPageContents(lngPage))
 
         arrOffsets(lngPageObject) = Len(strDocument)
-        strObject = CStr(lngPageObject) & " 0 obj" & vbCrLf & "<< /Type /Page /Parent 2 0 R " & "/MediaBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & "/CropBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & "/Resources << /Font << /F0 3 0 R /F1 4 0 R >> >> " & "/Contents " & CStr(lngContentObject) & " 0 R >>" & vbCrLf & "endobj" & vbCrLf
+        strObject = CStr(lngPageObject) & " 0 obj" & vbCrLf & "<< /Type /Page /Parent 2 0 R " & "/MediaBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & "/CropBox [0 0 " & PdfNumber(PDF_PAGE_WIDTH) & " " & PdfNumber(PDF_PAGE_HEIGHT) & "] " & "/Resources << /Font << /F0 3 0 R /F1 4 0 R >> /XObject << /Im0 5 0 R >> >> " & "/Contents " & CStr(lngContentObject) & " 0 R >>" & vbCrLf & "endobj" & vbCrLf
         strDocument = strDocument & strObject
 
         arrOffsets(lngContentObject) = Len(strDocument)
