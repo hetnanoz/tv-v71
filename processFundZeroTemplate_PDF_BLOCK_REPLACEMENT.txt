@@ -1,0 +1,46 @@
+W PROCEDURZE modTradeversand.processFundZeroTemplate
+
+ZNAJDZ TEN BLOK:
+
+    fullPdfPath = pPdf & pdfName & ".pdf"
+    Set wksMacro = ThisWorkbook.Worksheets("Tradeversand")
+    blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wksMacro)
+
+    If blnRawOraclePdfEnabled Then
+        If Not GenerateRawOraclePdfFromWorksheet(fullPdfPath, wsOut, logoPath) Then
+            Err.Raise 1026, METHOD_NAME, _
+                      "The raw Oracle-compatible PDF could not be generated for fund " & fundId & "."
+        End If
+    Else
+        If Not QueueWorksheetForPowerPdf(wsOut, fullPdfPath) Then
+            Err.Raise 1015, METHOD_NAME, _
+                      "Power PDF print job could not be queued for fund " & fundId & ". " & _
+                      GetPowerPdfLastErrorDescription()
+        End If
+    End If
+
+I ZAMIEN GO NA:
+
+    fullPdfPath = pPdf & pdfName & ".pdf"
+    Set wksMacro = ThisWorkbook.Worksheets("Tradeversand")
+    blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wksMacro)
+
+    If blnRawOraclePdfEnabled Then
+        If Not GenerateKeyValuePdfFromWorksheet(fullPdfPath, wsOut) Then
+            Err.Raise 1026, METHOD_NAME, _
+                      "The raw key-value PDF could not be generated for fund " & fundId & "."
+        End If
+    Else
+        If Not QueueWorksheetForPowerPdf(wsOut, fullPdfPath) Then
+            Err.Raise 1015, METHOD_NAME, _
+                      "Power PDF print job could not be queued for fund " & fundId & ". " & _
+                      GetPowerPdfLastErrorDescription()
+        End If
+    End If
+
+UWAGA:
+- Nie usuwaj modRawOraclePdfExport.
+- Nie zmieniaj GenerateRawOraclePdfFromWorksheet.
+- Stary RAW Oracle pozostaje w projekcie, tylko nie jest teraz wywolywany.
+- FALSE = Power PDF.
+- TRUE = nowy key-value raw PDF.
