@@ -13,9 +13,9 @@ Private Const TABLE_LEFT_X As Double = 40.52
 Private Const TABLE_DIVIDER_X As Double = 365.04
 Private Const TABLE_RIGHT_X As Double = 1323.04
 Private Const TABLE_TOP_Y As Double = 642#
-Private Const TABLE_BOTTOM_Y As Double = 92#
+Private Const TABLE_BOTTOM_Y As Double = 224#
 Private Const ROW_HEIGHT As Double = 22#
-Private Const ROW_COUNT As Long = 25
+Private Const ROW_COUNT As Long = 19
 Private Const TEXT_LEFT_PADDING As Double = 8#
 Private Const TEXT_BASELINE_FROM_BOTTOM As Double = 7#
 Private Const KEY_FONT_SIZE As Double = 10#
@@ -40,7 +40,7 @@ Private Const FOOTER_TEXT As String = "Diese Abrechnung wurde maschinell erstell
 ' Parameters:    targetPath As String, wksSource As Excel.Worksheet, logoPath As String
 ' Returns:       Boolean
 ' Description:   Generates a parser-friendly PDF 1.4 with exactly one transaction
-'                per page and 25 fixed KEY/VALUE rows. The existing report
+'                per page and 19 fixed KEY/VALUE rows. The existing report
 '                worksheet remains the single source of business-calculated data.
 '-------------------------------------------------------------------------------
 Public Function GenerateKeyValuePdfFromWorksheet(ByVal targetPath As String, ByVal wksSource As Excel.Worksheet, ByVal logoPath As String) As Boolean
@@ -146,7 +146,7 @@ End Function
 
 '-------------------------------------------------------------------------------
 ' Builds the immutable page layer once for the whole document: logo, table rules
-' and the 25 KEY labels. Every page references this same PDF content stream.
+' and the 19 KEY labels. Every page references this same PDF content stream.
 '-------------------------------------------------------------------------------
 Private Function BuildStaticPageContent(ByRef strStaticContent As String) As Boolean
 
@@ -166,16 +166,16 @@ Private Function BuildStaticPageContent(ByRef strStaticContent As String) As Boo
     BuildStaticPageContent = False
     strStaticContent = vbNullString
 
-    arrKeys = Array( "Depotnr.", "Fondsbezeichnung", "Geschaeftsart", "Schlusstag", "Valutatag", "WKN", "ISIN", "Wertpapierbezeichnung", "Nominale/Stuecke", "Whg (Nominale/Stuecke)", "Kurs", "Stueckzinsen", "Transaktionsnr.", "Maklergebuehren", "Whg (Maklergebuehren)", "Steuern", "Whg (Steuern)", "Abwicklungsprovision", "Whg (Abwicklungsprovision)", "Spesen", "Whg (Spesen)", "ausm. Betrag in Whg", "ausm. Betrag in Abrech. Whg", "Whg", "Devisenkurs")
+    arrKeys = Array( "Depotnr.", "Fondsbezeichnung", "Geschaeftsart", "Schlusstag", "Valutatag", "WKN", "ISIN", "Wertpapierbezeichnung", "Nominale/Stuecke", "Kurs", "Stueckzinsen", "Transaktionsnr.", "Maklergebuehren", "Steuern", "Abwicklungsprovision", "Spesen", "ausm. Betrag in Whg", "ausm. Betrag in Abrech. Whg", "Devisenkurs")
 
     If UBound(arrKeys) - LBound(arrKeys) + 1 <> ROW_COUNT Then
-        Err.Raise 1024, METHOD_NAME, "The fixed KEY list does not contain exactly 25 rows."
+        Err.Raise 1024, METHOD_NAME, "The fixed KEY list does not contain exactly 19 rows."
     End If
 
     strContent = "q" & vbCrLf & PdfNumber(LOGO_WIDTH) & " 0 0 " & PdfNumber(LOGO_HEIGHT) & " " & PdfNumber(LOGO_X) & " " & PdfNumber(LOGO_Y) & " cm" & vbCrLf & "/Im0 Do" & vbCrLf & "Q" & vbCrLf
     strContent = strContent & "0 g" & vbCrLf & "0 G" & vbCrLf & PdfNumber(LINE_WIDTH) & " w" & vbCrLf
 
-    ' Horizontal boundaries: 26 lines for 25 rows.
+    ' Horizontal boundaries: 20 lines for 19 rows.
     For lngIndex = 0 To ROW_COUNT
         dblCurrentY = TABLE_TOP_Y - (CDbl(lngIndex) * ROW_HEIGHT)
         strContent = strContent & PdfNumber(TABLE_LEFT_X) & " " & PdfNumber(dblCurrentY) & " m " & PdfNumber(TABLE_RIGHT_X) & " " & PdfNumber(dblCurrentY) & " l S" & vbCrLf
@@ -277,6 +277,7 @@ Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Work
     Dim lngIndex As Long
     Dim lngSourceRow As Long
     Dim strContent As String
+    Dim strCurrency As String
     Dim strPageNumber As String
     Dim strValue As String
 
@@ -284,15 +285,15 @@ Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Work
 
     BuildSingleTransactionPageContent = vbNullString
 
-    arrColumns = Array( 1, 2, 5, 7, 9, 10, 11, 13, 16, 18, 19, 20, 1, 2, 4, 5, 8, 9, 12, 13, 15, 16, 19, 20, 21)
-    arrRowOffsets = Array( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+    arrColumns = Array( 1, 2, 5, 7, 9, 10, 11, 13, 16, 19, 20, 1, 2, 5, 9, 13, 16, 19, 21)
+    arrRowOffsets = Array( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1)
 
     If UBound(arrColumns) - LBound(arrColumns) + 1 <> ROW_COUNT Then
-        Err.Raise 1024, METHOD_NAME, "The fixed VALUE column map does not contain exactly 25 rows."
+        Err.Raise 1024, METHOD_NAME, "The fixed VALUE column map does not contain exactly 19 rows."
     End If
 
     If UBound(arrRowOffsets) - LBound(arrRowOffsets) + 1 <> ROW_COUNT Then
-        Err.Raise 1024, METHOD_NAME, "The fixed VALUE row map does not contain exactly 25 rows."
+        Err.Raise 1024, METHOD_NAME, "The fixed VALUE row map does not contain exactly 19 rows."
     End If
 
     dblValueAvailableWidth = TABLE_RIGHT_X - TABLE_DIVIDER_X - TEXT_LEFT_PADDING - VALUE_RIGHT_PADDING
@@ -305,6 +306,27 @@ Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Work
         End If
 
         strValue = GetWorksheetDisplayText(wksSource.Cells(lngSourceRow, CLng(arrColumns(lngIndex))))
+        strCurrency = vbNullString
+
+        Select Case lngIndex
+            Case 12
+                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 4))
+            Case 13
+                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 8))
+            Case 14
+                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 12))
+            Case 15
+                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 15))
+            Case 16
+                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngTopRow, 18))
+            Case 17
+                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 20))
+        End Select
+
+        If Len(strCurrency) > 0 Then
+            strValue = CombineValueWithCurrency(strValue, strCurrency)
+        End If
+
         dblBaselineY = TABLE_TOP_Y - (CDbl(lngIndex + 1) * ROW_HEIGHT) + TEXT_BASELINE_FROM_BOTTOM
         dblFontSize = ResolveValueFontSize(strValue, dblValueAvailableWidth)
         strContent = strContent & BuildTextCommand("/F1", dblFontSize, TABLE_DIVIDER_X + TEXT_LEFT_PADDING, dblBaselineY, strValue)
@@ -329,6 +351,43 @@ ErrorHandler:
     BuildSingleTransactionPageContent = vbNullString
 
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "topRow;bottomRow;pageNumber;pageCount;valueIndex", lngTopRow, lngBottomRow, lngPageNumber, lngPageCount, lngIndex
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Combines an already calculated/display-formatted amount with its confirmed
+' currency. If the amount is blank, no standalone currency is emitted.
+'-------------------------------------------------------------------------------
+Private Function CombineValueWithCurrency(ByVal strValue As String, ByVal strCurrency As String) As String
+    Const METHOD_NAME As String = "CombineValueWithCurrency"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    CombineValueWithCurrency = vbNullString
+    strValue = Trim$(strValue)
+    strCurrency = Trim$(strCurrency)
+
+    If Len(strValue) = 0 Then GoTo ExitFunction
+
+    If Len(strCurrency) > 0 Then
+        CombineValueWithCurrency = strValue & " " & strCurrency
+    Else
+        CombineValueWithCurrency = strValue
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    CombineValueWithCurrency = strValue
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "value;currency", strValue, strCurrency
     errorManager.save
     Resume ExitFunction
 End Function
@@ -1156,4 +1215,5 @@ ErrorHandler:
     errorManager.save
     Resume ExitSub
 End Sub
+
 
