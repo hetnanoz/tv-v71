@@ -1,6 +1,7 @@
 Option Explicit
 
 Private Const CLASS_NAME As String = "modKeyValuePdfExport"
+Private Const SETTLEMENT_CONVERSION_CONFIG_RANGE_NAME As String = "convert_costs_to_abrech_whg"
 Private Const PDF_HEADER As String = "%PDF-1.4"
 Private Const PDF_PAGE_WIDTH As Double = 1368#
 Private Const PDF_PAGE_HEIGHT As Double = 684#
@@ -49,6 +50,7 @@ Public Function GenerateKeyValuePdfFromWorksheet(ByVal targetPath As String, ByV
     Dim arrBottomRows() As Long
     Dim arrTopRows() As Long
     Dim blnFileOpened As Boolean
+    Dim blnSettlementCurrencyConversionEnabled As Boolean
     Dim colPageContents As Collection
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -75,6 +77,7 @@ Public Function GenerateKeyValuePdfFromWorksheet(ByVal targetPath As String, ByV
     End If
 
     wksSource.Calculate
+    blnSettlementCurrencyConversionEnabled = IsSettlementCurrencyConversionEnabled()
 
     If Not CollectTransactionRows(wksSource, arrTopRows, arrBottomRows, lngTradeCount) Then
         Err.Raise 1001, METHOD_NAME, "No transaction row pairs were found in the report worksheet."
@@ -88,7 +91,7 @@ Public Function GenerateKeyValuePdfFromWorksheet(ByVal targetPath As String, ByV
         Err.Raise 1024, METHOD_NAME, "The shared static key-value PDF content could not be built."
     End If
 
-    If Not BuildAllPageContents(wksSource, arrTopRows, arrBottomRows, lngTradeCount, colPageContents) Then
+    If Not BuildAllPageContents(wksSource, arrTopRows, arrBottomRows, lngTradeCount, blnSettlementCurrencyConversionEnabled, colPageContents) Then
         Err.Raise 1024, METHOD_NAME, "The dynamic key-value PDF page contents could not be built."
     End If
 
@@ -215,7 +218,7 @@ End Function
 ' Builds only the dynamic content stream for each transaction. The immutable
 ' logo/table/KEY layer is stored once and shared by every PDF page.
 '-------------------------------------------------------------------------------
-Private Function BuildAllPageContents( ByVal wksSource As Excel.Worksheet, ByRef arrTopRows() As Long, ByRef arrBottomRows() As Long, ByVal lngTradeCount As Long, ByRef colPageContents As Collection) As Boolean
+Private Function BuildAllPageContents(ByVal wksSource As Excel.Worksheet, ByRef arrTopRows() As Long, ByRef arrBottomRows() As Long, ByVal lngTradeCount As Long, ByVal blnSettlementCurrencyConversionEnabled As Boolean, ByRef colPageContents As Collection) As Boolean
 
     Const METHOD_NAME As String = "BuildAllPageContents"
     Dim errorManager As New ErrorManager
@@ -234,7 +237,7 @@ Private Function BuildAllPageContents( ByVal wksSource As Excel.Worksheet, ByRef
     End If
 
     For lngTradeIndex = 1 To lngTradeCount
-        strPageContent = BuildSingleTransactionPageContent(wksSource, arrTopRows(lngTradeIndex), arrBottomRows(lngTradeIndex), lngTradeIndex, lngTradeCount)
+        strPageContent = BuildSingleTransactionPageContent(wksSource, arrTopRows(lngTradeIndex), arrBottomRows(lngTradeIndex), lngTradeIndex, lngTradeCount, blnSettlementCurrencyConversionEnabled)
 
         If Len(strPageContent) = 0 Then
             Err.Raise 1024, METHOD_NAME, "A key-value page content stream was empty for transaction " & CStr(lngTradeIndex) & "."
@@ -262,11 +265,13 @@ End Function
 ' Builds only page-specific VALUE text, pagination and the optional final footer.
 ' The table geometry, logo and KEY labels are supplied by the shared static stream.
 '-------------------------------------------------------------------------------
-Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Worksheet, ByVal lngTopRow As Long, ByVal lngBottomRow As Long, ByVal lngPageNumber As Long, ByVal lngPageCount As Long) As String
+Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Worksheet, ByVal lngTopRow As Long, ByVal lngBottomRow As Long, ByVal lngPageNumber As Long, ByVal lngPageCount As Long, ByVal blnSettlementCurrencyConversionEnabled As Boolean) As String
 
     Const METHOD_NAME As String = "BuildSingleTransactionPageContent"
     Dim arrColumns As Variant
     Dim arrRowOffsets As Variant
+    Dim blnAmountConverted As Boolean
+    Dim blnConvertToSettlement As Boolean
     Dim dblBaselineY As Double
     Dim dblFontSize As Double
     Dim dblPageNumberX As Double
@@ -276,9 +281,12 @@ Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Work
     Dim errNumber As Long
     Dim lngIndex As Long
     Dim lngSourceRow As Long
+    Dim rngValueCell As Excel.Range
     Dim strContent As String
     Dim strCurrency As String
     Dim strPageNumber As String
+    Dim strSettlementCurrency As String
+    Dim strTransactionCurrency As String
     Dim strValue As String
 
     On Error GoTo ErrorHandler
@@ -297,6 +305,13 @@ Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Work
     End If
 
     dblValueAvailableWidth = TABLE_RIGHT_X - TABLE_DIVIDER_X - TEXT_LEFT_PADDING - VALUE_RIGHT_PADDING
+    strTransactionCurrency = GetWorksheetDisplayText(wksSource.Cells(lngTopRow, 18))
+    strSettlementCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 20))
+    blnConvertToSettlement = False
+
+    If blnSettlementCurrencyConversionEnabled Then
+        blnConvertToSettlement = ShouldConvertToSettlementCurrency(strTransactionCurrency, strSettlementCurrency)
+    End If
 
     For lngIndex = 0 To ROW_COUNT - 1
         If CLng(arrRowOffsets(lngIndex)) = 0 Then
@@ -305,22 +320,36 @@ Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Work
             lngSourceRow = lngBottomRow
         End If
 
-        strValue = GetWorksheetDisplayText(wksSource.Cells(lngSourceRow, CLng(arrColumns(lngIndex))))
+        Set rngValueCell = wksSource.Cells(lngSourceRow, CLng(arrColumns(lngIndex)))
+        strValue = GetWorksheetDisplayText(rngValueCell)
         strCurrency = vbNullString
 
         Select Case lngIndex
-            Case 12
-                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 4))
-            Case 13
-                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 8))
-            Case 14
-                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 12))
-            Case 15
-                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 15))
+            Case 10, 12, 13, 14, 15
+                blnAmountConverted = False
+
+                If blnConvertToSettlement Then
+                    strValue = ConvertAmountToSettlementCurrency(rngValueCell, wksSource.Cells(lngBottomRow, 21), blnAmountConverted)
+                End If
+
+                If blnAmountConverted Then
+                    strCurrency = strSettlementCurrency
+                Else
+                    Select Case lngIndex
+                        Case 12
+                            strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 4))
+                        Case 13
+                            strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 8))
+                        Case 14
+                            strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 12))
+                        Case 15
+                            strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 15))
+                    End Select
+                End If
             Case 16
-                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngTopRow, 18))
+                strCurrency = strTransactionCurrency
             Case 17
-                strCurrency = GetWorksheetDisplayText(wksSource.Cells(lngBottomRow, 20))
+                strCurrency = strSettlementCurrency
         End Select
 
         If Len(strCurrency) > 0 Then
@@ -330,6 +359,7 @@ Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Work
         dblBaselineY = TABLE_TOP_Y - (CDbl(lngIndex + 1) * ROW_HEIGHT) + TEXT_BASELINE_FROM_BOTTOM
         dblFontSize = ResolveValueFontSize(strValue, dblValueAvailableWidth)
         strContent = strContent & BuildTextCommand("/F1", dblFontSize, TABLE_DIVIDER_X + TEXT_LEFT_PADDING, dblBaselineY, strValue)
+        Set rngValueCell = Nothing
     Next lngIndex
 
     If lngPageNumber = lngPageCount Then
@@ -343,6 +373,7 @@ Private Function BuildSingleTransactionPageContent(ByVal wksSource As Excel.Work
     BuildSingleTransactionPageContent = strContent
 
 ExitFunction:
+    Set rngValueCell = Nothing
     Exit Function
 
 ErrorHandler:
@@ -351,6 +382,314 @@ ErrorHandler:
     BuildSingleTransactionPageContent = vbNullString
 
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "topRow;bottomRow;pageNumber;pageCount;valueIndex", lngTopRow, lngBottomRow, lngPageNumber, lngPageCount, lngIndex
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Reads the optional settlement-currency conversion switch from Tradeversand.
+' TRUE enables conversion for this client. FALSE, blank, missing or invalid values
+' preserve the previous PDF behavior without settlement-currency conversion.
+'-------------------------------------------------------------------------------
+Private Function IsSettlementCurrencyConversionEnabled() As Boolean
+    Const METHOD_NAME As String = "IsSettlementCurrencyConversionEnabled"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngBangPosition As Long
+    Dim objName As Excel.Name
+    Dim rngFlag As Excel.Range
+    Dim strCandidateName As String
+    Dim strFlag As String
+    Dim varFlag As Variant
+    Dim wksMacro As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    IsSettlementCurrencyConversionEnabled = False
+    Set wksMacro = ThisWorkbook.Worksheets("Tradeversand")
+    wksMacro.Calculate
+
+    For Each objName In ThisWorkbook.Names
+        strCandidateName = CStr(objName.Name)
+        lngBangPosition = InStrRev(strCandidateName, "!")
+
+        If lngBangPosition > 0 Then
+            strCandidateName = Mid$(strCandidateName, lngBangPosition + 1)
+        End If
+
+        strCandidateName = Replace$(strCandidateName, "'", vbNullString)
+
+        If StrComp(strCandidateName, SETTLEMENT_CONVERSION_CONFIG_RANGE_NAME, vbTextCompare) = 0 Then
+            Set rngFlag = objName.RefersToRange
+
+            If Not rngFlag Is Nothing Then
+                If StrComp(rngFlag.Parent.Name, wksMacro.Name, vbTextCompare) = 0 Then
+                    Exit For
+                End If
+            End If
+
+            Set rngFlag = Nothing
+        End If
+    Next objName
+
+    If rngFlag Is Nothing Then GoTo ExitFunction
+    If IsError(rngFlag.Value) Then GoTo ExitFunction
+
+    varFlag = rngFlag.Value2
+
+    If VarType(varFlag) = vbBoolean Then
+        IsSettlementCurrencyConversionEnabled = CBool(varFlag)
+        GoTo ExitFunction
+    End If
+
+    If IsNumeric(varFlag) Then
+        IsSettlementCurrencyConversionEnabled = (CDbl(varFlag) <> 0#)
+        GoTo ExitFunction
+    End If
+
+    strFlag = UCase$(Trim$(CStr(varFlag)))
+    IsSettlementCurrencyConversionEnabled = (strFlag = "TRUE" Or strFlag = "PRAWDA" Or strFlag = "YES" Or strFlag = "JA" Or strFlag = "1")
+
+ExitFunction:
+    Set objName = Nothing
+    Set rngFlag = Nothing
+    Set wksMacro = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    IsSettlementCurrencyConversionEnabled = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "configRange", SETTLEMENT_CONVERSION_CONFIG_RANGE_NAME
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Returns whether conversion is required after the optional worksheet switch has
+' enabled it. Conversion is required only when both currencies exist and differ.
+'-------------------------------------------------------------------------------
+Private Function ShouldConvertToSettlementCurrency(ByVal strTransactionCurrency As String, ByVal strSettlementCurrency As String) As Boolean
+    Const METHOD_NAME As String = "ShouldConvertToSettlementCurrency"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    ShouldConvertToSettlementCurrency = False
+    strTransactionCurrency = UCase$(Trim$(strTransactionCurrency))
+    strSettlementCurrency = UCase$(Trim$(strSettlementCurrency))
+
+    If Len(strTransactionCurrency) = 0 Then GoTo ExitFunction
+    If Len(strSettlementCurrency) = 0 Then GoTo ExitFunction
+
+    ShouldConvertToSettlementCurrency = (strTransactionCurrency <> strSettlementCurrency)
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ShouldConvertToSettlementCurrency = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "transactionCurrency;settlementCurrency", strTransactionCurrency, strSettlementCurrency
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Divides an already calculated amount by Devisenkurs for settlement-currency
+' presentation. Missing, non-numeric, zero or negative FX rates safely fall back
+' to 1, so PDF generation cannot fail because of an unusable Devisenkurs.
+'-------------------------------------------------------------------------------
+Private Function ConvertAmountToSettlementCurrency(ByVal rngAmount As Excel.Range, ByVal rngExchangeRate As Excel.Range, ByRef blnConversionApplied As Boolean) As String
+    Const METHOD_NAME As String = "ConvertAmountToSettlementCurrency"
+    Dim dblAmount As Double
+    Dim dblConvertedAmount As Double
+    Dim dblExchangeRate As Double
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strOriginalValue As String
+
+    On Error GoTo ErrorHandler
+
+    ConvertAmountToSettlementCurrency = vbNullString
+    blnConversionApplied = False
+    strOriginalValue = GetWorksheetDisplayText(rngAmount)
+
+    If Len(strOriginalValue) = 0 Then GoTo ExitFunction
+
+    If Not TryGetNumericCellValue(rngAmount, dblAmount) Then
+        ConvertAmountToSettlementCurrency = strOriginalValue
+        GoTo ExitFunction
+    End If
+
+    dblExchangeRate = GetSafeExchangeRate(rngExchangeRate)
+    dblConvertedAmount = dblAmount / dblExchangeRate
+    ConvertAmountToSettlementCurrency = FormatSettlementAmount(dblConvertedAmount)
+    blnConversionApplied = True
+
+ExitFunction:
+    Set rngAmount = Nothing
+    Set rngExchangeRate = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ConvertAmountToSettlementCurrency = strOriginalValue
+    blnConversionApplied = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "originalValue", strOriginalValue
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Reads Devisenkurs as a positive numeric value. A missing, invalid, zero or
+' negative value returns 1 as the explicit safe fallback requested for the PDF.
+'-------------------------------------------------------------------------------
+Private Function GetSafeExchangeRate(ByVal rngExchangeRate As Excel.Range) As Double
+    Const METHOD_NAME As String = "GetSafeExchangeRate"
+    Dim dblExchangeRate As Double
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    GetSafeExchangeRate = 1#
+
+    If rngExchangeRate Is Nothing Then GoTo ExitFunction
+    If Not TryGetNumericCellValue(rngExchangeRate, dblExchangeRate) Then GoTo ExitFunction
+    If dblExchangeRate <= 0# Then GoTo ExitFunction
+
+    GetSafeExchangeRate = dblExchangeRate
+
+ExitFunction:
+    Set rngExchangeRate = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetSafeExchangeRate = 1#
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Reads a numeric worksheet value without changing the report worksheet.
+' Numeric Excel cells are preferred; text values are normalized only as fallback.
+'-------------------------------------------------------------------------------
+Private Function TryGetNumericCellValue(ByVal rngCell As Excel.Range, ByRef dblValue As Double) As Boolean
+    Const METHOD_NAME As String = "TryGetNumericCellValue"
+    Dim blnHasDigit As Boolean
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngIndex As Long
+    Dim lngLastComma As Long
+    Dim lngLastDot As Long
+    Dim strCharacter As String
+    Dim strValue As String
+    Dim varValue As Variant
+
+    On Error GoTo ErrorHandler
+
+    TryGetNumericCellValue = False
+    dblValue = 0#
+
+    If rngCell Is Nothing Then GoTo ExitFunction
+    If IsError(rngCell.Value) Then GoTo ExitFunction
+
+    varValue = rngCell.Value2
+
+    If IsNumeric(varValue) Then
+        dblValue = CDbl(varValue)
+        TryGetNumericCellValue = True
+        GoTo ExitFunction
+    End If
+
+    strValue = Trim$(CStr(varValue))
+    If Len(strValue) = 0 Then GoTo ExitFunction
+
+    strValue = Replace$(strValue, Chr$(160), vbNullString)
+    strValue = Replace$(strValue, " ", vbNullString)
+    lngLastComma = InStrRev(strValue, ",")
+    lngLastDot = InStrRev(strValue, ".")
+
+    If lngLastComma > 0 And lngLastDot > 0 Then
+        If lngLastComma > lngLastDot Then
+            strValue = Replace$(strValue, ".", vbNullString)
+            strValue = Replace$(strValue, ",", ".")
+        Else
+            strValue = Replace$(strValue, ",", vbNullString)
+        End If
+    ElseIf lngLastComma > 0 Then
+        strValue = Replace$(strValue, ",", ".")
+    End If
+
+    For lngIndex = 1 To Len(strValue)
+        strCharacter = Mid$(strValue, lngIndex, 1)
+        If strCharacter >= "0" And strCharacter <= "9" Then
+            blnHasDigit = True
+            Exit For
+        End If
+    Next lngIndex
+
+    If Not blnHasDigit Then GoTo ExitFunction
+
+    dblValue = Val(strValue)
+    TryGetNumericCellValue = True
+
+ExitFunction:
+    Set rngCell = Nothing
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    TryGetNumericCellValue = False
+    dblValue = 0#
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "cellText", strValue
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Uses the monetary output format already used by the report for converted values.
+' Excel performs the formatting while the report process has its configured
+' decimal and thousands separators active.
+'-------------------------------------------------------------------------------
+Private Function FormatSettlementAmount(ByVal dblValue As Double) As String
+    Const METHOD_NAME As String = "FormatSettlementAmount"
+    Const SETTLEMENT_AMOUNT_FORMAT As String = "# ### ### ### ### ##0.00"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    FormatSettlementAmount = Application.WorksheetFunction.Text(dblValue, SETTLEMENT_AMOUNT_FORMAT)
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    FormatSettlementAmount = CStr(dblValue)
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "value", dblValue
     errorManager.save
     Resume ExitFunction
 End Function
