@@ -334,7 +334,6 @@ ExitSub:
         Application.StatusBar = varPreviousStatusBar
     End If
     If errNumber <> 0 Then
-        On Error GoTo 0
         VBA.Err.Raise errNumber, METHOD_NAME, errDescription
     End If
     Exit Sub
@@ -345,7 +344,8 @@ ErrorHandler:
 
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
     errorManager.save
-    Resume ExitSub
+    ' Keep this handler active so the preserved error can propagate to the caller after cleanup.
+    GoTo ExitSub
 End Sub
 
 '-------------------------------------------------------------------------------
@@ -437,9 +437,7 @@ Public Function getMappingFromFondsliste(ByVal folderPath As String, ByVal baseN
 ExitFunction:
     If Not wbMapping Is Nothing Then
         If Not wasAlreadyOpen Then
-            On Error Resume Next
-            wbMapping.Close SaveChanges:=False
-            On Error GoTo 0
+            Call CloseWorkbookNoSaveSafe(wbMapping, METHOD_NAME)
         End If
     End If
     Set wsMapping = Nothing
@@ -632,9 +630,7 @@ nextRow:
 
 ExitSub:
     If Not wbOut Is Nothing Then
-        On Error Resume Next
-        wbOut.Close SaveChanges:=False
-        On Error GoTo 0
+        Call CloseWorkbookNoSaveSafe(wbOut, METHOD_NAME)
     End If
     Set wksMacro = Nothing
     Set wsOut = Nothing
@@ -644,7 +640,6 @@ ExitSub:
         Application.DisplayAlerts = blnPreviousDisplayAlerts
     End If
     If errNumber <> 0 Then
-        On Error GoTo 0
         VBA.Err.Raise errNumber, METHOD_NAME, errDescription
     End If
     Exit Sub
@@ -664,7 +659,8 @@ ErrorHandler:
         pPdf, _
         blnRawOraclePdfEnabled
     errorManager.save
-    Resume ExitSub
+    ' Keep this handler active so the preserved error can propagate to the caller after cleanup.
+    GoTo ExitSub
 End Sub
 
 '-------------------------------------------------------------------------------
@@ -1330,12 +1326,7 @@ ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
 
-    Set fso = CreateObject("Scripting.FileSystemObject")
-    On Error Resume Next
-    If Dir(srcFolder & "*.*") <> vbNullString Then
-        fso.CopyFile srcFolder & "*.*", dstFolder, True
-    End If
-    On Error GoTo 0
+    Call CopyFilesFallbackSafe(srcFolder, dstFolder, METHOD_NAME)
 
     errorManager.addError _
         CLASS_NAME, _
@@ -1445,9 +1436,7 @@ Public Function prepareGlobalMappingV2(ByRef wsMap As Excel.Worksheet) As Object
 
 ExitFunction:
     If Not wbMapping Is Nothing Then
-        On Error Resume Next
-        wbMapping.Close SaveChanges:=False
-        On Error GoTo 0
+        Call CloseWorkbookNoSaveSafe(wbMapping, METHOD_NAME)
     End If
     Set wbMapping = Nothing
     Set dict = Nothing
@@ -1657,9 +1646,7 @@ Public Sub RemovePdfAClaimFromPdf(ByVal pdfPath As String)
 
 ExitSub:
     If fileNum > 0 Then
-        On Error Resume Next
-        Close #fileNum
-        On Error GoTo 0
+        Call CloseFileNumberSafe(fileNum, METHOD_NAME)
     End If
     Exit Sub
 
@@ -2669,9 +2656,9 @@ nextFfyRow:
         Next r
 
 ExitSub:
-        On Error Resume Next
-        If fileNum > 0 Then Close #fileNum
-        On Error GoTo 0
+    If fileNum > 0 Then
+        Call CloseFileNumberSafe(fileNum, METHOD_NAME)
+    End If
     Exit Sub
 
 ErrorHandler:
@@ -2766,9 +2753,9 @@ nextRow:
     End If
 
 ExitSub:
-    On Error Resume Next
-    If fileNum > 0 Then Close #fileNum
-    On Error GoTo 0
+    If fileNum > 0 Then
+        Call CloseFileNumberSafe(fileNum, METHOD_NAME)
+    End If
     Exit Sub
 
 ErrorHandler:
@@ -3185,6 +3172,109 @@ End Function
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
+' Creation date: 2026-08-14
+' Parameters:    ByVal workbookToClose As Excel.Workbook, ByVal callerMethod As String
+' Returns:       ---
+' Description:   Closes a workbook without saving and logs cleanup failures using BAT error handling.
+'-------------------------------------------------------------------------------
+Private Sub CloseWorkbookNoSaveSafe(ByVal workbookToClose As Excel.Workbook, ByVal callerMethod As String)
+    Const METHOD_NAME As String = "CloseWorkbookNoSaveSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim workbookName As String
+
+    On Error GoTo ErrorHandler
+
+    If workbookToClose Is Nothing Then GoTo ExitSub
+
+    workbookName = workbookToClose.Name
+    workbookToClose.Close SaveChanges:=False
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod;workbookName", callerMethod, workbookName
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-14
+' Parameters:    ByRef fileNum As Long, ByVal callerMethod As String
+' Returns:       ---
+' Description:   Closes an open VBA file number and logs cleanup failures using BAT error handling.
+'-------------------------------------------------------------------------------
+Private Sub CloseFileNumberSafe(ByRef fileNum As Long, ByVal callerMethod As String)
+    Const METHOD_NAME As String = "CloseFileNumberSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileNumberToClose As Long
+
+    On Error GoTo ErrorHandler
+
+    If fileNum <= 0 Then GoTo ExitSub
+
+    fileNumberToClose = fileNum
+    Close #fileNum
+    fileNum = 0
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    fileNum = 0
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod;fileNum", callerMethod, fileNumberToClose
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-14
+' Parameters:    ByVal srcFolder As String, ByVal dstFolder As String, ByVal callerMethod As String
+' Returns:       ---
+' Description:   Performs the legacy FileSystemObject fallback copy with BAT-compliant error handling.
+'-------------------------------------------------------------------------------
+Private Sub CopyFilesFallbackSafe(ByVal srcFolder As String, ByVal dstFolder As String, ByVal callerMethod As String)
+    Const METHOD_NAME As String = "CopyFilesFallbackSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fso As Object
+
+    On Error GoTo ErrorHandler
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    If Dir(srcFolder & "*.*") <> vbNullString Then
+        fso.CopyFile srcFolder & "*.*", dstFolder, True
+    End If
+
+ExitSub:
+    Set fso = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod;srcFolder;dstFolder", callerMethod, srcFolder, dstFolder
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
 ' Creation date: 2026-08-04
 ' Parameters:    ByVal csvFullPath As String, ByVal pdfFullPath As String
 ' Returns:       ---
@@ -3256,9 +3346,7 @@ Public Sub convertFfyCsvToPdf(ByVal csvFullPath As String, ByVal pdfFullPath As 
 
 ExitSub:
     If Not wbCsv Is Nothing Then
-        On Error Resume Next
-        wbCsv.Close SaveChanges:=False
-        On Error GoTo 0
+        Call CloseWorkbookNoSaveSafe(wbCsv, METHOD_NAME)
     End If
     Set wsCsv = Nothing
     Set wbCsv = Nothing
@@ -3266,7 +3354,6 @@ ExitSub:
         Application.DisplayAlerts = blnPreviousDisplayAlerts
     End If
     If errNumber <> 0 Then
-        On Error GoTo 0
         VBA.Err.Raise errNumber, METHOD_NAME, errDescription
     End If
     Exit Sub
@@ -3284,7 +3371,8 @@ ErrorHandler:
         csvFullPath, _
         pdfFullPath
     errorManager.save
-    Resume ExitSub
+    ' Keep this handler active so the preserved error can propagate to the caller after cleanup.
+    GoTo ExitSub
 End Sub
 
 
