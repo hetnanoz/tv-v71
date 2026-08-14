@@ -5,9 +5,9 @@ Private Const PDF_HEADER As String = "%PDF-1.4"
 Private Const PDF_PAGE_WIDTH As Double = 1368#
 Private Const PDF_PAGE_HEIGHT As Double = 684#
 Private Const LOGO_X As Double = 40.52
-Private Const LOGO_Y As Double = 654#
-Private Const LOGO_WIDTH As Double = 85.52
-Private Const LOGO_HEIGHT As Double = 17.96
+Private Const LOGO_Y As Double = 645.02#
+Private Const LOGO_WIDTH As Double = 111.18
+Private Const LOGO_HEIGHT As Double = 26.94
 
 Private Const TABLE_LEFT_X As Double = 40.52
 Private Const TABLE_DIVIDER_X As Double = 365.04
