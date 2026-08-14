@@ -530,7 +530,7 @@ Private Function ConvertAmountToSettlementCurrency(ByVal rngAmount As Excel.Rang
     End If
 
     dblExchangeRate = GetSafeExchangeRate(rngExchangeRate)
-    dblConvertedAmount = dblAmount / dblExchangeRate
+    dblConvertedAmount = RoundUpSettlementAmountToTwoDecimals(dblAmount / dblExchangeRate)
     ConvertAmountToSettlementCurrency = FormatSettlementAmount(dblConvertedAmount)
     blnConversionApplied = True
 
@@ -546,6 +546,34 @@ ErrorHandler:
     blnConversionApplied = False
 
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "originalValue", strOriginalValue
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Rounds converted settlement-currency values upward to exactly two decimals.
+' Excel ROUNDUP is used deliberately, so any non-zero fraction beyond the second
+' decimal increases the absolute amount, e.g. 0.2000001 becomes 0.21.
+'-------------------------------------------------------------------------------
+Private Function RoundUpSettlementAmountToTwoDecimals(ByVal dblValue As Double) As Double
+    Const METHOD_NAME As String = "RoundUpSettlementAmountToTwoDecimals"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    RoundUpSettlementAmountToTwoDecimals = Application.WorksheetFunction.RoundUp(dblValue, 2)
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    RoundUpSettlementAmountToTwoDecimals = dblValue
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "value", dblValue
     errorManager.save
     Resume ExitFunction
 End Function
