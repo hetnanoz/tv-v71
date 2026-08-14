@@ -7,13 +7,12 @@ Private Const CLASS_NAME As String = "modEmailSender"
 ' Creation date: 2026-08-05
 ' Parameters:    ---
 ' Returns:       ---
-' Description:   Creates, sends or displays configured Tradeversand e-mails and archives their attachments.
+' Description:   Creates and displays configured Tradeversand e-mails and archives their attachments. Automatic sending is disabled.
 '-------------------------------------------------------------------------------
 Public Sub processAndSendTradeversand()
     Const METHOD_NAME As String = "processAndSendTradeversand"
     Dim attachFfy As Boolean
     Dim attachFfyPdf As Boolean
-    Dim autoSend As Boolean
     Dim blnStatusBarCaptured As Boolean
     Dim bodyText As String
     Dim clientName As String
@@ -74,7 +73,6 @@ Public Sub processAndSendTradeversand()
         inclPdf = getSafeBoolean(.Range("create_pdf_file").Value)
         inclXlsx = getSafeBoolean(.Range("create_xlsx_file").Value)
         inclCsv = getSafeBoolean(.Range("create_csv_file").Value)
-        autoSend = getSafeBoolean(.Range("auto_email").Value)
         separateMails = getSafeBoolean(.Range("csv_pdf_separate_emails").Value)
         inclFfy = getSafeBoolean(.Range("create_ffy_csv_file").Value)
         attachFfy = getSafeBoolean(.Range("attach_ffy_to_email").Value)
@@ -124,32 +122,12 @@ Public Sub processAndSendTradeversand()
             jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", clientName)
         End If
 
-        totalMoved = totalMoved + sendFilesBatched( _
-            fso, _
-            outApp, _
-            senderEmail, _
-            recipTo, _
-            recipCc, _
-            emailTitle, _
-            bodyText, _
-            jobs, _
-            maxAtt, _
-            autoSend)
+        totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
     Else
         If inclCsv Then
             Set jobs = New Collection
             jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", clientName, csvRequireSubstring, csvExcludeSubstring)
-            totalMoved = totalMoved + sendFilesBatched( _
-                fso, _
-                outApp, _
-                senderEmail, _
-                recipTo, _
-                recipCc, _
-                emailTitle, _
-                bodyText, _
-                jobs, _
-                maxAtt, _
-                autoSend)
+            totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
         End If
 
         If inclPdf Or inclXlsx Or attachFfyPdf Then
@@ -163,17 +141,7 @@ Public Sub processAndSendTradeversand()
                 jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", clientName)
             End If
 
-            totalMoved = totalMoved + sendFilesBatched( _
-                fso, _
-                outApp, _
-                senderEmail, _
-                recipTo, _
-                recipCc, _
-                emailTitle, _
-                bodyText, _
-                jobs, _
-                maxAtt, _
-                autoSend)
+            totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
         End If
     End If
 
@@ -192,13 +160,7 @@ ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "clientName", _
-        clientName
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "clientName", clientName
     errorManager.save
     errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
     Resume ExitSub
@@ -211,14 +173,11 @@ End Sub
 ' Returns:       ---
 ' Description:   Sends and archives reports for a parent client and its configured child client.
 '-------------------------------------------------------------------------------
-Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, _
-                                                ByVal childName As String, _
-                                                Optional ByVal useChildOwnPaths As Boolean = False)
+Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVal childName As String, Optional ByVal useChildOwnPaths As Boolean = False)
     Const METHOD_NAME As String = "processAndSendTradeversand_withChild"
     Dim allowedPrefixes As String
     Dim attachFfy As Boolean
     Dim attachFfyPdf As Boolean
-    Dim autoSend As Boolean
     Dim blnStatusBarCaptured As Boolean
     Dim bodyText As String
     Dim childOnlyPrefix As String
@@ -288,7 +247,6 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, _
         inclPdf = getSafeBoolean(.Range("create_pdf_file").Value)
         inclXlsx = getSafeBoolean(.Range("create_xlsx_file").Value)
         inclCsv = getSafeBoolean(.Range("create_csv_file").Value)
-        autoSend = getSafeBoolean(.Range("auto_email").Value)
         separateMails = getSafeBoolean(.Range("csv_pdf_separate_emails").Value)
         inclFfy = getSafeBoolean(.Range("create_ffy_csv_file").Value)
         attachFfy = getSafeBoolean(.Range("attach_ffy_to_email").Value)
@@ -395,17 +353,7 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, _
             End If
         End If
 
-        totalMoved = totalMoved + sendFilesBatched( _
-            fso, _
-            outApp, _
-            senderEmail, _
-            recipTo, _
-            recipCc, _
-            emailTitle, _
-            bodyText, _
-            jobs, _
-            maxAtt, _
-            autoSend)
+        totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
     Else
         If inclCsv Then
             Set jobs = New Collection
@@ -417,17 +365,7 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, _
                 jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", allowedPrefixes, csvRequireSubstring, csvExcludeSubstring)
             End If
 
-            totalMoved = totalMoved + sendFilesBatched( _
-                fso, _
-                outApp, _
-                senderEmail, _
-                recipTo, _
-                recipCc, _
-                emailTitle, _
-                bodyText, _
-                jobs, _
-                maxAtt, _
-                autoSend)
+            totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
         End If
 
         If inclPdf Or inclXlsx Or attachFfyPdf Then
@@ -459,17 +397,7 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, _
                 End If
             End If
 
-            totalMoved = totalMoved + sendFilesBatched( _
-                fso, _
-                outApp, _
-                senderEmail, _
-                recipTo, _
-                recipCc, _
-                emailTitle, _
-                bodyText, _
-                jobs, _
-                maxAtt, _
-                autoSend)
+            totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
         End If
     End If
 
@@ -494,15 +422,7 @@ ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "parentName;childName;useChildOwnPaths", _
-        parentName, _
-        childName, _
-        useChildOwnPaths
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "parentName;childName;useChildOwnPaths", parentName, childName, useChildOwnPaths
     errorManager.save
     errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
     Resume ExitSub
@@ -515,48 +435,33 @@ End Sub
 ' Returns:       Variant
 ' Description:   Creates one attachment and archive job definition.
 '-------------------------------------------------------------------------------
-Private Function makeJob(ByRef fso As Object, _
-                         ByVal sPath As String, _
-                         ByVal aPath As String, _
-                         ByVal ext As String, _
-                         ByVal clientName As String, _
-                         Optional ByVal requireSubstring As String = vbNullString, _
-                         Optional ByVal excludeSubstring As String = vbNullString) As Variant
+Private Function makeJob(ByRef fso As Object, ByVal sPath As String, ByVal aPath As String, ByVal ext As String, ByVal clientName As String, Optional ByVal requireSubstring As String = vbNullString, Optional ByVal excludeSubstring As String = vbNullString) As Variant
     Const METHOD_NAME As String = "makeJob"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
+    Dim isRethrowing As Boolean
 
     On Error GoTo ErrorHandler
 
-    makeJob = Array( _
-        sPath, _
-        aPath, _
-        ext, _
-        collectFiles(fso, sPath, ext, clientName, requireSubstring, excludeSubstring))
+    makeJob = Array(sPath, aPath, ext, collectFiles(fso, sPath, ext, clientName, requireSubstring, excludeSubstring))
 
 ExitFunction:
     If errNumber <> 0 Then
-        On Error GoTo 0
+        isRethrowing = True
         VBA.Err.Raise errNumber, METHOD_NAME, errDescription
     End If
     Exit Function
 
 ErrorHandler:
+    If isRethrowing Then
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
     makeJob = Empty
-
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "sourcePath;archivePath;extension;clientName", _
-        sPath, _
-        aPath, _
-        ext, _
-        clientName
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "sourcePath;archivePath;extension;clientName", sPath, aPath, ext, clientName
     errorManager.save
     Resume ExitFunction
 End Function
@@ -568,12 +473,7 @@ End Function
 ' Returns:       Collection
 ' Description:   Returns files matching the configured extension, prefixes and substring filters.
 '-------------------------------------------------------------------------------
-Private Function collectFiles(ByRef fsoObj As Object, _
-                              ByVal sPath As String, _
-                              ByVal ext As String, _
-                              ByVal clientName As String, _
-                              ByVal requireSubstring As String, _
-                              ByVal excludeSubstring As String) As Collection
+Private Function collectFiles(ByRef fsoObj As Object, ByVal sPath As String, ByVal ext As String, ByVal clientName As String, ByVal requireSubstring As String, ByVal excludeSubstring As String) As Collection
     Const METHOD_NAME As String = "collectFiles"
     Dim allowedPrefixes() As String
     Dim errorManager As New ErrorManager
@@ -654,15 +554,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     Set collectFiles = result
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "sourcePath;extension;clientName", _
-        sPath, _
-        ext, _
-        clientName
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "sourcePath;extension;clientName", sPath, ext, clientName
     errorManager.save
     Resume ExitFunction
 End Function
@@ -670,20 +562,11 @@ End Function
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-05
-' Parameters:    fso As Object, outApp As Object, sFrom As String, sTo As String, sCc As String, sSub As String, sBody As String, jobs As Collection, maxAtt As Long, autoSend As Boolean
+' Parameters:    fso As Object, outApp As Object, sFrom As String, sTo As String, sCc As String, sSub As String, sBody As String, jobs As Collection, maxAtt As Long
 ' Returns:       Long
 ' Description:   Creates attachment batches, finalizes their e-mails and archives the source files.
 '-------------------------------------------------------------------------------
-Private Function sendFilesBatched(ByRef fso As Object, _
-                                  ByRef outApp As Object, _
-                                  ByVal sFrom As String, _
-                                  ByVal sTo As String, _
-                                  ByVal sCc As String, _
-                                  ByVal sSub As String, _
-                                  ByVal sBody As String, _
-                                  ByRef jobs As Collection, _
-                                  ByVal maxAtt As Long, _
-                                  ByVal autoSend As Boolean) As Long
+Private Function sendFilesBatched(ByRef fso As Object, ByRef outApp As Object, ByVal sFrom As String, ByVal sTo As String, ByVal sCc As String, ByVal sSub As String, ByVal sBody As String, ByRef jobs As Collection, ByVal maxAtt As Long) As Long
     Const METHOD_NAME As String = "sendFilesBatched"
     Dim allFiles As Collection
     Dim batchIndex As Long
@@ -758,17 +641,12 @@ Private Function sendFilesBatched(ByRef fso As Object, _
             mailItem.Attachments.Add CStr(allFiles(fileIndex))
         Next fileIndex
 
-        Call finalizeMail(mailItem, autoSend)
+        Call finalizeMail(mailItem)
     Next batchIndex
 
     For Each job In jobs
         Set jobFiles = job(3)
-        moved = moved + archiveJob( _
-            fso, _
-            jobFiles, _
-            CStr(job(0)), _
-            CStr(job(1)), _
-            CStr(job(2)))
+        moved = moved + archiveJob( fso, jobFiles, CStr(job(0)), CStr(job(1)), CStr(job(2)))
     Next job
 
     sendFilesBatched = moved
@@ -785,16 +663,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     sendFilesBatched = moved
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "subject;maxAttachments;autoSend;movedCount", _
-        sSub, _
-        maxAtt, _
-        autoSend, _
-        moved
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "subject;maxAttachments;movedCount", sSub, maxAtt, moved
     errorManager.save
     Resume ExitFunction
 End Function
@@ -806,11 +675,7 @@ End Function
 ' Returns:       Long
 ' Description:   Moves one job's source files to its dated archive folder.
 '-------------------------------------------------------------------------------
-Private Function archiveJob(ByRef fsoObj As Object, _
-                            ByRef filesColl As Collection, _
-                            ByVal sPath As String, _
-                            ByVal aPath As String, _
-                            ByVal ext As String) As Long
+Private Function archiveJob(ByRef fsoObj As Object, ByRef filesColl As Collection, ByVal sPath As String, ByVal aPath As String, ByVal ext As String) As Long
     Const METHOD_NAME As String = "archiveJob"
     Dim baseName As String
     Dim dest As String
@@ -842,10 +707,7 @@ Private Function archiveJob(ByRef fsoObj As Object, _
     End If
 
     If Len(aPath) > 0 And aPath <> "\" Then
-        dynamicArchivePath = aPath & _
-                             Format$(Date, "yyyy") & "\" & _
-                             Format$(Date, "mm") & "\" & _
-                             Format$(Date, "dd") & "\"
+        dynamicArchivePath = aPath & Format$(Date, "yyyy") & "\" & Format$(Date, "mm") & "\" & Format$(Date, "dd") & "\"
         Call ensureFolderExists(fsoObj, dynamicArchivePath)
         aPath = dynamicArchivePath
         isArchiveReady = True
@@ -906,16 +768,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     archiveJob = movedCounter
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "sourcePath;archivePath;extension;movedCount", _
-        sPath, _
-        aPath, _
-        ext, _
-        movedCounter
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "sourcePath;archivePath;extension;movedCount", sPath, aPath, ext, movedCounter
     errorManager.save
     Resume ExitFunction
 End Function
@@ -927,12 +780,7 @@ End Function
 ' Returns:       Object
 ' Description:   Creates an Outlook mail item with the configured sender, recipients and subject.
 '-------------------------------------------------------------------------------
-Private Function createBaseMail(ByRef outApp As Object, _
-                                ByVal sFrom As String, _
-                                ByVal sTo As String, _
-                                ByVal sCc As String, _
-                                ByVal sSub As String, _
-                                ByVal sBody As String) As Object
+Private Function createBaseMail(ByRef outApp As Object, ByVal sFrom As String, ByVal sTo As String, ByVal sCc As String, ByVal sSub As String, ByVal sBody As String) As Object
     Const METHOD_NAME As String = "createBaseMail"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -952,9 +800,7 @@ Private Function createBaseMail(ByRef outApp As Object, _
         .Cc = sCc
         .Subject = sSub
         .Sensitivity = 1
-        .PropertyAccessor.SetProperty _
-            "http://schemas.microsoft.com/mapi/string/{00020386-0000-0000-C000-000000000046}/msip_labels", _
-            "MSIP_Label_"
+        .PropertyAccessor.SetProperty "http://schemas.microsoft.com/mapi/string/{00020386-0000-0000-C000-000000000046}/msip_labels", "MSIP_Label_"
     End With
 
     Set createBaseMail = outMail
@@ -968,13 +814,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     Set createBaseMail = Nothing
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "subject", _
-        sSub
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "subject", sSub
     errorManager.save
     Resume ExitFunction
 End Function
@@ -982,11 +822,11 @@ End Function
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-05
-' Parameters:    mailObj As Object, bAuto As Boolean
+' Parameters:    mailObj As Object
 ' Returns:       ---
-' Description:   Adds the configured HTML body and sends or displays the mail item.
+' Description:   Adds the configured HTML body and displays the mail item for manual review and sending.
 '-------------------------------------------------------------------------------
-Private Sub finalizeMail(ByRef mailObj As Object, ByVal bAuto As Boolean)
+Private Sub finalizeMail(ByRef mailObj As Object)
     Const METHOD_NAME As String = "finalizeMail"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -1000,14 +840,8 @@ Private Sub finalizeMail(ByRef mailObj As Object, ByVal bAuto As Boolean)
 
     mailObj.Display
     formattedBody = Replace$(CStr(wsMacro.Range("email_body").Value), vbLf, "<br>")
-    mailObj.HTMLBody = "<p style='font-family:Arial; font-size:11pt;'>" & _
-                       formattedBody & _
-                       "</p><br>" & _
-                       mailObj.HTMLBody
+    mailObj.HTMLBody = "<p style='font-family:Arial; font-size:11pt;'>" & formattedBody & "</p><br>" & mailObj.HTMLBody
 
-    If bAuto Then
-        mailObj.Send
-    End If
 
 ExitSub:
     Set wsMacro = Nothing
@@ -1017,13 +851,7 @@ ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "autoSend", _
-        bAuto
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
     errorManager.save
     Resume ExitSub
 End Sub
@@ -1054,14 +882,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     tryRename = False
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "sourcePath;destinationPath", _
-        srcPath, _
-        destPath
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "sourcePath;destinationPath", srcPath, destPath
     errorManager.save
     Resume ExitFunction
 End Function
@@ -1073,9 +894,7 @@ End Function
 ' Returns:       Boolean
 ' Description:   Attempts to move a file through FileSystemObject.
 '-------------------------------------------------------------------------------
-Private Function tryMoveFile(ByRef fsoObj As Object, _
-                             ByVal srcPath As String, _
-                             ByVal destPath As String) As Boolean
+Private Function tryMoveFile(ByRef fsoObj As Object, ByVal srcPath As String, ByVal destPath As String) As Boolean
     Const METHOD_NAME As String = "tryMoveFile"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -1094,14 +913,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     tryMoveFile = False
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "sourcePath;destinationPath", _
-        srcPath, _
-        destPath
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "sourcePath;destinationPath", srcPath, destPath
     errorManager.save
     Resume ExitFunction
 End Function
@@ -1149,13 +961,7 @@ ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "folderPath", _
-        folderPath
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "folderPath", folderPath
     errorManager.save
     Resume ExitSub
 End Sub
@@ -1191,11 +997,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     formatFolderPath = vbNullString
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
     errorManager.save
     Resume ExitFunction
 End Function
@@ -1217,10 +1019,7 @@ Private Function getSafeBoolean(ByVal v As Variant) As Boolean
     On Error GoTo ErrorHandler
 
     upperValue = UCase$(Trim$(CStr(v)))
-    getSafeBoolean = upperValue = "TRUE" _
-                     Or upperValue = "1" _
-                     Or upperValue = "PRAWDA" _
-                     Or upperValue = "TAK"
+    getSafeBoolean = upperValue = "TRUE" Or upperValue = "1" Or upperValue = "PRAWDA" Or upperValue = "TAK"
 
 ExitFunction:
     Exit Function
@@ -1230,11 +1029,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     getSafeBoolean = False
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
     errorManager.save
     Resume ExitFunction
 End Function
@@ -1268,11 +1063,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     getSafeLong = 0
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
     errorManager.save
     Resume ExitFunction
 End Function
@@ -1284,9 +1075,7 @@ End Function
 ' Returns:       ---
 ' Description:   Moves files of one extension through Robocopy.
 '-------------------------------------------------------------------------------
-Private Sub fastMoveFiles(ByVal srcFolder As String, _
-                          ByVal dstFolder As String, _
-                          ByVal ext As String)
+Private Sub fastMoveFiles(ByVal srcFolder As String, ByVal dstFolder As String, ByVal ext As String)
     Const METHOD_NAME As String = "fastMoveFiles"
     Dim cmd As String
     Dim dstTrimmed As String
@@ -1309,8 +1098,7 @@ Private Sub fastMoveFiles(ByVal srcFolder As String, _
         dstTrimmed = Left$(dstTrimmed, Len(dstTrimmed) - 1)
     End If
 
-    cmd = "robocopy """ & srcTrimmed & """ """ & dstTrimmed & """ ""*." & ext & """ " & _
-          "/MOV /MT:8 /R:1 /W:1 /NP /NJH /NJS /NDL /NC /NS /NFL"
+    cmd = "robocopy """ & srcTrimmed & """ """ & dstTrimmed & """ ""*." & ext & """ " & "/MOV /MT:8 /R:1 /W:1 /NP /NJH /NJS /NDL /NC /NS /NFL"
 
     Set shell = CreateObject("WScript.Shell")
     shell.Run cmd, 0, True
@@ -1323,15 +1111,7 @@ ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "sourceFolder;destinationFolder;extension", _
-        srcFolder, _
-        dstFolder, _
-        ext
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "sourceFolder;destinationFolder;extension", srcFolder, dstFolder, ext
     errorManager.save
     Resume ExitSub
 End Sub
@@ -1343,9 +1123,7 @@ End Sub
 ' Returns:       Long
 ' Description:   Counts files with the requested extension in a folder.
 '-------------------------------------------------------------------------------
-Private Function countFilesByExt(ByRef fsoObj As Object, _
-                                 ByVal folderPath As String, _
-                                 ByVal ext As String) As Long
+Private Function countFilesByExt(ByRef fsoObj As Object, ByVal folderPath As String, ByVal ext As String) As Long
     Const METHOD_NAME As String = "countFilesByExt"
     Dim countValue As Long
     Dim errorManager As New ErrorManager
@@ -1383,14 +1161,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     countFilesByExt = 0
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "folderPath;extension", _
-        folderPath, _
-        ext
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "folderPath;extension", folderPath, ext
     errorManager.save
     Resume ExitFunction
 End Function
