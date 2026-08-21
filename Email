@@ -1,0 +1,13 @@
+I have regenerated the PDF examples for the same four test funds and have also included one consolidated CSV file containing the corresponding transactions:
+F00865 – FX scenario with different trade and settlement currencies
+F01555 – Storno transactions
+F01564 – transactions with Stückzinsen
+F01568 – additional multi-transaction test case
+For F00865, I have additionally attached both PDF variants once again:
+Trade Currency version – fees and costs shown in the trade currency
+Settlement Currency version – fees and costs converted into the settlement currency
+This should allow you to compare the functional results in the PDF and CSV formats in parallel and also confirm which currency treatment you would prefer for FX transactions going forward.
+I also have two additional questions regarding the final production setup:
+In the CSV file, column O contains the FX rate (Devisenkurs). Do you have any specific requirement regarding the number of decimal places for this field? For example, should the FX rate be limited to a fixed or maximum number of decimal places, or should we retain the full available precision?
+Furthermore, could you please confirm whether Free of Payment transactions should be included in the final daily CSV and PDF files, or whether these transactions should be excluded?
+Please let me know if you notice any other differences or if any further adjustments are required.
