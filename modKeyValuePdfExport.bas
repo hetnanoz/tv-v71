@@ -35,6 +35,50 @@ Private Const FOOTER_Y As Double = 40#
 Private Const FOOTER_FONT_SIZE As Double = 9#
 Private Const FOOTER_TEXT As String = "Diese Abrechnung wurde maschinell erstellt und ist ohne eigenhaendige Unterschrift gueltig"
 
+Private mblnLogoCacheReady As Boolean
+Private mblnStaticContentCacheReady As Boolean
+Private mlngCachedLogoComponents As Long
+Private mlngCachedLogoHeight As Long
+Private mlngCachedLogoWidth As Long
+Private mstrCachedLogoHex As String
+Private mstrCachedLogoPath As String
+Private mstrCachedStaticContent As String
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-21
+' Parameters:    ---
+' Returns:       ---
+' Description:   Clears client-specific Key-Value PDF cache data before a new
+'                client/report run. The immutable static page stream is kept.
+'-------------------------------------------------------------------------------
+Public Sub ResetKeyValuePdfClientCache()
+    Const METHOD_NAME As String = "ResetKeyValuePdfClientCache"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    mblnLogoCacheReady = False
+    mlngCachedLogoComponents = 0
+    mlngCachedLogoHeight = 0
+    mlngCachedLogoWidth = 0
+    mstrCachedLogoHex = vbNullString
+    mstrCachedLogoPath = vbNullString
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-13
@@ -83,11 +127,11 @@ Public Function GenerateKeyValuePdfFromWorksheet(ByVal targetPath As String, ByV
         Err.Raise 1001, METHOD_NAME, "No transaction row pairs were found in the report worksheet."
     End If
 
-    If Not PrepareLogoImageFromPath(logoPath, strLogoHex, lngLogoWidth, lngLogoHeight, lngLogoComponents) Then
+    If Not GetCachedLogoImage(logoPath, strLogoHex, lngLogoWidth, lngLogoHeight, lngLogoComponents) Then
         Err.Raise 1013, METHOD_NAME, "The report logo could not be prepared as a JPEG image."
     End If
 
-    If Not BuildStaticPageContent(strStaticContent) Then
+    If Not GetCachedStaticPageContent(strStaticContent) Then
         Err.Raise 1024, METHOD_NAME, "The shared static key-value PDF content could not be built."
     End If
 
@@ -143,6 +187,57 @@ ErrorHandler:
     GenerateKeyValuePdfFromWorksheet = False
 
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "targetPath;logoPath;tradeCount", targetPath, logoPath, lngTradeCount
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-21
+' Parameters:    ByRef strStaticContent As String
+' Returns:       Boolean
+' Description:   Returns the immutable Key-Value page stream from module cache.
+'                The 19 KEY labels and table geometry are built only once.
+'-------------------------------------------------------------------------------
+Private Function GetCachedStaticPageContent(ByRef strStaticContent As String) As Boolean
+    Const METHOD_NAME As String = "GetCachedStaticPageContent"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strBuiltContent As String
+
+    On Error GoTo ErrorHandler
+
+    GetCachedStaticPageContent = False
+    strStaticContent = vbNullString
+
+    If mblnStaticContentCacheReady Then
+        If Len(mstrCachedStaticContent) > 0 Then
+            strStaticContent = mstrCachedStaticContent
+            GetCachedStaticPageContent = True
+            GoTo ExitFunction
+        End If
+    End If
+
+    If Not BuildStaticPageContent(strBuiltContent) Then
+        GoTo ExitFunction
+    End If
+
+    mstrCachedStaticContent = strBuiltContent
+    mblnStaticContentCacheReady = True
+    strStaticContent = mstrCachedStaticContent
+    GetCachedStaticPageContent = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetCachedStaticPageContent = False
+    strStaticContent = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
     errorManager.save
     Resume ExitFunction
 End Function
@@ -1040,6 +1135,66 @@ ErrorHandler:
 End Function
 
 '-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-21
+' Parameters:    logoPath As String and JPEG output values
+' Returns:       Boolean
+' Description:   Reuses prepared JPEG data for all funds in the current client
+'                run. A changed logo path automatically refreshes the cache.
+'-------------------------------------------------------------------------------
+Private Function GetCachedLogoImage(ByVal logoPath As String, ByRef strLogoHex As String, ByRef lngLogoWidth As Long, ByRef lngLogoHeight As Long, ByRef lngLogoComponents As Long) As Boolean
+    Const METHOD_NAME As String = "GetCachedLogoImage"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim strNormalizedLogoPath As String
+
+    On Error GoTo ErrorHandler
+
+    GetCachedLogoImage = False
+    strLogoHex = vbNullString
+    lngLogoWidth = 0
+    lngLogoHeight = 0
+    lngLogoComponents = 0
+    strNormalizedLogoPath = Trim$(logoPath)
+
+    If mblnLogoCacheReady Then
+        If StrComp(strNormalizedLogoPath, mstrCachedLogoPath, vbTextCompare) = 0 Then
+            strLogoHex = mstrCachedLogoHex
+            lngLogoWidth = mlngCachedLogoWidth
+            lngLogoHeight = mlngCachedLogoHeight
+            lngLogoComponents = mlngCachedLogoComponents
+            GetCachedLogoImage = True
+            GoTo ExitFunction
+        End If
+    End If
+
+    If Not PrepareLogoImageFromPath(strNormalizedLogoPath, strLogoHex, lngLogoWidth, lngLogoHeight, lngLogoComponents) Then
+        GoTo ExitFunction
+    End If
+
+    mstrCachedLogoPath = strNormalizedLogoPath
+    mstrCachedLogoHex = strLogoHex
+    mlngCachedLogoWidth = lngLogoWidth
+    mlngCachedLogoHeight = lngLogoHeight
+    mlngCachedLogoComponents = lngLogoComponents
+    mblnLogoCacheReady = True
+    GetCachedLogoImage = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetCachedLogoImage = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "logoPath", logoPath
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
 ' Reads the configured JPG/JPEG logo directly from logoPath and prepares it as a
 ' PDF image XObject. No worksheet copy/paste or temporary Chart export is used.
 ' The same image object is reused on every transaction page.
@@ -1582,5 +1737,4 @@ ErrorHandler:
     errorManager.save
     Resume ExitSub
 End Sub
-
 
