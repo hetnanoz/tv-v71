@@ -12,6 +12,11 @@ Private gstrDeferredBatchSummary As String
 Private gstrDeferredOriginalResultsFileName As String
 Private gstrLastClientErrorDescription As String
 
+Private gvarFondslisteCache As Variant
+Private gstrFondslisteCachePath As String
+Private gdtFondslisteCacheModified As Date
+Private gdblFondslisteCacheSize As Double
+
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-05
@@ -155,8 +160,7 @@ Public Sub executeMasterProcess()
                 wsMacro.Range("results_file_name").Value = wsMap.Cells(rowIndex, "A").Value
 
                 Application.Calculate
-                DoEvents
-                Application.Wait Now + TimeValue("0:00:01")
+                Call WaitForCalculationComplete(METHOD_NAME)
 
                 targetKvg = Trim$(CStr(wsMap.Cells(rowIndex, "U").Value))
                 Set clientDict = buildClientDictFromArray(fondslisteArr, targetKvg)
@@ -1287,7 +1291,10 @@ Public Function loadFondslisteToArray(ByRef wsMacro As Excel.Worksheet) As Varia
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
+    Dim fileObject As Object
+    Dim fileSystemObj As Object
     Dim folderPath As String
+    Dim fullPath As String
     Dim latestDate As Long
     Dim latestFile As String
     Dim tempFile As String
@@ -1320,14 +1327,35 @@ Public Function loadFondslisteToArray(ByRef wsMacro As Excel.Worksheet) As Varia
         Err.Raise 1010, METHOD_NAME, "Fondsliste file not found in " & folderPath
     End If
 
-    Set wbMapping = Workbooks.Open(folderPath & latestFile, ReadOnly:=True)
-    loadFondslisteToArray = wbMapping.Sheets(1).UsedRange.Value
+    fullPath = folderPath & latestFile
+    Set fileSystemObj = CreateObject("Scripting.FileSystemObject")
+    Set fileObject = fileSystemObj.GetFile(fullPath)
+
+    If IsArray(gvarFondslisteCache) Then
+        If StrComp(gstrFondslisteCachePath, fullPath, vbTextCompare) = 0 Then
+            If gdtFondslisteCacheModified = fileObject.DateLastModified Then
+                If gdblFondslisteCacheSize = CDbl(fileObject.Size) Then
+                    loadFondslisteToArray = gvarFondslisteCache
+                    GoTo ExitFunction
+                End If
+            End If
+        End If
+    End If
+
+    Set wbMapping = Workbooks.Open(Filename:=fullPath, UpdateLinks:=0, ReadOnly:=True, AddToMru:=False, Notify:=False, IgnoreReadOnlyRecommended:=True)
+    gvarFondslisteCache = wbMapping.Sheets(1).UsedRange.Value
+    gstrFondslisteCachePath = fullPath
+    gdtFondslisteCacheModified = fileObject.DateLastModified
+    gdblFondslisteCacheSize = CDbl(fileObject.Size)
+    loadFondslisteToArray = gvarFondslisteCache
 
 ExitFunction:
     If Not wbMapping Is Nothing Then
         Call CloseWorkbookNoSaveSafe(wbMapping, METHOD_NAME)
     End If
 
+    Set fileObject = Nothing
+    Set fileSystemObj = Nothing
     Set wbMapping = Nothing
 
     If errNumber <> 0 Then
@@ -1340,14 +1368,7 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     loadFondslisteToArray = Empty
 
-    errorManager.addError _
-        CLASS_NAME, _
-        METHOD_NAME, _
-        errNumber, _
-        errDescription, _
-        "folderPath;baseName", _
-        folderPath, _
-        baseName
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "folderPath;baseName;fullPath", folderPath, baseName, fullPath
     errorManager.save
     GoTo ExitFunction
 End Function
@@ -1590,6 +1611,46 @@ ErrorHandler:
     errorManager.save
     Resume ExitFunction
 End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-21
+' Parameters:    ByVal callerMethod As String
+' Returns:       ---
+' Description:   Waits only as long as Excel actually needs to finish calculation.
+'                A timeout prevents a stalled calculation from blocking the batch forever.
+'-------------------------------------------------------------------------------
+Private Sub WaitForCalculationComplete(ByVal callerMethod As String)
+    Const METHOD_NAME As String = "WaitForCalculationComplete"
+    Const CALCULATION_TIMEOUT_SECONDS As Long = 30
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim dtStart As Date
+
+    On Error GoTo ErrorHandler
+
+    dtStart = Now
+
+    Do While Application.CalculationState <> xlDone
+        DoEvents
+
+        If DateDiff("s", dtStart, Now) >= CALCULATION_TIMEOUT_SECONDS Then
+            Err.Raise 1060, METHOD_NAME, "Excel calculation did not finish within " & CStr(CALCULATION_TIMEOUT_SECONDS) & " seconds."
+        End If
+    Loop
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod", callerMethod
+    errorManager.save
+    Resume ExitSub
+End Sub
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
