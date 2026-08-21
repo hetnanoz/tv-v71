@@ -8,6 +8,10 @@ Option Explicit
 
 Private Const CLASS_NAME As String = "modTradeversand"
 
+Private mblnInputHeaderCacheReady As Boolean
+Private mlngCachedWknInputColumn As Long
+Private mstrCachedInputHeaderSignature As String
+
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-04
@@ -87,6 +91,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     Dim dictFondsbez As Object
     Dim createFfyPdfFlag As Boolean
     Dim ffyPdfFullName As String
+    Dim lngResolvedWknInputColumn As Long
     Dim blnRawOraclePdfEnabled As Boolean
     Dim pdfOutputPath As String
 
@@ -219,6 +224,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
 
     If Not IsArray(inputDataArr) Then GoTo ExitSub
     inputLastRow = UBound(inputDataArr, 1)
+    lngResolvedWknInputColumn = GetCachedInputWknColumn(inputDataArr)
 
     diagT = Timer
 
@@ -291,7 +297,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
                 Call processFundZeroTemplate(fundIdStr, inputDataArr, inputLastRow, tempXlsx, pdfOutputPath, _
                                              dictMapping, effectivePdfXlsxPrefix, tradesPerPage, _
                                              createXlsxFlag, inclFreeFlag, logoFullPath, missingFundsList, _
-                                             cachedPrevBizDay, dictFondsbez)
+                                             cachedPrevBizDay, dictFondsbez, lngResolvedWknInputColumn)
             End If
             countSuccess = countSuccess + 1
 
@@ -486,7 +492,7 @@ Public Sub processFundZeroTemplate(fundId As String, ByRef inputArr As Variant, 
                             pXlsx As String, pPdf As String, dictMap As Object, _
                             prefix As String, limitPerPage As Long, saveXlsx As Boolean, inclFree As Boolean, _
                             logoPath As String, ByRef missingFundsList As String, ByVal prevBizDay As Date, _
-                            ByRef dictFondsbez As Object)
+                            ByRef dictFondsbez As Object, Optional ByVal resolvedWknInputColumn As Long = -1)
     Const METHOD_NAME As String = "processFundZeroTemplate"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -514,6 +520,7 @@ Public Sub processFundZeroTemplate(fundId As String, ByRef inputArr As Variant, 
     Dim fullPdfPath As String
     Dim blnPageSetupBatchStarted As Boolean
     Dim blnPreviousPrintCommunication As Boolean
+    Dim blnMinimalKeyValueWorksheet As Boolean
 
     On Error GoTo ErrorHandler
 
@@ -524,17 +531,29 @@ Public Sub processFundZeroTemplate(fundId As String, ByRef inputArr As Variant, 
     DoEvents
     Application.CutCopyMode = False
 
+    Set wksMacro = ThisWorkbook.Worksheets("Tradeversand")
+    blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wksMacro)
+    blnMinimalKeyValueWorksheet = blnRawOraclePdfEnabled And Not saveXlsx
+
     Set wbOut = createWorkbookSafe()
     Set wsOut = wbOut.Sheets(1)
 
-    Call insertLogo(wsOut, logoPath)
-    Call buildPerfectHeaders(wsOut)
+    If blnMinimalKeyValueWorksheet Then
+        wsOut.Columns("A:V").ColumnWidth = 80
+    End If
+
+    If Not blnMinimalKeyValueWorksheet Then
+        Call insertLogo(wsOut, logoPath)
+        Call buildPerfectHeaders(wsOut)
+    End If
 
     outRow = 7
     tradeCount = 0
 
-    originalView = ActiveWindow.View
-    If originalView <> xlNormalView Then ActiveWindow.View = xlNormalView
+    If Not blnMinimalKeyValueWorksheet Then
+        originalView = ActiveWindow.View
+        If originalView <> xlNormalView Then ActiveWindow.View = xlNormalView
+    End If
 
     For r = 2 To lastInRow
         If Right(safeString(inputArr(r, 4)), 11) = fundId And (inclFree = True Or extractNumber(inputArr(r, 52)) <> 0) Then
@@ -543,15 +562,17 @@ Public Sub processFundZeroTemplate(fundId As String, ByRef inputArr As Variant, 
             tradeCount = tradeCount + 1
 
             If tradeCount > 1 Then
-                With wsOut.Range(wsOut.Cells(outRow, 1), wsOut.Cells(outRow, 22))
-                    .RowHeight = 5
-                    .Interior.Color = RGB(220, 220, 220)
-                End With
-            
+                If Not blnMinimalKeyValueWorksheet Then
+                    With wsOut.Range(wsOut.Cells(outRow, 1), wsOut.Cells(outRow, 22))
+                        .RowHeight = 5
+                        .Interior.Color = RGB(220, 220, 220)
+                    End With
+                End If
+
                 outRow = outRow + 1
             End If
 
-            Call fillTradeData(inputArr, r, wsOut, outRow, dictFondsbez)
+            Call fillTradeData(inputArr, r, wsOut, outRow, dictFondsbez, resolvedWknInputColumn, blnMinimalKeyValueWorksheet)
             outRow = outRow + 2
 
         End If
@@ -562,25 +583,27 @@ nextRow:
         GoTo ExitSub
     End If
 
-    If ActiveWindow.View <> originalView Then ActiveWindow.View = originalView
+    If Not blnMinimalKeyValueWorksheet Then
+        If ActiveWindow.View <> originalView Then ActiveWindow.View = originalView
 
-    With wsOut.Range("A1:V" & (outRow + 2)).Font
-        .Name = "Times New Roman"
-        .Size = 8
-    End With
+        With wsOut.Range("A1:V" & (outRow + 2)).Font
+            .Name = "Times New Roman"
+            .Size = 8
+        End With
 
-    wsOut.Range(wsOut.Cells(5, 1), wsOut.Cells(outRow - 1, 22)).BorderAround LineStyle:=xlContinuous, Weight:=xlThin
-    wsOut.Columns("A:V").EntireColumn.AutoFit
+        wsOut.Range(wsOut.Cells(5, 1), wsOut.Cells(outRow - 1, 22)).BorderAround LineStyle:=xlContinuous, Weight:=xlThin
+        wsOut.Columns("A:V").EntireColumn.AutoFit
 
-    For c = 1 To 22
-        If wsOut.Columns(c).ColumnWidth < 8 Then wsOut.Columns(c).ColumnWidth = 8
-        wsOut.Columns(c).ColumnWidth = wsOut.Columns(c).ColumnWidth + 1
-    Next c
+        For c = 1 To 22
+            If wsOut.Columns(c).ColumnWidth < 8 Then wsOut.Columns(c).ColumnWidth = 8
+            wsOut.Columns(c).ColumnWidth = wsOut.Columns(c).ColumnWidth + 1
+        Next c
 
-    wsOut.Cells(outRow + 1, 1).Value = "Diese Abrechnung wurde maschinell erstellt und ist ohne eigenhaendige Unterschrift gueltig"
-    wsOut.Cells(outRow + 1, 1).Font.Italic = False
-    wsOut.Cells(outRow + 1, 1).Font.Bold = True
-    wsOut.Cells(outRow + 1, 1).Font.Size = 9
+        wsOut.Cells(outRow + 1, 1).Value = "Diese Abrechnung wurde maschinell erstellt und ist ohne eigenhaendige Unterschrift gueltig"
+        wsOut.Cells(outRow + 1, 1).Font.Italic = False
+        wsOut.Cells(outRow + 1, 1).Font.Bold = True
+        wsOut.Cells(outRow + 1, 1).Font.Size = 9
+    End If
 
     todayStr = Format(prevBizDay, "yyyymmdd")
 
@@ -605,34 +628,35 @@ nextRow:
     pdfName = baseNamePdf & friendlyName & suffixStr
     xlsxName = baseNameXlsx & friendlyName & suffixStr
 
-    Set wksMacro = ThisWorkbook.Worksheets("Tradeversand")
-    blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wksMacro)
+    If Not blnMinimalKeyValueWorksheet Then
+        If Not blnRawOraclePdfEnabled Then
+            blnPageSetupBatchStarted = BeginPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
+        End If
 
-    If Not blnRawOraclePdfEnabled Then
-        blnPageSetupBatchStarted = BeginPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
-    End If
+        With wsOut.PageSetup
+            .PrintArea = "$A$1:$V$" & (outRow + 1)
+            .Orientation = xlLandscape
+            .LeftMargin = Application.CentimetersToPoints(0.7)
+            .RightMargin = Application.CentimetersToPoints(0.7)
+            .Zoom = False
+            .FitToPagesWide = 1
+            .FitToPagesTall = False
+            .PrintTitleRows = "$5:$6"
+            .RightFooter = "&""Times New Roman,Regular""&8&P/&N"
+        End With
 
-    With wsOut.PageSetup
-        .PrintArea = "$A$1:$V$" & (outRow + 1)
-        .Orientation = xlLandscape
-        .LeftMargin = Application.CentimetersToPoints(0.7)
-        .RightMargin = Application.CentimetersToPoints(0.7)
-        .Zoom = False
-        .FitToPagesWide = 1
-        .FitToPagesTall = False
-        .PrintTitleRows = "$5:$6"
-        .RightFooter = "&""Times New Roman,Regular""&8&P/&N"
-    End With
-
-    If blnPageSetupBatchStarted Then
-        Call EndPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
-        blnPageSetupBatchStarted = False
+        If blnPageSetupBatchStarted Then
+            Call EndPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
+            blnPageSetupBatchStarted = False
+        End If
     End If
 
     Application.DisplayAlerts = False
     Application.EnableEvents = False
 
-    Call ApplySensitivityLabel(wbOut, "8ffbc0b8-e97b-47d1-beac-cb0955d66f3b")
+    If Not blnMinimalKeyValueWorksheet Then
+        Call ApplySensitivityLabel(wbOut, "8ffbc0b8-e97b-47d1-beac-cb0955d66f3b")
+    End If
 
     If saveXlsx Then
         wbOut.SaveAs fileName:=pXlsx & xlsxName & ".xlsx", FileFormat:=xlOpenXMLWorkbook
@@ -696,6 +720,60 @@ End Sub
 ' Returns:       ---
 ' Description:   Writes one transaction block to the fund report worksheet.
 '-------------------------------------------------------------------------------
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-21
+' Parameters:    ByRef inputArr As Variant
+' Returns:       Long
+' Description:   Resolves the WKN source column once per distinct input header and
+'                reuses it for all funds and transactions using the same input.
+'-------------------------------------------------------------------------------
+Private Function GetCachedInputWknColumn(ByRef inputArr As Variant) As Long
+    Const METHOD_NAME As String = "GetCachedInputWknColumn"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim lngColumn As Long
+    Dim lngHeaderRow As Long
+    Dim strHeaderSignature As String
+
+    On Error GoTo ErrorHandler
+
+    GetCachedInputWknColumn = 0
+    If Not IsArray(inputArr) Then GoTo ExitFunction
+
+    lngHeaderRow = LBound(inputArr, 1)
+    strHeaderSignature = CStr(LBound(inputArr, 2)) & ":" & CStr(UBound(inputArr, 2))
+
+    For lngColumn = LBound(inputArr, 2) To UBound(inputArr, 2)
+        strHeaderSignature = strHeaderSignature & Chr$(30) & safeString(inputArr(lngHeaderRow, lngColumn))
+    Next lngColumn
+
+    If mblnInputHeaderCacheReady Then
+        If StrComp(mstrCachedInputHeaderSignature, strHeaderSignature, vbBinaryCompare) = 0 Then
+            GetCachedInputWknColumn = mlngCachedWknInputColumn
+            GoTo ExitFunction
+        End If
+    End If
+
+    mlngCachedWknInputColumn = ResolveInputWknColumn(inputArr)
+    mstrCachedInputHeaderSignature = strHeaderSignature
+    mblnInputHeaderCacheReady = True
+    GetCachedInputWknColumn = mlngCachedWknInputColumn
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    GetCachedInputWknColumn = ResolveInputWknColumn(inputArr)
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
@@ -801,7 +879,7 @@ ErrorHandler:
     Resume ExitFunction
 End Function
 
-Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.Worksheet, outR As Long, ByRef dictFondsbez As Object)
+Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.Worksheet, outR As Long, ByRef dictFondsbez As Object, Optional ByVal resolvedWknInputColumn As Long = -1, Optional ByVal minimalFormatting As Boolean = False)
     Const METHOD_NAME As String = "fillTradeData"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -832,24 +910,26 @@ Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.
     blnPreviousDisplayAlerts = Application.DisplayAlerts
     blnSettingsCaptured = True
 
-    Application.DisplayAlerts = False
-    wsOut.Range(wsOut.Cells(outR, 2), wsOut.Cells(outR, 4)).Merge
-    wsOut.Range(wsOut.Cells(outR, 5), wsOut.Cells(outR, 6)).Merge
-    wsOut.Range(wsOut.Cells(outR, 7), wsOut.Cells(outR, 8)).Merge
-    wsOut.Range(wsOut.Cells(outR, 11), wsOut.Cells(outR, 12)).Merge
-    wsOut.Range(wsOut.Cells(outR, 13), wsOut.Cells(outR, 15)).Merge
-    wsOut.Range(wsOut.Cells(outR, 16), wsOut.Cells(outR, 17)).Merge
-    wsOut.Range(wsOut.Cells(outR, 20), wsOut.Cells(outR, 22)).Merge
-    wsOut.Range(wsOut.Cells(outR + 1, 2), wsOut.Cells(outR + 1, 3)).Merge
-    wsOut.Range(wsOut.Cells(outR + 1, 5), wsOut.Cells(outR + 1, 7)).Merge
-    wsOut.Range(wsOut.Cells(outR + 1, 9), wsOut.Cells(outR + 1, 11)).Merge
-    wsOut.Range(wsOut.Cells(outR + 1, 13), wsOut.Cells(outR + 1, 14)).Merge
-    wsOut.Range(wsOut.Cells(outR + 1, 16), wsOut.Cells(outR + 1, 18)).Merge
-    wsOut.Range(wsOut.Cells(outR + 1, 21), wsOut.Cells(outR + 1, 22)).Merge
-    Application.DisplayAlerts = blnPreviousDisplayAlerts
+    If Not minimalFormatting Then
+        Application.DisplayAlerts = False
+        wsOut.Range(wsOut.Cells(outR, 2), wsOut.Cells(outR, 4)).Merge
+        wsOut.Range(wsOut.Cells(outR, 5), wsOut.Cells(outR, 6)).Merge
+        wsOut.Range(wsOut.Cells(outR, 7), wsOut.Cells(outR, 8)).Merge
+        wsOut.Range(wsOut.Cells(outR, 11), wsOut.Cells(outR, 12)).Merge
+        wsOut.Range(wsOut.Cells(outR, 13), wsOut.Cells(outR, 15)).Merge
+        wsOut.Range(wsOut.Cells(outR, 16), wsOut.Cells(outR, 17)).Merge
+        wsOut.Range(wsOut.Cells(outR, 20), wsOut.Cells(outR, 22)).Merge
+        wsOut.Range(wsOut.Cells(outR + 1, 2), wsOut.Cells(outR + 1, 3)).Merge
+        wsOut.Range(wsOut.Cells(outR + 1, 5), wsOut.Cells(outR + 1, 7)).Merge
+        wsOut.Range(wsOut.Cells(outR + 1, 9), wsOut.Cells(outR + 1, 11)).Merge
+        wsOut.Range(wsOut.Cells(outR + 1, 13), wsOut.Cells(outR + 1, 14)).Merge
+        wsOut.Range(wsOut.Cells(outR + 1, 16), wsOut.Cells(outR + 1, 18)).Merge
+        wsOut.Range(wsOut.Cells(outR + 1, 21), wsOut.Cells(outR + 1, 22)).Merge
+        Application.DisplayAlerts = blnPreviousDisplayAlerts
 
-    wsOut.Rows(outR).RowHeight = 18
-    wsOut.Rows(outR).VerticalAlignment = xlCenter
+        wsOut.Rows(outR).RowHeight = 18
+        wsOut.Rows(outR).VerticalAlignment = xlCenter
+    End If
 
     depotnrKey = Right(safeString(inputArr(inR, 4)), 11)
     wsOut.Cells(outR, 1).Value = depotnrKey
@@ -865,7 +945,7 @@ Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.
     End If
 
     wsOut.Cells(outR, 2).Value = "'" & fundNameStr
-    Call shrinkFontIfTooLong(wsOut.Cells(outR, 2), fundNameStr)
+    If Not minimalFormatting Then Call shrinkFontIfTooLong(wsOut.Cells(outR, 2), fundNameStr)
 
     colA = UCase(safeString(inputArr(inR, 1)))
     colB = UCase(safeString(inputArr(inR, 2)))
@@ -900,11 +980,11 @@ Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.
 
     wsOut.Cells(outR, 7).Value = toDate(inputArr(inR, 10))
     wsOut.Cells(outR, 7).NumberFormat = "dd-mm-yy"
-    wsOut.Cells(outR, 7).HorizontalAlignment = xlCenter
+    If Not minimalFormatting Then wsOut.Cells(outR, 7).HorizontalAlignment = xlCenter
 
     wsOut.Cells(outR, 9).Value = toDate(inputArr(inR, 9))
     wsOut.Cells(outR, 9).NumberFormat = "dd-mm-yy"
-    wsOut.Cells(outR, 9).HorizontalAlignment = xlCenter
+    If Not minimalFormatting Then wsOut.Cells(outR, 9).HorizontalAlignment = xlCenter
 
     ' FIX39:
     ' The previous generator hard-blanked WKN, which explains the exact
@@ -912,7 +992,11 @@ Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.
     ' 34 content-dependent WKN clips. Resolve WKN from the input header instead
     ' of guessing a fixed column number; if no WKN-like header exists, preserve
     ' the former blank behavior.
-    lngWknInputColumn = ResolveInputWknColumn(inputArr)
+    If resolvedWknInputColumn >= 0 Then
+        lngWknInputColumn = resolvedWknInputColumn
+    Else
+        lngWknInputColumn = ResolveInputWknColumn(inputArr)
+    End If
     wknStr = vbNullString
 
     If lngWknInputColumn > 0 Then
@@ -925,14 +1009,14 @@ Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.
     Else
         wsOut.Cells(outR, 10).Value = ""
     End If
-    wsOut.Cells(outR, 10).ShrinkToFit = False
+    If Not minimalFormatting Then wsOut.Cells(outR, 10).ShrinkToFit = False
 
     wsOut.Cells(outR, 11).Value = "'" & safeString(inputArr(inR, 11))
-    wsOut.Cells(outR, 11).ShrinkToFit = False
+    If Not minimalFormatting Then wsOut.Cells(outR, 11).ShrinkToFit = False
 
     secNameStr = safeString(inputArr(inR, 12))
     wsOut.Cells(outR, 13).Value = "'" & secNameStr
-    Call shrinkFontIfTooLong(wsOut.Cells(outR, 13), secNameStr)
+    If Not minimalFormatting Then Call shrinkFontIfTooLong(wsOut.Cells(outR, 13), secNameStr)
 
     valNom = extractNumber(inputArr(inR, 18))
     wsOut.Cells(outR, 16).Value = valNom
@@ -961,8 +1045,10 @@ Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.
     End If
     wsOut.Cells(outR, 20).Value = safeString(inputArr(inR, 32))
 
-    wsOut.Rows(outR + 1).RowHeight = 18
-    wsOut.Rows(outR + 1).VerticalAlignment = xlCenter
+    If Not minimalFormatting Then
+        wsOut.Rows(outR + 1).RowHeight = 18
+        wsOut.Rows(outR + 1).VerticalAlignment = xlCenter
+    End If
 
     transNr = safeString(inputArr(inR, 7))
     If colB = "O" And Left(transNr, 1) = "P" Then
@@ -1134,29 +1220,31 @@ Public Sub fillTradeData(ByRef inputArr As Variant, inR As Long, wsOut As Excel.
     End If
     wsOut.Cells(outR + 1, 21).NumberFormat = "General"
 
-    With wsOut.Range(wsOut.Cells(outR, 1), wsOut.Cells(outR + 1, 22)).Borders
-        .LineStyle = xlContinuous
-        .Weight = xlHairline
-    End With
+    If Not minimalFormatting Then
+        With wsOut.Range(wsOut.Cells(outR, 1), wsOut.Cells(outR + 1, 22)).Borders
+            .LineStyle = xlContinuous
+            .Weight = xlHairline
+        End With
 
-    With wsOut.Cells(outR, 5)
-        .HorizontalAlignment = xlCenter
-        .VerticalAlignment = xlCenter
-        .IndentLevel = 0
-    End With
+        With wsOut.Cells(outR, 5)
+            .HorizontalAlignment = xlCenter
+            .VerticalAlignment = xlCenter
+            .IndentLevel = 0
+        End With
 
-    wsOut.Cells(outR, 1).IndentLevel = 1
-    wsOut.Cells(outR, 2).IndentLevel = 1
-    wsOut.Cells(outR, 11).IndentLevel = 1
-    wsOut.Cells(outR, 13).IndentLevel = 1
-    wsOut.Cells(outR, 18).IndentLevel = 1
+        wsOut.Cells(outR, 1).IndentLevel = 1
+        wsOut.Cells(outR, 2).IndentLevel = 1
+        wsOut.Cells(outR, 11).IndentLevel = 1
+        wsOut.Cells(outR, 13).IndentLevel = 1
+        wsOut.Cells(outR, 18).IndentLevel = 1
 
-    wsOut.Cells(outR + 1, 1).IndentLevel = 1
-    wsOut.Cells(outR + 1, 4).IndentLevel = 1
-    wsOut.Cells(outR + 1, 8).IndentLevel = 1
-    wsOut.Cells(outR + 1, 12).IndentLevel = 1
-    wsOut.Cells(outR + 1, 15).IndentLevel = 1
-    wsOut.Cells(outR + 1, 20).IndentLevel = 1
+        wsOut.Cells(outR + 1, 1).IndentLevel = 1
+        wsOut.Cells(outR + 1, 4).IndentLevel = 1
+        wsOut.Cells(outR + 1, 8).IndentLevel = 1
+        wsOut.Cells(outR + 1, 12).IndentLevel = 1
+        wsOut.Cells(outR + 1, 15).IndentLevel = 1
+        wsOut.Cells(outR + 1, 20).IndentLevel = 1
+    End If
 
 ExitSub:
     If blnSettingsCaptured Then
