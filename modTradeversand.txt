@@ -87,6 +87,8 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     Dim dictFondsbez As Object
     Dim createFfyPdfFlag As Boolean
     Dim ffyPdfFullName As String
+    Dim blnRawOraclePdfEnabled As Boolean
+    Dim pdfOutputPath As String
 
     On Error GoTo ErrorHandler
 
@@ -166,6 +168,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     createFfyCsvFlag = UCase(Trim(safeString(wsMacro.Range("create_ffy_csv_file").Value))) = "TRUE"
     ffyUseExterneFondNr = UCase(Trim(safeString(wsMacro.Range("ffy_use_externe_fond_nr").Value))) = "TRUE"
     createFfyPdfFlag = UCase(Trim(safeString(wsMacro.Range("create_ffy_pdf_file").Value))) = "TRUE"
+    blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wsMacro)
 
     If Not isChildPass Then
         If Not assertClientInPath(pathXlsx, resultsFileNamePrefix) Then
@@ -196,6 +199,12 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     tempPdf = Environ("TEMP") & "\MacroPdf_" & resultsFileNamePrefix & "_" & Format(Now, "hhmmss") & "\"
     If Not fileSystemObj.FolderExists(tempXlsx) Then MkDir tempXlsx
     If Not fileSystemObj.FolderExists(tempPdf) Then MkDir tempPdf
+
+    If blnRawOraclePdfEnabled Then
+        pdfOutputPath = pathPdf
+    Else
+        pdfOutputPath = tempPdf
+    End If
 
     Application.ScreenUpdating = False
     Application.DisplayAlerts = False
@@ -275,7 +284,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
             progressStartFund fundCounter, CStr(dictMapping(fundIdStr))
 
             If Not skipPdfXlsx Then
-                Call processFundZeroTemplate(fundIdStr, inputDataArr, inputLastRow, tempXlsx, pathPdf, _
+                Call processFundZeroTemplate(fundIdStr, inputDataArr, inputLastRow, tempXlsx, pdfOutputPath, _
                                              dictMapping, effectivePdfXlsxPrefix, tradesPerPage, _
                                              createXlsxFlag, inclFreeFlag, logoFullPath, missingFundsList, _
                                              cachedPrevBizDay, dictFondsbez)
@@ -621,11 +630,7 @@ nextRow:
                       "The key-value RAW PDF could not be generated for fund " & fundId & "."
         End If
     Else
-        If Not QueueWorksheetForPowerPdf(wsOut, fullPdfPath) Then
-            Err.Raise 1015, METHOD_NAME, _
-                      "Power PDF print job could not be queued for fund " & fundId & ". " & _
-                      GetPowerPdfLastErrorDescription()
-        End If
+        wsOut.ExportAsFixedFormat Type:=xlTypePDF, fileName:=fullPdfPath, Quality:=xlQualityStandard, IncludeDocProperties:=True, IgnorePrintAreas:=False, OpenAfterPublish:=False
     End If
 
 ExitSub:
@@ -3338,11 +3343,7 @@ Public Sub convertFfyCsvToPdf(ByVal csvFullPath As String, ByVal pdfFullPath As 
 
     Call ApplySensitivityLabel(wbCsv, "8ffbc0b8-e97b-47d1-beac-cb0955d66f3b")
 
-    If Not QueueWorksheetForPowerPdf(wsCsv, pdfFullPath) Then
-        Err.Raise 1015, METHOD_NAME, _
-                  "Power PDF print job could not be queued for FFY PDF. " & _
-                  GetPowerPdfLastErrorDescription()
-    End If
+    wsCsv.ExportAsFixedFormat Type:=xlTypePDF, fileName:=pdfFullPath, Quality:=xlQualityStandard, IncludeDocProperties:=True, IgnorePrintAreas:=False, OpenAfterPublish:=False
 
 ExitSub:
     If Not wbCsv Is Nothing Then
