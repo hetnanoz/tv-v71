@@ -52,7 +52,12 @@ Public Sub executeMasterProcess()
     blnApplicationStateCaptured = True
     batchSummary = vbNullString
 
+    If GetPowerPdfPendingCount() > 0 Then
+        Err.Raise 1025, METHOD_NAME, "A previous Power PDF batch is still running. Wait until it finishes before starting another run."
+    End If
+
     Call ResetDeferredCompletionState
+    Call SetPowerPdfCompletionCallback(vbNullString)
 
     Application.Calculation = xlCalculationAutomatic
 
@@ -193,10 +198,16 @@ NextRow:
     gblnDeferredRunAll = runAll
     gblnDeferredCompletionPending = True
 
-    Call CompleteTradeversandProcess
+    Call SetPowerPdfCompletionCallback("CompleteTradeversandAfterPowerPdf")
+
+    If GetPowerPdfPendingCount() > 0 Then
+        Call FinishPowerPdfBatch
+    Else
+        Call CompleteTradeversandAfterPowerPdf
+    End If
 
 ExitSub:
-    Call ClearProgressSafe(METHOD_NAME)
+    Call ProgressClearSafe(METHOD_NAME)
 
     If IsArray(inputDataArr) Then
         Erase inputDataArr
@@ -206,15 +217,15 @@ ExitSub:
         Erase fondslisteArr
     End If
 
-    If Not wsMacro Is Nothing Then
-        Call RestoreResultsFileNameSafe(wsMacro, strOriginalResultsFileName, METHOD_NAME)
+    If Len(strOriginalResultsFileName) > 0 Then
+        Call RestoreTradeversandResultsFileNameSafe(strOriginalResultsFileName, METHOD_NAME)
     End If
 
     If blnApplicationStateCaptured Then
-        Call RestoreCalculationModeSafe(originalCalculation, METHOD_NAME)
+        Call RestoreApplicationCalculationSafe(originalCalculation, METHOD_NAME)
     End If
 
-    Call ClearStatusBarSafe(METHOD_NAME)
+    Call ResetApplicationStatusBarSafe(METHOD_NAME)
 
     Set clientDict = Nothing
     Set wsMap = Nothing
@@ -236,21 +247,22 @@ ErrorHandler:
         kvgProcessedIndex
     errorManager.save
     errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
-    GoTo ExitSub
+    Resume ExitSub
 End Sub
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
-' Creation date: 2026-08-21
+' Creation date: 2026-08-05
 ' Parameters:    ---
 ' Returns:       ---
-' Description:   Completes Tradeversand after synchronous PDF generation and prepares queued e-mails.
+' Description:   Sends deferred client e-mails after all queued PDF files are available.
 '-------------------------------------------------------------------------------
-Public Sub CompleteTradeversandProcess()
-    Const METHOD_NAME As String = "CompleteTradeversandProcess"
+Public Sub CompleteTradeversandAfterPowerPdf()
+    Const METHOD_NAME As String = "CompleteTradeversandAfterPowerPdf"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
+    Dim wksConfig As Excel.Worksheet
 
     On Error GoTo ErrorHandler
 
@@ -261,13 +273,23 @@ Public Sub CompleteTradeversandProcess()
     Call SendDeferredEmailRequests
 
     If gblnDeferredRunAll Then
-        MsgBox "Process finished." & vbCrLf & vbCrLf & "Summary:" & vbCrLf & gstrDeferredBatchSummary, vbInformation, "Batch Summary"
+        MsgBox _
+            "Process finished." & vbCrLf & vbCrLf & "Summary:" & vbCrLf & gstrDeferredBatchSummary, _
+            vbInformation, _
+            "Batch Summary"
     Else
-        MsgBox "Process finished." & vbCrLf & "Generated: " & gstrDeferredBatchSummary, vbInformation, "Success"
+        MsgBox _
+            "Process finished." & vbCrLf & "Generated: " & gstrDeferredBatchSummary, _
+            vbInformation, _
+            "Success"
     End If
 
 ExitSub:
-    Call ClearStatusBarSafe(METHOD_NAME)
+    If Len(gstrDeferredOriginalResultsFileName) > 0 Then
+        Call RestoreTradeversandResultsFileNameSafe(gstrDeferredOriginalResultsFileName, METHOD_NAME)
+    End If
+    Call ResetApplicationStatusBarSafe(METHOD_NAME)
+    Set wksConfig = Nothing
     Call ResetDeferredCompletionState
     Exit Sub
 
@@ -275,37 +297,13 @@ ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
 
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription
     errorManager.save
     errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
-    GoTo ExitSub
-End Sub
-
-'-------------------------------------------------------------------------------
-' Author:        Pawel Ligezka
-' Creation date: 2026-08-21
-' Parameters:    ---
-' Returns:       ---
-' Description:   Legacy compatibility entry point. PDF generation is now synchronous.
-'-------------------------------------------------------------------------------
-Public Sub CompleteTradeversandAfterPowerPdf()
-    Const METHOD_NAME As String = "CompleteTradeversandAfterPowerPdf"
-    Dim errorManager As New ErrorManager
-    Dim errDescription As String
-    Dim errNumber As Long
-
-    On Error GoTo ErrorHandler
-
-    Call CompleteTradeversandProcess
-
-ExitSub:
-    Exit Sub
-
-ErrorHandler:
-    errNumber = VBA.Err.Number
-    errDescription = VBA.Err.Description
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
-    errorManager.save
     Resume ExitSub
 End Sub
 
@@ -402,11 +400,10 @@ Private Sub SendDeferredEmailRequests()
     Next varRequest
 
 ExitSub:
-    If Not wksConfig Is Nothing Then
-        Call RestoreResultsFileNameSafe(wksConfig, strPreviousResultsFileName, METHOD_NAME)
+    If Len(strPreviousResultsFileName) > 0 Then
+        Call RestoreTradeversandResultsFileNameSafe(strPreviousResultsFileName, METHOD_NAME)
     End If
     Set wksConfig = Nothing
-
     If errNumber <> 0 Then
         VBA.Err.Raise errNumber, METHOD_NAME, errDescription
     End If
@@ -737,13 +734,11 @@ Private Function runProcessForClient(ByVal clientName As String, _
 
 ExitFunction:
     If resultsNameTouched Then
-        wsMacro.Range("results_file_name").Value = originalFileName
-        Application.Calculate
-        DoEvents
+        Call RestoreTradeversandResultsFileNameSafe(originalFileName, METHOD_NAME)
     End If
 
     If blnScreenUpdatingCaptured Then
-        Application.ScreenUpdating = blnPreviousScreenUpdating
+        Call RestoreApplicationScreenUpdatingSafe(blnPreviousScreenUpdating, METHOD_NAME)
     End If
     Set combinedDict = Nothing
     Set childDict = Nothing
@@ -1599,32 +1594,35 @@ End Function
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-21
-' Parameters:    ByRef wsConfig As Excel.Worksheet, ByVal originalName As String, ByVal callerMethod As String
+' Parameters:    ByVal resultsFileName As String, ByVal callerMethod As String
 ' Returns:       ---
-' Description:   Restores results_file_name without allowing cleanup errors to re-enter the caller handler.
+' Description:   Restores results_file_name without allowing cleanup failures to re-enter the caller's error handler.
 '-------------------------------------------------------------------------------
-Private Sub RestoreResultsFileNameSafe(ByRef wsConfig As Excel.Worksheet, ByVal originalName As String, ByVal callerMethod As String)
-    Const METHOD_NAME As String = "RestoreResultsFileNameSafe"
+Private Sub RestoreTradeversandResultsFileNameSafe(ByVal resultsFileName As String, ByVal callerMethod As String)
+    Const METHOD_NAME As String = "RestoreTradeversandResultsFileNameSafe"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
+    Dim wsConfig As Excel.Worksheet
 
     On Error GoTo ErrorHandler
 
-    If wsConfig Is Nothing Then GoTo ExitSub
-    If Len(originalName) = 0 Then GoTo ExitSub
+    If Len(resultsFileName) = 0 Then GoTo ExitSub
 
-    wsConfig.Range("results_file_name").Value = originalName
+    Set wsConfig = ThisWorkbook.Worksheets("Tradeversand")
+    wsConfig.Range("results_file_name").Value = resultsFileName
     Application.Calculate
     DoEvents
 
 ExitSub:
+    Set wsConfig = Nothing
     Exit Sub
 
 ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod;originalName", callerMethod, originalName
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod;resultsFileName", callerMethod, resultsFileName
     errorManager.save
     Resume ExitSub
 End Sub
@@ -1632,19 +1630,19 @@ End Sub
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-21
-' Parameters:    ByVal previousCalculation As Excel.XlCalculation, ByVal callerMethod As String
+' Parameters:    ByVal calculationMode As Excel.XlCalculation, ByVal callerMethod As String
 ' Returns:       ---
-' Description:   Restores Excel calculation mode during cleanup.
+' Description:   Restores Excel calculation mode using an isolated BAT error handler.
 '-------------------------------------------------------------------------------
-Private Sub RestoreCalculationModeSafe(ByVal previousCalculation As Excel.XlCalculation, ByVal callerMethod As String)
-    Const METHOD_NAME As String = "RestoreCalculationModeSafe"
+Private Sub RestoreApplicationCalculationSafe(ByVal calculationMode As Excel.XlCalculation, ByVal callerMethod As String)
+    Const METHOD_NAME As String = "RestoreApplicationCalculationSafe"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
 
     On Error GoTo ErrorHandler
 
-    Application.Calculation = previousCalculation
+    Application.Calculation = calculationMode
 
 ExitSub:
     Exit Sub
@@ -1652,6 +1650,36 @@ ExitSub:
 ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod", callerMethod
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-21
+' Parameters:    ByVal screenUpdatingValue As Boolean, ByVal callerMethod As String
+' Returns:       ---
+' Description:   Restores ScreenUpdating using an isolated BAT error handler.
+'-------------------------------------------------------------------------------
+Private Sub RestoreApplicationScreenUpdatingSafe(ByVal screenUpdatingValue As Boolean, ByVal callerMethod As String)
+    Const METHOD_NAME As String = "RestoreApplicationScreenUpdatingSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Application.ScreenUpdating = screenUpdatingValue
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod", callerMethod
     errorManager.save
     Resume ExitSub
@@ -1662,38 +1690,10 @@ End Sub
 ' Creation date: 2026-08-21
 ' Parameters:    ByVal callerMethod As String
 ' Returns:       ---
-' Description:   Clears the status bar during cleanup without re-entering the caller handler.
+' Description:   Clears the progress UI using an isolated BAT error handler.
 '-------------------------------------------------------------------------------
-Private Sub ClearStatusBarSafe(ByVal callerMethod As String)
-    Const METHOD_NAME As String = "ClearStatusBarSafe"
-    Dim errorManager As New ErrorManager
-    Dim errDescription As String
-    Dim errNumber As Long
-
-    On Error GoTo ErrorHandler
-
-    Application.StatusBar = False
-
-ExitSub:
-    Exit Sub
-
-ErrorHandler:
-    errNumber = VBA.Err.Number
-    errDescription = VBA.Err.Description
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod", callerMethod
-    errorManager.save
-    Resume ExitSub
-End Sub
-
-'-------------------------------------------------------------------------------
-' Author:        Pawel Ligezka
-' Creation date: 2026-08-21
-' Parameters:    ByVal callerMethod As String
-' Returns:       ---
-' Description:   Clears progress UI during cleanup without re-entering the caller handler.
-'-------------------------------------------------------------------------------
-Private Sub ClearProgressSafe(ByVal callerMethod As String)
-    Const METHOD_NAME As String = "ClearProgressSafe"
+Private Sub ProgressClearSafe(ByVal callerMethod As String)
+    Const METHOD_NAME As String = "ProgressClearSafe"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
@@ -1708,6 +1708,36 @@ ExitSub:
 ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod", callerMethod
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-21
+' Parameters:    ByVal callerMethod As String
+' Returns:       ---
+' Description:   Resets the Excel status bar using an isolated BAT error handler.
+'-------------------------------------------------------------------------------
+Private Sub ResetApplicationStatusBarSafe(ByVal callerMethod As String)
+    Const METHOD_NAME As String = "ResetApplicationStatusBarSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Application.StatusBar = False
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod", callerMethod
     errorManager.save
     Resume ExitSub
@@ -1718,7 +1748,7 @@ End Sub
 ' Creation date: 2026-08-21
 ' Parameters:    ByVal workbookToClose As Excel.Workbook, ByVal callerMethod As String
 ' Returns:       ---
-' Description:   Closes a workbook without saving and logs cleanup failures.
+' Description:   Closes a workbook without saving using BAT-compliant cleanup handling.
 '-------------------------------------------------------------------------------
 Private Sub CloseWorkbookNoSaveSafe(ByVal workbookToClose As Excel.Workbook, ByVal callerMethod As String)
     Const METHOD_NAME As String = "CloseWorkbookNoSaveSafe"
@@ -1740,6 +1770,7 @@ ExitSub:
 ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
+
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod;workbookName", callerMethod, workbookName
     errorManager.save
     Resume ExitSub
