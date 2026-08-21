@@ -170,6 +170,10 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     createFfyPdfFlag = UCase(Trim(safeString(wsMacro.Range("create_ffy_pdf_file").Value))) = "TRUE"
     blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wsMacro)
 
+    If blnRawOraclePdfEnabled And Not skipPdfXlsx Then
+        Call ResetKeyValuePdfClientCache
+    End If
+
     If Not isChildPass Then
         If Not assertClientInPath(pathXlsx, resultsFileNamePrefix) Then
             Err.Raise 1020, , "SAFETY ABORT: XLSX path does not match client name. Path: " & pathXlsx & ", Client: " & resultsFileNamePrefix
@@ -508,6 +512,8 @@ Public Sub processFundZeroTemplate(fundId As String, ByRef inputArr As Variant, 
     Dim suffixStr As String
     Dim maxFriendly As Long
     Dim fullPdfPath As String
+    Dim blnPageSetupBatchStarted As Boolean
+    Dim blnPreviousPrintCommunication As Boolean
 
     On Error GoTo ErrorHandler
 
@@ -599,6 +605,13 @@ nextRow:
     pdfName = baseNamePdf & friendlyName & suffixStr
     xlsxName = baseNameXlsx & friendlyName & suffixStr
 
+    Set wksMacro = ThisWorkbook.Worksheets("Tradeversand")
+    blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wksMacro)
+
+    If Not blnRawOraclePdfEnabled Then
+        blnPageSetupBatchStarted = BeginPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
+    End If
+
     With wsOut.PageSetup
         .PrintArea = "$A$1:$V$" & (outRow + 1)
         .Orientation = xlLandscape
@@ -611,6 +624,11 @@ nextRow:
         .RightFooter = "&""Times New Roman,Regular""&8&P/&N"
     End With
 
+    If blnPageSetupBatchStarted Then
+        Call EndPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
+        blnPageSetupBatchStarted = False
+    End If
+
     Application.DisplayAlerts = False
     Application.EnableEvents = False
 
@@ -621,8 +639,6 @@ nextRow:
     End If
 
     fullPdfPath = pPdf & pdfName & ".pdf"
-    Set wksMacro = ThisWorkbook.Worksheets("Tradeversand")
-    blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wksMacro)
 
     If blnRawOraclePdfEnabled Then
         If Not GenerateKeyValuePdfFromWorksheet(fullPdfPath, wsOut, logoPath) Then
@@ -634,6 +650,11 @@ nextRow:
     End If
 
 ExitSub:
+    If blnPageSetupBatchStarted Then
+        Call EndPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
+        blnPageSetupBatchStarted = False
+    End If
+
     If Not wbOut Is Nothing Then
         Call CloseWorkbookNoSaveSafe(wbOut, METHOD_NAME)
     End If
@@ -3280,6 +3301,74 @@ End Sub
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
+' Creation date: 2026-08-21
+' Parameters:    ByRef blnPreviousPrintCommunication As Boolean, callerMethod As String
+' Returns:       Boolean
+' Description:   Suspends Excel printer communication while a PageSetup block is
+'                populated. Failure only disables the optimization and is logged.
+'-------------------------------------------------------------------------------
+Private Function BeginPageSetupBatch(ByRef blnPreviousPrintCommunication As Boolean, ByVal callerMethod As String) As Boolean
+    Const METHOD_NAME As String = "BeginPageSetupBatch"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    BeginPageSetupBatch = False
+    blnPreviousPrintCommunication = Application.PrintCommunication
+    Application.PrintCommunication = False
+    BeginPageSetupBatch = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    BeginPageSetupBatch = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod", callerMethod
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-08-21
+' Parameters:    previousPrintCommunication As Boolean, callerMethod As String
+' Returns:       ---
+' Description:   Commits batched PageSetup changes and restores the prior Excel
+'                PrintCommunication state.
+'-------------------------------------------------------------------------------
+Private Sub EndPageSetupBatch(ByVal previousPrintCommunication As Boolean, ByVal callerMethod As String)
+    Const METHOD_NAME As String = "EndPageSetupBatch"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    Application.PrintCommunication = True
+
+    If Not previousPrintCommunication Then
+        Application.PrintCommunication = False
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "callerMethod;previousPrintCommunication", callerMethod, previousPrintCommunication
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
 ' Creation date: 2026-08-04
 ' Parameters:    ByVal csvFullPath As String, ByVal pdfFullPath As String
 ' Returns:       ---
@@ -3296,6 +3385,8 @@ Public Sub convertFfyCsvToPdf(ByVal csvFullPath As String, ByVal pdfFullPath As 
     Dim wsCsv As Excel.Worksheet
     Dim csvFileName As String
     Dim c As Long
+    Dim blnPageSetupBatchStarted As Boolean
+    Dim blnPreviousPrintCommunication As Boolean
 
     On Error GoTo ErrorHandler
 
@@ -3327,6 +3418,8 @@ Public Sub convertFfyCsvToPdf(ByVal csvFullPath As String, ByVal pdfFullPath As 
             .Columns(c).ColumnWidth = .Columns(c).ColumnWidth + 1
         Next c
 
+        blnPageSetupBatchStarted = BeginPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
+
         With .PageSetup
             .Orientation = xlLandscape
             .LeftMargin = Application.CentimetersToPoints(0.7)
@@ -3339,6 +3432,11 @@ Public Sub convertFfyCsvToPdf(ByVal csvFullPath As String, ByVal pdfFullPath As 
             .RightFooter = "&""Times New Roman,Regular""&8&P/&N"
         End With
 
+        If blnPageSetupBatchStarted Then
+            Call EndPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
+            blnPageSetupBatchStarted = False
+        End If
+
     End With
 
     Call ApplySensitivityLabel(wbCsv, "8ffbc0b8-e97b-47d1-beac-cb0955d66f3b")
@@ -3346,6 +3444,11 @@ Public Sub convertFfyCsvToPdf(ByVal csvFullPath As String, ByVal pdfFullPath As 
     wsCsv.ExportAsFixedFormat Type:=xlTypePDF, fileName:=pdfFullPath, Quality:=xlQualityStandard, IncludeDocProperties:=True, IgnorePrintAreas:=False, OpenAfterPublish:=False
 
 ExitSub:
+    If blnPageSetupBatchStarted Then
+        Call EndPageSetupBatch(blnPreviousPrintCommunication, METHOD_NAME)
+        blnPageSetupBatchStarted = False
+    End If
+
     If Not wbCsv Is Nothing Then
         Call CloseWorkbookNoSaveSafe(wbCsv, METHOD_NAME)
     End If
