@@ -1,0 +1,50 @@
+Hi Diana,
+thank you very much for your detailed comparison and for highlighting the differences in the file.
+Before we implement the functional changes, I would like to clarify the intended target format so that we can make the PDF and CSV fully consistent going forward.
+For the FX example F00865, we had provided two PDF variants:
+Trade Currency version – fees and costs remain in the transaction/trade currency
+Settlement Currency version – fees and costs are converted into the settlement currency
+This was intended to illustrate both possible approaches and to allow us to confirm which treatment should be used in the final solution.
+Based on your latest comments, we are also considering an additional option for the CSV format which could make the two outputs much easier to reconcile.
+Harmonised 19-column CSV
+We could create an additional CSV format which mirrors the Key-Value PDF structure one-to-one.
+Each transaction would be represented by one CSV row with the same 19 fields and in the same logical order as in the PDF:
+Depotnr.
+Fondsbezeichnung
+Geschaeftsart
+Schlusstag
+Valutatag
+WKN
+ISIN
+Wertpapierbezeichnung
+Nominale/Stuecke
+Kurs
+Stueckzinsen
+Transaktionsnr.
+Maklergebuehren
+Steuern
+Abwicklungsprovision
+Spesen
+ausm. Betrag in Whg
+ausm. Betrag in Abrech. Whg
+Devisenkurs
+With this approach, the individual fee components would also be shown separately in the CSV, exactly as they are in the PDF, rather than being combined into fewer fee columns.
+The existing CSV format could remain unchanged if it is required for your current downstream processing. The new harmonised CSV could be provided additionally, or potentially replace the existing format if this is preferable from your side.
+Before proceeding, could you please confirm the following points?
+Currency of fees and costs
+Which of the two approaches should be used consistently in PDF and CSV for FX transactions:
+fees in the trade currency, or
+fees converted into the settlement currency?
+Individual fee components
+Would you prefer the new CSV to show Maklergebuehren, Steuern, Abwicklungsprovision and Spesen separately, exactly as in the PDF?
+Exchange rate
+We noticed that the existing CSV and PDF currently show the FX rate in opposite directions.
+Which representation should be the standard for both formats: the current CSV representation or the current PDF representation?
+Existing CSV structure
+Is the current CSV column structure mandatory for an existing interface on your side, or would an additional/new 19-column format as described above be acceptable?
+Free of Payment transactions
+Should Free of Payment transactions be included in both the PDF and CSV deliveries, or should they be excluded?
+Numeric precision
+Do you have any specific requirements regarding the maximum number of decimal places, particularly for the exchange rate, or should we retain the available source precision?
+Our preferred approach would be to use the same underlying business logic for the harmonised PDF and CSV. This would ensure that amounts, currencies, fee components and exchange rates are represented consistently in both formats and avoid similar discrepancies in the future.
+Once we have your confirmation, we can implement the changes accordingly.
