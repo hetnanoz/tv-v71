@@ -91,6 +91,9 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     Dim dictFondsbez As Object
     Dim createFfyPdfFlag As Boolean
     Dim ffyPdfFullName As String
+    Dim createHarmonizedCsvFlag As Boolean
+    Dim harmonizedCsvFullName As String
+    Dim hasHarmonizedCsvOutput As Boolean
     Dim lngResolvedWknInputColumn As Long
     Dim blnRawOraclePdfEnabled As Boolean
     Dim pdfOutputPath As String
@@ -173,6 +176,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     createFfyCsvFlag = UCase(Trim(safeString(wsMacro.Range("create_ffy_csv_file").Value))) = "TRUE"
     ffyUseExterneFondNr = UCase(Trim(safeString(wsMacro.Range("ffy_use_externe_fond_nr").Value))) = "TRUE"
     createFfyPdfFlag = UCase(Trim(safeString(wsMacro.Range("create_ffy_pdf_file").Value))) = "TRUE"
+    createHarmonizedCsvFlag = UCase(Trim(safeString(wsMacro.Range("create_harmonized_csv_file").Value))) = "TRUE"
     blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wsMacro)
 
     If blnRawOraclePdfEnabled And Not skipPdfXlsx Then
@@ -192,6 +196,17 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
 
         If createCsvFlag And pathCsv = "" Then
             Err.Raise 1023, , "CSV path is empty for client " & resultsFileNamePrefix
+        End If
+
+        If createHarmonizedCsvFlag And Not assertClientInPath(pathCsv, resultsFileNamePrefix) Then
+            Err.Raise 1027, METHOD_NAME, _
+                      "SAFETY ABORT: Harmonized CSV path does not match client name. Path: " & _
+                      pathCsv & ", Client: " & resultsFileNamePrefix
+        End If
+
+        If createHarmonizedCsvFlag And Len(pathCsv) = 0 Then
+            Err.Raise 1028, METHOD_NAME, _
+                      "Harmonized CSV path is empty for client " & resultsFileNamePrefix
         End If
 
         Call ClearFolderContentSafe(pathXlsx, "*.xlsx")
@@ -271,6 +286,21 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     End If
     diagT = Timer
 
+    hasHarmonizedCsvOutput = False
+
+    If createHarmonizedCsvFlag And Not skipCsv Then
+        safeCsvPrefix = Replace(Replace(Replace(effectiveCsvPrefix, "/", "_"), "\", "_"), ":", "")
+        csvDateStr = Format(Date, "yyyymmdd")
+        harmonizedCsvFullName = safeCsvPrefix & "-WP_Geschafte_" & effectiveCsvNr & "_" & csvDateStr & "_harmonized.csv"
+
+        Call saveArrayAsHarmonizedCsv(inputDataArr, pathCsv & harmonizedCsvFullName, dictMapping, inclFreeFlag, fondsArr, lngResolvedWknInputColumn)
+
+        If Len(Dir(pathCsv & harmonizedCsvFullName)) > 0 Then
+            hasHarmonizedCsvOutput = True
+        End If
+    End If
+    diagT = Timer
+
     Set dictFunds = getUniqueFundIds(inputDataArr, inputLastRow, inclFreeFlag)
     Set dictFondsbez = buildFondsbezeichnungMap(fondsArr)
 
@@ -327,6 +357,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
 
     csvCount = 0
     If createCsvFlag And Dir(pathCsv & csvFullName) <> "" Then csvCount = 1
+    If hasHarmonizedCsvOutput Then csvCount = csvCount + 1
 
     ffyCount = 0
     If hasFfyOutput Then ffyCount = 1
