@@ -10,7 +10,7 @@ Private Const REQUIRED_INPUT_COLUMNS As Long = 110
 ' Creation date: 2026-09-03
 ' Parameters:    dataArr As Variant, fullPath As String, dictFilter As Object, inclFree As Boolean, fondsArr As Variant, resolvedWknInputColumn As Long
 ' Returns:       ---
-' Description:   Creates the 27-column harmonized CSV using values produced by the existing fillTradeData business logic and the legacy FFY Fondsnr KVG mapping.
+' Description:   Creates the 28-column harmonized CSV using values produced by the existing fillTradeData business logic, the legacy FFY Fondsnr KVG mapping, and a currency-pair descriptor for the exchange rate.
 '-------------------------------------------------------------------------------
 Public Sub saveArrayAsHarmonizedCsv(ByRef dataArr As Variant, _
                                     ByVal fullPath As String, _
@@ -133,7 +133,7 @@ End Sub
 ' Creation date: 2026-09-03
 ' Parameters:    ---
 ' Returns:       String
-' Description:   Returns the fixed 27-column harmonized CSV header row.
+' Description:   Returns the fixed 28-column harmonized CSV header row.
 '-------------------------------------------------------------------------------
 Private Function buildHarmonizedHeader() As String
     Const METHOD_NAME As String = "buildHarmonizedHeader"
@@ -144,7 +144,7 @@ Private Function buildHarmonizedHeader() As String
 
     On Error GoTo ErrorHandler
 
-    ReDim headers(0 To 26)
+    ReDim headers(0 To 27)
     headers(0) = "Fondsnr KVG"
     headers(1) = "Depotnr."
     headers(2) = "Fondsbezeichnung"
@@ -172,6 +172,7 @@ Private Function buildHarmonizedHeader() As String
     headers(24) = "ausm. Betrag in Abrech. Whg"
     headers(25) = "Whg (ausm. Betrag in Abrech. Whg)"
     headers(26) = "Devisenkurs"
+    headers(27) = "Devisenkurs Waehrungspaar"
 
     buildHarmonizedHeader = Join(headers, CSV_SEPARATOR)
 
@@ -207,7 +208,7 @@ Private Function buildHarmonizedLine(ByRef dataArr As Variant, _
     Dim errDescription As String
     Dim errNumber As Long
     Dim index As Long
-    Dim values(0 To 26) As String
+    Dim values(0 To 27) As String
 
     On Error GoTo ErrorHandler
 
@@ -238,6 +239,7 @@ Private Function buildHarmonizedLine(ByRef dataArr As Variant, _
     values(24) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 19))
     values(25) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 20))
     values(26) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 21))
+    values(27) = buildExchangeRateCurrencyPair(values(23), values(25))
 
     For index = LBound(values) To UBound(values)
         values(index) = escapeHarmonizedCsvValue(values(index))
@@ -263,6 +265,49 @@ ErrorHandler:
         errDescription, _
         "inputRow", _
         inputRow
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    tradeCurrency As String, settlementCurrency As String
+' Returns:       String
+' Description:   Returns the currency pair associated with Devisenkurs as
+'                <Whg (ausm. Betrag in Whg)>/<Whg (ausm. Betrag in Abrech. Whg)>.
+'                Example: GBP/EUR. If either currency is missing or both currencies are the same, returns blank.
+'-------------------------------------------------------------------------------
+Private Function buildExchangeRateCurrencyPair(ByVal tradeCurrency As String, _
+                                               ByVal settlementCurrency As String) As String
+    Const METHOD_NAME As String = "buildExchangeRateCurrencyPair"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    tradeCurrency = Trim$(tradeCurrency)
+    settlementCurrency = Trim$(settlementCurrency)
+
+    If Len(tradeCurrency) = 0 Or Len(settlementCurrency) = 0 Then
+        buildExchangeRateCurrencyPair = vbNullString
+    ElseIf StrComp(tradeCurrency, settlementCurrency, vbTextCompare) = 0 Then
+        buildExchangeRateCurrencyPair = vbNullString
+    Else
+        buildExchangeRateCurrencyPair = tradeCurrency & "/" & settlementCurrency
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    buildExchangeRateCurrencyPair = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
     errorManager.save
     Resume ExitFunction
 End Function
