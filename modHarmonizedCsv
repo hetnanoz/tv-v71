@@ -10,7 +10,7 @@ Private Const REQUIRED_INPUT_COLUMNS As Long = 110
 ' Creation date: 2026-09-03
 ' Parameters:    dataArr As Variant, fullPath As String, dictFilter As Object, inclFree As Boolean, fondsArr As Variant, resolvedWknInputColumn As Long
 ' Returns:       ---
-' Description:   Creates the 26-column harmonized CSV using values produced by the existing fillTradeData business logic.
+' Description:   Creates the 27-column harmonized CSV using values produced by the existing fillTradeData business logic and the legacy FFY Fondsnr KVG mapping.
 '-------------------------------------------------------------------------------
 Public Sub saveArrayAsHarmonizedCsv(ByRef dataArr As Variant, _
                                     ByVal fullPath As String, _
@@ -20,16 +20,20 @@ Public Sub saveArrayAsHarmonizedCsv(ByRef dataArr As Variant, _
                                     Optional ByVal resolvedWknInputColumn As Long = -1)
     Const METHOD_NAME As String = "saveArrayAsHarmonizedCsv"
     Dim blnFileOpen As Boolean
+    Dim depotnrToExterneFondNr As Object
     Dim dictFondsbez As Object
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
+    Dim ffyUseExterneFondNr As Boolean
     Dim fileNum As Long
+    Dim fondsNrKvg As String
     Dim fundIdStr As String
     Dim lastRow As Long
     Dim lineText As String
     Dim rowIndex As Long
     Dim wkbScratch As Excel.Workbook
+    Dim wksConfig As Excel.Worksheet
     Dim wksScratch As Excel.Worksheet
 
     On Error GoTo ErrorHandler
@@ -47,6 +51,15 @@ Public Sub saveArrayAsHarmonizedCsv(ByRef dataArr As Variant, _
     End If
 
     Set dictFondsbez = buildFondsbezeichnungMap(fondsArr)
+    Set wksConfig = ThisWorkbook.Worksheets("Tradeversand")
+    ffyUseExterneFondNr = UCase$(Trim$(safeString(wksConfig.Range("ffy_use_externe_fond_nr").Value))) = "TRUE"
+
+    If ffyUseExterneFondNr Then
+        Set depotnrToExterneFondNr = buildDepotnrToExterneFondNrMap(fondsArr)
+    Else
+        Set depotnrToExterneFondNr = Nothing
+    End If
+
     Set wkbScratch = Application.Workbooks.Add(xlWBATWorksheet)
     Set wksScratch = wkbScratch.Worksheets(1)
     wksScratch.Columns("A:V").ColumnWidth = 80
@@ -68,10 +81,17 @@ Public Sub saveArrayAsHarmonizedCsv(ByRef dataArr As Variant, _
         If Len(fundIdStr) >= 11 Then fundIdStr = Right$(fundIdStr, 11)
         If Not dictFilter.Exists(fundIdStr) Then GoTo NextRow
 
+        fondsNrKvg = fundIdStr
+        If ffyUseExterneFondNr And Not depotnrToExterneFondNr Is Nothing Then
+            If depotnrToExterneFondNr.Exists(fundIdStr) Then
+                fondsNrKvg = CStr(depotnrToExterneFondNr(fundIdStr))
+            End If
+        End If
+
         Call resetScratchArea(wksScratch)
         Call fillTradeData(dataArr, rowIndex, wksScratch, SCRATCH_ROW, dictFondsbez, resolvedWknInputColumn, True)
 
-        lineText = buildHarmonizedLine(dataArr, rowIndex, wksScratch)
+        lineText = buildHarmonizedLine(dataArr, rowIndex, wksScratch, fondsNrKvg)
         Print #fileNum, lineText
 
 NextRow:
@@ -82,7 +102,9 @@ ExitSub:
     Call closeHarmonizedWorkbookSafe(wkbScratch)
 
     Set wksScratch = Nothing
+    Set wksConfig = Nothing
     Set wkbScratch = Nothing
+    Set depotnrToExterneFondNr = Nothing
     Set dictFondsbez = Nothing
 
     If errNumber <> 0 Then
@@ -111,7 +133,7 @@ End Sub
 ' Creation date: 2026-09-03
 ' Parameters:    ---
 ' Returns:       String
-' Description:   Returns the fixed 26-column harmonized CSV header row.
+' Description:   Returns the fixed 27-column harmonized CSV header row.
 '-------------------------------------------------------------------------------
 Private Function buildHarmonizedHeader() As String
     Const METHOD_NAME As String = "buildHarmonizedHeader"
@@ -122,33 +144,34 @@ Private Function buildHarmonizedHeader() As String
 
     On Error GoTo ErrorHandler
 
-    ReDim headers(0 To 25)
-    headers(0) = "Depotnr."
-    headers(1) = "Fondsbezeichnung"
-    headers(2) = "Geschaeftsart"
-    headers(3) = "Schlusstag"
-    headers(4) = "Valutatag"
-    headers(5) = "WKN"
-    headers(6) = "ISIN"
-    headers(7) = "Wertpapierbezeichnung"
-    headers(8) = "Nominale/Stuecke"
-    headers(9) = "Quantity Type"
-    headers(10) = "Kurs"
-    headers(11) = "Stueckzinsen"
-    headers(12) = "Transaktionsnr."
-    headers(13) = "Maklergebuehren"
-    headers(14) = "Maklergebuehren Whg"
-    headers(15) = "Steuern"
-    headers(16) = "Steuern Whg"
-    headers(17) = "Abwicklungsprovision"
-    headers(18) = "Abwicklungsprovision Whg"
-    headers(19) = "Spesen"
-    headers(20) = "Spesen Whg"
-    headers(21) = "ausm. Betrag in Whg"
-    headers(22) = "Whg (ausm. Betrag in Whg)"
-    headers(23) = "ausm. Betrag in Abrech. Whg"
-    headers(24) = "Whg (ausm. Betrag in Abrech. Whg)"
-    headers(25) = "Devisenkurs"
+    ReDim headers(0 To 26)
+    headers(0) = "Fondsnr KVG"
+    headers(1) = "Depotnr."
+    headers(2) = "Fondsbezeichnung"
+    headers(3) = "Geschaeftsart"
+    headers(4) = "Schlusstag"
+    headers(5) = "Valutatag"
+    headers(6) = "WKN"
+    headers(7) = "ISIN"
+    headers(8) = "Wertpapierbezeichnung"
+    headers(9) = "Nominale/Stuecke"
+    headers(10) = "Quantity Type"
+    headers(11) = "Kurs"
+    headers(12) = "Stueckzinsen"
+    headers(13) = "Transaktionsnr."
+    headers(14) = "Maklergebuehren"
+    headers(15) = "Maklergebuehren Whg"
+    headers(16) = "Steuern"
+    headers(17) = "Steuern Whg"
+    headers(18) = "Abwicklungsprovision"
+    headers(19) = "Abwicklungsprovision Whg"
+    headers(20) = "Spesen"
+    headers(21) = "Spesen Whg"
+    headers(22) = "ausm. Betrag in Whg"
+    headers(23) = "Whg (ausm. Betrag in Whg)"
+    headers(24) = "ausm. Betrag in Abrech. Whg"
+    headers(25) = "Whg (ausm. Betrag in Abrech. Whg)"
+    headers(26) = "Devisenkurs"
 
     buildHarmonizedHeader = Join(headers, CSV_SEPARATOR)
 
@@ -171,48 +194,50 @@ End Function
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-09-03
-' Parameters:    dataArr As Variant, inputRow As Long, wksScratch As Excel.Worksheet
+' Parameters:    dataArr As Variant, inputRow As Long, wksScratch As Excel.Worksheet, fondsNrKvg As String
 ' Returns:       String
-' Description:   Builds one harmonized CSV row from the values already calculated by fillTradeData plus Quantity Type from input column S.
+' Description:   Builds one harmonized CSV row from existing fillTradeData values, Quantity Type from input column S, and Fondsnr KVG using the legacy FFY mapping logic.
 '-------------------------------------------------------------------------------
 Private Function buildHarmonizedLine(ByRef dataArr As Variant, _
                                      ByVal inputRow As Long, _
-                                     ByRef wksScratch As Excel.Worksheet) As String
+                                     ByRef wksScratch As Excel.Worksheet, _
+                                     ByVal fondsNrKvg As String) As String
     Const METHOD_NAME As String = "buildHarmonizedLine"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
     Dim index As Long
-    Dim values(0 To 25) As String
+    Dim values(0 To 26) As String
 
     On Error GoTo ErrorHandler
 
-    values(0) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 1))
-    values(1) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 2))
-    values(2) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 5))
-    values(3) = readHarmonizedDate(wksScratch.Cells(SCRATCH_ROW, 7))
-    values(4) = readHarmonizedDate(wksScratch.Cells(SCRATCH_ROW, 9))
-    values(5) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 10))
-    values(6) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 11))
-    values(7) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 13))
-    values(8) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW, 16))
-    values(9) = safeString(dataArr(inputRow, 19))
-    values(10) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW, 19))
-    values(11) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW, 20))
-    values(12) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 1))
-    values(13) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 2))
-    values(14) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 4))
-    values(15) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 5))
-    values(16) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 8))
-    values(17) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 9))
-    values(18) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 12))
-    values(19) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 13))
-    values(20) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 15))
-    values(21) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 16))
-    values(22) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 18))
-    values(23) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 19))
-    values(24) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 20))
-    values(25) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 21))
+    values(0) = fondsNrKvg
+    values(1) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 1))
+    values(2) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 2))
+    values(3) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 5))
+    values(4) = readHarmonizedDate(wksScratch.Cells(SCRATCH_ROW, 7))
+    values(5) = readHarmonizedDate(wksScratch.Cells(SCRATCH_ROW, 9))
+    values(6) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 10))
+    values(7) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 11))
+    values(8) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 13))
+    values(9) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW, 16))
+    values(10) = safeString(dataArr(inputRow, 19))
+    values(11) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW, 19))
+    values(12) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW, 20))
+    values(13) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 1))
+    values(14) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 2))
+    values(15) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 4))
+    values(16) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 5))
+    values(17) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 8))
+    values(18) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 9))
+    values(19) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 12))
+    values(20) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 13))
+    values(21) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 15))
+    values(22) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 16))
+    values(23) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 18))
+    values(24) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 19))
+    values(25) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 20))
+    values(26) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 21))
 
     For index = LBound(values) To UBound(values)
         values(index) = escapeHarmonizedCsvValue(values(index))
