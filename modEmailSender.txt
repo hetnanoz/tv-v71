@@ -13,6 +13,8 @@ Public Sub processAndSendTradeversand()
     Const METHOD_NAME As String = "processAndSendTradeversand"
     Dim attachFfy As Boolean
     Dim attachFfyPdf As Boolean
+    Dim attachHarmonizedCsv As Boolean
+    Dim createHarmonizedCsv As Boolean
     Dim blnStatusBarCaptured As Boolean
     Dim bodyText As String
     Dim clientName As String
@@ -77,12 +79,19 @@ Public Sub processAndSendTradeversand()
         inclFfy = getSafeBoolean(.Range("create_ffy_csv_file").Value)
         attachFfy = getSafeBoolean(.Range("attach_ffy_to_email").Value)
         attachFfyPdf = getSafeBoolean(.Range("attach_ffy_pdf_to_email").Value)
+        createHarmonizedCsv = getSafeBoolean(.Range("create_harmonized_csv_file").Value)
+        attachHarmonizedCsv = getSafeBoolean(.Range("attach_harmonized_csv_to_email").Value)
         onlyFfy = getSafeBoolean(.Range("attach_only_ffy_csv").Value)
         maxAtt = getSafeLong(.Range("max_attachments_per_mail").Value)
     End With
 
     If Len(clientName) = 0 Then
         Err.Raise 1001, METHOD_NAME, "Client name is missing in 'results_file_name'."
+    End If
+
+    If attachHarmonizedCsv And Not createHarmonizedCsv Then
+        Err.Raise 1052, METHOD_NAME, _
+                  "Invalid Harmonized CSV configuration: attach_harmonized_csv_to_email=TRUE requires create_harmonized_csv_file=TRUE."
     End If
 
     Set fso = CreateObject("Scripting.FileSystemObject")
@@ -97,6 +106,8 @@ Public Sub processAndSendTradeversand()
     ElseIf inclFfy And Not attachFfy Then
         csvRequireSubstring = "_new_version"
     End If
+
+    csvExcludeSubstring = appendCsvExcludeFilter(csvExcludeSubstring, "_harmonized")
 
     pdfReq = vbNullString
     pdfExc = vbNullString
@@ -114,6 +125,10 @@ Public Sub processAndSendTradeversand()
             jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", clientName, csvRequireSubstring, csvExcludeSubstring)
         End If
 
+        If attachHarmonizedCsv Then
+            jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", clientName, "_harmonized")
+        End If
+
         If inclPdf Or attachFfyPdf Then
             jobs.Add makeJob(fso, pathPdfRes, pathPdfArch, "pdf", clientName, pdfReq, pdfExc)
         End If
@@ -124,9 +139,17 @@ Public Sub processAndSendTradeversand()
 
         totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
     Else
-        If inclCsv Then
+        If inclCsv Or attachHarmonizedCsv Then
             Set jobs = New Collection
-            jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", clientName, csvRequireSubstring, csvExcludeSubstring)
+
+            If inclCsv Then
+                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", clientName, csvRequireSubstring, csvExcludeSubstring)
+            End If
+
+            If attachHarmonizedCsv Then
+                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", clientName, "_harmonized")
+            End If
+
             totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
         End If
 
@@ -178,6 +201,10 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
     Dim allowedPrefixes As String
     Dim attachFfy As Boolean
     Dim attachFfyPdf As Boolean
+    Dim attachHarmonizedCsv As Boolean
+    Dim childAttachHarmonizedCsv As Boolean
+    Dim childCreateHarmonizedCsv As Boolean
+    Dim createHarmonizedCsv As Boolean
     Dim blnStatusBarCaptured As Boolean
     Dim bodyText As String
     Dim childOnlyPrefix As String
@@ -251,12 +278,19 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
         inclFfy = getSafeBoolean(.Range("create_ffy_csv_file").Value)
         attachFfy = getSafeBoolean(.Range("attach_ffy_to_email").Value)
         attachFfyPdf = getSafeBoolean(.Range("attach_ffy_pdf_to_email").Value)
+        createHarmonizedCsv = getSafeBoolean(.Range("create_harmonized_csv_file").Value)
+        attachHarmonizedCsv = getSafeBoolean(.Range("attach_harmonized_csv_to_email").Value)
         onlyFfy = getSafeBoolean(.Range("attach_only_ffy_csv").Value)
         maxAtt = getSafeLong(.Range("max_attachments_per_mail").Value)
     End With
 
     If Len(Trim$(parentName)) = 0 Then
         Err.Raise 1001, METHOD_NAME, "Parent client name is missing."
+    End If
+
+    If attachHarmonizedCsv And Not createHarmonizedCsv Then
+        Err.Raise 1052, METHOD_NAME, _
+                  "Invalid Harmonized CSV configuration for parent: attach=TRUE requires create=TRUE."
     End If
 
     csvRequireSubstring = vbNullString
@@ -268,6 +302,8 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
     ElseIf inclFfy And Not attachFfy Then
         csvRequireSubstring = "_new_version"
     End If
+
+    csvExcludeSubstring = appendCsvExcludeFilter(csvExcludeSubstring, "_harmonized")
 
     pdfReq = vbNullString
     pdfExc = vbNullString
@@ -301,12 +337,22 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
             childPathXlsxArch = formatFolderPath(CStr(.Range("archive_path_xlsx").Value))
             childPathPdfArch = formatFolderPath(CStr(.Range("archive_path_pdf").Value))
             childPathCsvArch = formatFolderPath(CStr(.Range("archive_path_csv").Value))
+            childCreateHarmonizedCsv = getSafeBoolean(.Range("create_harmonized_csv_file").Value)
+            childAttachHarmonizedCsv = getSafeBoolean(.Range("attach_harmonized_csv_to_email").Value)
         End With
 
         wsConfig.Range("results_file_name").Value = originalFileName
         resultsNameTouched = False
         Application.Calculate
         DoEvents
+
+        If childAttachHarmonizedCsv And Not childCreateHarmonizedCsv Then
+            Err.Raise 1053, METHOD_NAME, _
+                      "Invalid Harmonized CSV configuration for child: attach=TRUE requires create=TRUE."
+        End If
+    Else
+        childCreateHarmonizedCsv = createHarmonizedCsv
+        childAttachHarmonizedCsv = attachHarmonizedCsv
     End If
 
     Set fso = CreateObject("Scripting.FileSystemObject")
@@ -318,6 +364,10 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
         If useChildOwnPaths Then
             If inclCsv Then
                 jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", parentOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
+            End If
+
+            If attachHarmonizedCsv Then
+                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", parentOnlyPrefix, "_harmonized")
             End If
 
             If inclPdf Or attachFfyPdf Then
@@ -332,6 +382,10 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
                 jobs.Add makeJob(fso, childPathCsvRes, childPathCsvArch, "csv", childOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
             End If
 
+            If childAttachHarmonizedCsv Then
+                jobs.Add makeJob(fso, childPathCsvRes, childPathCsvArch, "csv", childOnlyPrefix, "_harmonized")
+            End If
+
             If inclPdf Or attachFfyPdf Then
                 jobs.Add makeJob(fso, childPathPdfRes, childPathPdfArch, "pdf", childOnlyPrefix, pdfReq, pdfExc)
             End If
@@ -342,6 +396,10 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
         Else
             If inclCsv Then
                 jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", allowedPrefixes, csvRequireSubstring, csvExcludeSubstring)
+            End If
+
+            If attachHarmonizedCsv Then
+                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", allowedPrefixes, "_harmonized")
             End If
 
             If inclPdf Or attachFfyPdf Then
@@ -355,14 +413,30 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
 
         totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
     Else
-        If inclCsv Then
+        If inclCsv Or attachHarmonizedCsv Or childAttachHarmonizedCsv Then
             Set jobs = New Collection
 
             If useChildOwnPaths Then
-                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", parentOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
-                jobs.Add makeJob(fso, childPathCsvRes, childPathCsvArch, "csv", childOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
+                If inclCsv Then
+                    jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", parentOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
+                    jobs.Add makeJob(fso, childPathCsvRes, childPathCsvArch, "csv", childOnlyPrefix, csvRequireSubstring, csvExcludeSubstring)
+                End If
+
+                If attachHarmonizedCsv Then
+                    jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", parentOnlyPrefix, "_harmonized")
+                End If
+
+                If childAttachHarmonizedCsv Then
+                    jobs.Add makeJob(fso, childPathCsvRes, childPathCsvArch, "csv", childOnlyPrefix, "_harmonized")
+                End If
             Else
-                jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", allowedPrefixes, csvRequireSubstring, csvExcludeSubstring)
+                If inclCsv Then
+                    jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", allowedPrefixes, csvRequireSubstring, csvExcludeSubstring)
+                End If
+
+                If attachHarmonizedCsv Then
+                    jobs.Add makeJob(fso, pathCsvRes, pathCsvArch, "csv", allowedPrefixes, "_harmonized")
+                End If
             End If
 
             totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt)
@@ -430,6 +504,40 @@ End Sub
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    existingFilter As String, valueToAdd As String
+' Returns:       String
+' Description:   Adds one semicolon-separated exclusion token without changing existing filters.
+'-------------------------------------------------------------------------------
+Private Function appendCsvExcludeFilter(ByVal existingFilter As String, ByVal valueToAdd As String) As String
+    Const METHOD_NAME As String = "appendCsvExcludeFilter"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If Len(Trim$(existingFilter)) = 0 Then
+        appendCsvExcludeFilter = Trim$(valueToAdd)
+    Else
+        appendCsvExcludeFilter = Trim$(existingFilter) & ";" & Trim$(valueToAdd)
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    appendCsvExcludeFilter = existingFilter
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
 ' Creation date: 2026-08-05
 ' Parameters:    fso As Object, sPath As String, aPath As String, ext As String, clientName As String, requireSubstring As String, optional, excludeSubstring As String, optional
 ' Returns:       Variant
@@ -480,7 +588,10 @@ Private Function collectFiles(ByRef fsoObj As Object, ByVal sPath As String, ByV
     Dim errDescription As String
     Dim errNumber As Long
     Dim fileItem As Object
+    Dim excludeIndex As Long
+    Dim excludeTokens() As String
     Dim lcExclude As String
+    Dim lcExcludeToken As String
     Dim lcFileName As String
     Dim lcPrefix As String
     Dim lcRequire As String
@@ -531,9 +642,18 @@ Private Function collectFiles(ByRef fsoObj As Object, ByVal sPath As String, ByV
             End If
 
             If prefixMatches And Len(lcExclude) > 0 Then
-                If InStr(1, lcFileName, lcExclude, vbBinaryCompare) > 0 Then
-                    prefixMatches = False
-                End If
+                excludeTokens = Split(lcExclude, ";")
+
+                For excludeIndex = LBound(excludeTokens) To UBound(excludeTokens)
+                    lcExcludeToken = LCase$(Trim$(excludeTokens(excludeIndex)))
+
+                    If Len(lcExcludeToken) > 0 Then
+                        If InStr(1, lcFileName, lcExcludeToken, vbBinaryCompare) > 0 Then
+                            prefixMatches = False
+                            Exit For
+                        End If
+                    End If
+                Next excludeIndex
             End If
 
             If prefixMatches Then
