@@ -1,0 +1,534 @@
+Option Explicit
+
+Private Const CLASS_NAME As String = "modHarmonizedCsv"
+Private Const CSV_SEPARATOR As String = ";"
+Private Const SCRATCH_ROW As Long = 1
+Private Const REQUIRED_INPUT_COLUMNS As Long = 110
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    dataArr As Variant, fullPath As String, dictFilter As Object, inclFree As Boolean, fondsArr As Variant, resolvedWknInputColumn As Long
+' Returns:       ---
+' Description:   Creates the 26-column harmonized CSV using values produced by the existing fillTradeData business logic.
+'-------------------------------------------------------------------------------
+Public Sub saveArrayAsHarmonizedCsv(ByRef dataArr As Variant, _
+                                    ByVal fullPath As String, _
+                                    ByRef dictFilter As Object, _
+                                    Optional ByVal inclFree As Boolean = True, _
+                                    Optional ByRef fondsArr As Variant, _
+                                    Optional ByVal resolvedWknInputColumn As Long = -1)
+    Const METHOD_NAME As String = "saveArrayAsHarmonizedCsv"
+    Dim blnFileOpen As Boolean
+    Dim dictFondsbez As Object
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileNum As Long
+    Dim fundIdStr As String
+    Dim lastRow As Long
+    Dim lineText As String
+    Dim rowIndex As Long
+    Dim wkbScratch As Excel.Workbook
+    Dim wksScratch As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    If Not IsArray(dataArr) Then
+        Err.Raise 1060, METHOD_NAME, "The transaction input array is required for the harmonized CSV."
+    End If
+
+    If dictFilter Is Nothing Then
+        Err.Raise 1061, METHOD_NAME, "The fund filter is required for the harmonized CSV."
+    End If
+
+    If UBound(dataArr, 2) < REQUIRED_INPUT_COLUMNS Then
+        Err.Raise 1062, METHOD_NAME, "The transaction input contains fewer than 110 columns."
+    End If
+
+    Set dictFondsbez = buildFondsbezeichnungMap(fondsArr)
+    Set wkbScratch = Application.Workbooks.Add(xlWBATWorksheet)
+    Set wksScratch = wkbScratch.Worksheets(1)
+    wksScratch.Columns("A:V").ColumnWidth = 80
+
+    fileNum = FreeFile
+    Open fullPath For Output As #fileNum
+    blnFileOpen = True
+
+    Print #fileNum, buildHarmonizedHeader()
+
+    lastRow = UBound(dataArr, 1)
+
+    For rowIndex = 2 To lastRow
+        If Len(Trim$(safeString(dataArr(rowIndex, 4)))) = 0 Then GoTo NextRow
+        If UCase$(Trim$(safeString(dataArr(rowIndex, 15)))) = "L/B" Then GoTo NextRow
+        If Not inclFree And extractNumber(dataArr(rowIndex, 52)) = 0 Then GoTo NextRow
+
+        fundIdStr = safeString(dataArr(rowIndex, 4))
+        If Len(fundIdStr) >= 11 Then fundIdStr = Right$(fundIdStr, 11)
+        If Not dictFilter.Exists(fundIdStr) Then GoTo NextRow
+
+        Call resetScratchArea(wksScratch)
+        Call fillTradeData(dataArr, rowIndex, wksScratch, SCRATCH_ROW, dictFondsbez, resolvedWknInputColumn, True)
+
+        lineText = buildHarmonizedLine(dataArr, rowIndex, wksScratch)
+        Print #fileNum, lineText
+
+NextRow:
+    Next rowIndex
+
+ExitSub:
+    Call closeHarmonizedFileSafe(fileNum, blnFileOpen)
+    Call closeHarmonizedWorkbookSafe(wkbScratch)
+
+    Set wksScratch = Nothing
+    Set wkbScratch = Nothing
+    Set dictFondsbez = Nothing
+
+    If errNumber <> 0 Then
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "fullPath;inclFree", _
+        fullPath, _
+        inclFree
+    errorManager.save
+    GoTo ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    ---
+' Returns:       String
+' Description:   Returns the fixed 26-column harmonized CSV header row.
+'-------------------------------------------------------------------------------
+Private Function buildHarmonizedHeader() As String
+    Const METHOD_NAME As String = "buildHarmonizedHeader"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim headers As Variant
+
+    On Error GoTo ErrorHandler
+
+    ReDim headers(0 To 25)
+    headers(0) = "Depotnr."
+    headers(1) = "Fondsbezeichnung"
+    headers(2) = "Geschaeftsart"
+    headers(3) = "Schlusstag"
+    headers(4) = "Valutatag"
+    headers(5) = "WKN"
+    headers(6) = "ISIN"
+    headers(7) = "Wertpapierbezeichnung"
+    headers(8) = "Nominale/Stuecke"
+    headers(9) = "Quantity Type"
+    headers(10) = "Kurs"
+    headers(11) = "Stueckzinsen"
+    headers(12) = "Transaktionsnr."
+    headers(13) = "Maklergebuehren"
+    headers(14) = "Maklergebuehren Whg"
+    headers(15) = "Steuern"
+    headers(16) = "Steuern Whg"
+    headers(17) = "Abwicklungsprovision"
+    headers(18) = "Abwicklungsprovision Whg"
+    headers(19) = "Spesen"
+    headers(20) = "Spesen Whg"
+    headers(21) = "ausm. Betrag in Whg"
+    headers(22) = "Whg (ausm. Betrag in Whg)"
+    headers(23) = "ausm. Betrag in Abrech. Whg"
+    headers(24) = "Whg (ausm. Betrag in Abrech. Whg)"
+    headers(25) = "Devisenkurs"
+
+    buildHarmonizedHeader = Join(headers, CSV_SEPARATOR)
+
+ExitFunction:
+    If errNumber <> 0 Then
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    buildHarmonizedHeader = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    dataArr As Variant, inputRow As Long, wksScratch As Excel.Worksheet
+' Returns:       String
+' Description:   Builds one harmonized CSV row from the values already calculated by fillTradeData plus Quantity Type from input column S.
+'-------------------------------------------------------------------------------
+Private Function buildHarmonizedLine(ByRef dataArr As Variant, _
+                                     ByVal inputRow As Long, _
+                                     ByRef wksScratch As Excel.Worksheet) As String
+    Const METHOD_NAME As String = "buildHarmonizedLine"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim index As Long
+    Dim values(0 To 25) As String
+
+    On Error GoTo ErrorHandler
+
+    values(0) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 1))
+    values(1) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 2))
+    values(2) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 5))
+    values(3) = readHarmonizedDate(wksScratch.Cells(SCRATCH_ROW, 7))
+    values(4) = readHarmonizedDate(wksScratch.Cells(SCRATCH_ROW, 9))
+    values(5) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 10))
+    values(6) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 11))
+    values(7) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 13))
+    values(8) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW, 16))
+    values(9) = safeString(dataArr(inputRow, 19))
+    values(10) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW, 19))
+    values(11) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW, 20))
+    values(12) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 1))
+    values(13) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 2))
+    values(14) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 4))
+    values(15) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 5))
+    values(16) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 8))
+    values(17) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 9))
+    values(18) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 12))
+    values(19) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 13))
+    values(20) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 15))
+    values(21) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 16))
+    values(22) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW, 18))
+    values(23) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 19))
+    values(24) = readHarmonizedText(wksScratch.Cells(SCRATCH_ROW + 1, 20))
+    values(25) = readHarmonizedNumber(wksScratch.Cells(SCRATCH_ROW + 1, 21))
+
+    For index = LBound(values) To UBound(values)
+        values(index) = escapeHarmonizedCsvValue(values(index))
+    Next index
+
+    buildHarmonizedLine = Join(values, CSV_SEPARATOR)
+
+ExitFunction:
+    If errNumber <> 0 Then
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    buildHarmonizedLine = vbNullString
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "inputRow", _
+        inputRow
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    targetCell As Excel.Range
+' Returns:       String
+' Description:   Returns one cell as text without changing the existing report calculation logic.
+'-------------------------------------------------------------------------------
+Private Function readHarmonizedText(ByRef targetCell As Excel.Range) As String
+    Const METHOD_NAME As String = "readHarmonizedText"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim value As Variant
+
+    On Error GoTo ErrorHandler
+
+    value = targetCell.Value2
+
+    If IsError(value) Or IsEmpty(value) Then
+        readHarmonizedText = vbNullString
+    Else
+        readHarmonizedText = CStr(value)
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    readHarmonizedText = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    targetCell As Excel.Range
+' Returns:       String
+' Description:   Returns one existing report date in the harmonized CSV date representation.
+'-------------------------------------------------------------------------------
+Private Function readHarmonizedDate(ByRef targetCell As Excel.Range) As String
+    Const METHOD_NAME As String = "readHarmonizedDate"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim value As Variant
+
+    On Error GoTo ErrorHandler
+
+    value = targetCell.Value
+
+    If IsError(value) Then
+        readHarmonizedDate = vbNullString
+    ElseIf IsEmpty(value) Then
+        readHarmonizedDate = vbNullString
+    ElseIf Len(CStr(value)) = 0 Then
+        readHarmonizedDate = vbNullString
+    ElseIf IsDate(value) Then
+        readHarmonizedDate = Format$(CDate(value), "dd-mm-yy")
+    Else
+        readHarmonizedDate = CStr(value)
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    readHarmonizedDate = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    targetCell As Excel.Range
+' Returns:       String
+' Description:   Returns one existing report value as an invariant CSV number or text when non-numeric.
+'-------------------------------------------------------------------------------
+Private Function readHarmonizedNumber(ByRef targetCell As Excel.Range) As String
+    Const METHOD_NAME As String = "readHarmonizedNumber"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim value As Variant
+
+    On Error GoTo ErrorHandler
+
+    value = targetCell.Value2
+
+    If IsError(value) Then
+        readHarmonizedNumber = vbNullString
+    ElseIf IsEmpty(value) Then
+        readHarmonizedNumber = vbNullString
+    ElseIf Len(CStr(value)) = 0 Then
+        readHarmonizedNumber = vbNullString
+    ElseIf IsNumeric(value) Then
+        readHarmonizedNumber = formatHarmonizedNumber(CDbl(value))
+    Else
+        readHarmonizedNumber = CStr(value)
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    readHarmonizedNumber = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    value As Double
+' Returns:       String
+' Description:   Formats a harmonized CSV number with a dot decimal separator and without thousands separators.
+'-------------------------------------------------------------------------------
+Private Function formatHarmonizedNumber(ByVal value As Double) As String
+    Const METHOD_NAME As String = "formatHarmonizedNumber"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim result As String
+
+    On Error GoTo ErrorHandler
+
+    result = Format$(value, "0.###############")
+    result = Replace$(result, ",", ".")
+    formatHarmonizedNumber = result
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    formatHarmonizedNumber = vbNullString
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    value As String
+' Returns:       String
+' Description:   Escapes one semicolon-delimited CSV field only when quoting is required.
+'-------------------------------------------------------------------------------
+Private Function escapeHarmonizedCsvValue(ByVal value As String) As String
+    Const METHOD_NAME As String = "escapeHarmonizedCsvValue"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim result As String
+
+    On Error GoTo ErrorHandler
+
+    result = Replace$(value, vbCrLf, " ")
+    result = Replace$(result, vbCr, " ")
+    result = Replace$(result, vbLf, " ")
+
+    If InStr(1, result, CSV_SEPARATOR, vbBinaryCompare) > 0 Or InStr(1, result, Chr$(34), vbBinaryCompare) > 0 Then
+        result = Replace$(result, Chr$(34), Chr$(34) & Chr$(34))
+        result = Chr$(34) & result & Chr$(34)
+    End If
+
+    escapeHarmonizedCsvValue = result
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    escapeHarmonizedCsvValue = value
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    wksScratch As Excel.Worksheet
+' Returns:       ---
+' Description:   Clears the two-row scratch area before the existing fillTradeData procedure is reused for the next transaction.
+'-------------------------------------------------------------------------------
+Private Sub resetScratchArea(ByRef wksScratch As Excel.Worksheet)
+    Const METHOD_NAME As String = "resetScratchArea"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    wksScratch.Range("A1:V2").ClearContents
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    fileNum As Long, blnFileOpen As Boolean
+' Returns:       ---
+' Description:   Closes the harmonized CSV file handle without masking the original process error.
+'-------------------------------------------------------------------------------
+Private Sub closeHarmonizedFileSafe(ByRef fileNum As Long, ByRef blnFileOpen As Boolean)
+    Const METHOD_NAME As String = "closeHarmonizedFileSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If blnFileOpen Then
+        Close #fileNum
+        blnFileOpen = False
+        fileNum = 0
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    blnFileOpen = False
+    fileNum = 0
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-03
+' Parameters:    wkbScratch As Excel.Workbook
+' Returns:       ---
+' Description:   Closes the temporary harmonized workbook without saving it.
+'-------------------------------------------------------------------------------
+Private Sub closeHarmonizedWorkbookSafe(ByRef wkbScratch As Excel.Workbook)
+    Const METHOD_NAME As String = "closeHarmonizedWorkbookSafe"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    If Not wkbScratch Is Nothing Then
+        wkbScratch.Close SaveChanges:=False
+    End If
+
+ExitSub:
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitSub
+End Sub
