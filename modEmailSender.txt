@@ -827,6 +827,7 @@ Private Function sendFilesBatched(ByRef fso As Object, ByRef outApp As Object, B
     Dim batches As Collection
     Dim currentBatch As Collection
     Dim currentBatchBytes As Double
+    Dim ensuredArchiveFolders As Object
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
@@ -849,6 +850,7 @@ Private Function sendFilesBatched(ByRef fso As Object, ByRef outApp As Object, B
     varPreviousStatusBar = Application.StatusBar
     Set allEntries = New Collection
     Set batches = New Collection
+    Set ensuredArchiveFolders = CreateObject("Scripting.Dictionary")
     sendFilesBatched = 0
     moved = 0
 
@@ -961,7 +963,7 @@ Private Function sendFilesBatched(ByRef fso As Object, ByRef outApp As Object, B
 
         Application.StatusBar = "Archiving attachments from batch " & batchIndex & "/" & numberOfBatches & "..."
         DoEvents
-        moved = moved + archiveBatchFiles(fso, batchFiles)
+        moved = moved + archiveBatchFiles(fso, batchFiles, ensuredArchiveFolders)
         Set mailItem = Nothing
     Next batchIndex
 
@@ -974,6 +976,7 @@ ExitFunction:
     Set currentBatch = Nothing
     Set batches = Nothing
     Set allEntries = Nothing
+    Set ensuredArchiveFolders = Nothing
 
     If errNumber <> 0 Then
         isRethrowing = True
@@ -1007,14 +1010,16 @@ End Function
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-09-04
-' Parameters:    fsoObj As Object, batchFiles As Collection
+' Parameters:    fsoObj As Object, batchFiles As Collection, ensuredArchiveFolders As Object
 ' Returns:       Long
 ' Description:   Archives only exact files attached to one completed e-mail batch.
-'                Non-collision files are moved in exact-name robocopy batches for performance.
+'                Same-volume non-collision files use a native exact-path move first;
+'                remaining files use exact-name robocopy batches. Archive folders are cached.
 '-------------------------------------------------------------------------------
-Private Function archiveBatchFiles(ByRef fsoObj As Object, ByRef batchFiles As Collection) As Long
+Private Function archiveBatchFiles(ByRef fsoObj As Object, ByRef batchFiles As Collection, ByRef ensuredArchiveFolders As Object) As Long
     Const METHOD_NAME As String = "archiveBatchFiles"
     Const GROUP_KEY_SEPARATOR As String = "|#|"
+    Dim archiveFolderKey As String
     Dim archiveRoot As String
     Dim baseName As String
     Dim bulkGroup As Collection
@@ -1056,7 +1061,21 @@ Private Function archiveBatchFiles(ByRef fsoObj As Object, ByRef batchFiles As C
             If fsoObj.FileExists(filePath) Then
                 dynamicArchivePath = archiveRoot & Format$(Date, "yyyy") & "\" & _
                                      Format$(Date, "mm") & "\" & Format$(Date, "dd") & "\"
-                Call ensureFolderExists(fsoObj, dynamicArchivePath)
+                archiveFolderKey = LCase$(dynamicArchivePath)
+
+                If ensuredArchiveFolders Is Nothing Then
+                    Call ensureFolderExists(fsoObj, dynamicArchivePath)
+                ElseIf Not ensuredArchiveFolders.Exists(archiveFolderKey) Then
+                    If fsoObj.FolderExists(dynamicArchivePath) Then
+                        ensuredArchiveFolders.Add archiveFolderKey, True
+                    Else
+                        Call ensureFolderExists(fsoObj, dynamicArchivePath)
+
+                        If fsoObj.FolderExists(dynamicArchivePath) Then
+                            ensuredArchiveFolders.Add archiveFolderKey, True
+                        End If
+                    End If
+                End If
 
                 fileName = fsoObj.GetFileName(filePath)
                 sourceFolder = fsoObj.GetParentFolderName(filePath)
@@ -1088,15 +1107,29 @@ Private Function archiveBatchFiles(ByRef fsoObj As Object, ByRef batchFiles As C
                         movedCounter = movedCounter + 1
                     End If
                 Else
-                    groupKey = sourceFolder & GROUP_KEY_SEPARATOR & destinationFolder
+                    moveSucceeded = False
 
-                    If Not bulkGroups.Exists(groupKey) Then
-                        Set bulkGroup = New Collection
-                        bulkGroups.Add groupKey, bulkGroup
+                    If canUseNativeArchiveMove(filePath, dest) Then
+                        moveSucceeded = tryRename(filePath, dest)
+
+                        If Not moveSucceeded Then
+                            moveSucceeded = tryMoveFile(fsoObj, filePath, dest)
+                        End If
                     End If
 
-                    Set bulkGroup = bulkGroups(groupKey)
-                    bulkGroup.Add fileName
+                    If moveSucceeded Then
+                        movedCounter = movedCounter + 1
+                    Else
+                        groupKey = sourceFolder & GROUP_KEY_SEPARATOR & destinationFolder
+
+                        If Not bulkGroups.Exists(groupKey) Then
+                            Set bulkGroup = New Collection
+                            bulkGroups.Add groupKey, bulkGroup
+                        End If
+
+                        Set bulkGroup = bulkGroups(groupKey)
+                        bulkGroup.Add fileName
+                    End If
                 End If
             End If
         End If
@@ -1143,7 +1176,7 @@ Private Function MoveExactFilesBulk(ByRef fsoObj As Object, _
                                     ByVal destinationFolder As String, _
                                     ByRef fileNames As Collection) As Long
     Const METHOD_NAME As String = "MoveExactFilesBulk"
-    Const MAX_FILES_PER_ROBOCOPY As Long = 25
+    Const MAX_FILES_PER_ROBOCOPY As Long = 100
     Const MAX_COMMAND_LENGTH As Long = 7000
     Dim chunkFiles As Collection
     Dim commandLength As Long
@@ -1234,8 +1267,10 @@ Private Function ExecuteExactRobocopyMove(ByRef fsoObj As Object, _
     Dim errNumber As Long
     Dim exitCode As Long
     Dim fileName As Variant
+    Dim destinationExists As Boolean
     Dim movedCounter As Long
     Dim shellObj As Object
+    Dim sourceExists As Boolean
     Dim sourcePath As String
 
     On Error GoTo ErrorHandler
@@ -1270,10 +1305,12 @@ Private Function ExecuteExactRobocopyMove(ByRef fsoObj As Object, _
     For Each fileName In fileNames
         sourcePath = fsoObj.BuildPath(sourceFolder, CStr(fileName))
         destinationPath = fsoObj.BuildPath(destinationFolder, CStr(fileName))
+        sourceExists = fsoObj.FileExists(sourcePath)
+        destinationExists = fsoObj.FileExists(destinationPath)
 
-        If Not fsoObj.FileExists(sourcePath) And fsoObj.FileExists(destinationPath) Then
+        If Not sourceExists And destinationExists Then
             movedCounter = movedCounter + 1
-        ElseIf fsoObj.FileExists(sourcePath) Then
+        ElseIf sourceExists Then
             If tryMoveFile(fsoObj, sourcePath, destinationPath) Then
                 movedCounter = movedCounter + 1
             End If
@@ -1385,6 +1422,100 @@ ErrorHandler:
     errNumber = VBA.Err.Number
     errDescription = VBA.Err.Description
     finalizeMail = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-04
+' Parameters:    sourcePath As String, destinationPath As String
+' Returns:       Boolean
+' Description:   Returns True only when both paths are on the same explicit drive
+'                or UNC share, where VBA Name can perform a fast native move.
+'                Ambiguous paths deliberately fall back to exact-file robocopy.
+'-------------------------------------------------------------------------------
+Private Function canUseNativeArchiveMove(ByVal sourcePath As String, ByVal destinationPath As String) As Boolean
+    Const METHOD_NAME As String = "canUseNativeArchiveMove"
+    Dim destinationRoot As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim sourceRoot As String
+
+    On Error GoTo ErrorHandler
+
+    sourceRoot = getArchivePathRoot(sourcePath)
+    destinationRoot = getArchivePathRoot(destinationPath)
+
+    canUseNativeArchiveMove = (Len(sourceRoot) > 0 And _
+                               Len(destinationRoot) > 0 And _
+                               StrComp(sourceRoot, destinationRoot, vbTextCompare) = 0)
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    canUseNativeArchiveMove = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-04
+' Parameters:    fullPath As String
+' Returns:       String
+' Description:   Returns a comparable local drive root (for example C:) or UNC
+'                share root (for example \\server\share).
+'-------------------------------------------------------------------------------
+Private Function getArchivePathRoot(ByVal fullPath As String) As String
+    Const METHOD_NAME As String = "getArchivePathRoot"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim firstSeparator As Long
+    Dim normalizedPath As String
+    Dim remainder As String
+    Dim secondSeparator As Long
+
+    On Error GoTo ErrorHandler
+
+    normalizedPath = Replace(fullPath, "/", "\")
+
+    If Len(normalizedPath) >= 2 And Mid$(normalizedPath, 2, 1) = ":" Then
+        getArchivePathRoot = UCase$(Left$(normalizedPath, 2))
+        GoTo ExitFunction
+    End If
+
+    If Left$(normalizedPath, 2) = "\\" Then
+        remainder = Mid$(normalizedPath, 3)
+        firstSeparator = InStr(1, remainder, "\", vbBinaryCompare)
+
+        If firstSeparator > 1 Then
+            secondSeparator = InStr(firstSeparator + 1, remainder, "\", vbBinaryCompare)
+
+            If secondSeparator > firstSeparator + 1 Then
+                getArchivePathRoot = "\\" & Left$(remainder, secondSeparator - 1)
+            ElseIf secondSeparator = 0 And Len(remainder) > firstSeparator Then
+                getArchivePathRoot = "\\" & remainder
+            End If
+        End If
+    End If
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    getArchivePathRoot = vbNullString
 
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
     errorManager.save
