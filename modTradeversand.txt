@@ -701,7 +701,7 @@ nextRow:
                       "The key-value RAW PDF could not be generated for fund " & fundId & "."
         End If
     Else
-        wsOut.ExportAsFixedFormat Type:=xlTypePDF, fileName:=fullPdfPath, Quality:=xlQualityStandard, IncludeDocProperties:=True, IgnorePrintAreas:=False, OpenAfterPublish:=False
+        wsOut.ExportAsFixedFormat Type:=xlTypePDF, fileName:=fullPdfPath, Quality:=xlQualityMinimum, IncludeDocProperties:=False, IgnorePrintAreas:=False, OpenAfterPublish:=False
     End If
 
 ExitSub:
@@ -3560,7 +3560,7 @@ Public Sub convertFfyCsvToPdf(ByVal csvFullPath As String, ByVal pdfFullPath As 
 
     Call ApplySensitivityLabel(wbCsv, "8ffbc0b8-e97b-47d1-beac-cb0955d66f3b")
 
-    wsCsv.ExportAsFixedFormat Type:=xlTypePDF, fileName:=pdfFullPath, Quality:=xlQualityStandard, IncludeDocProperties:=True, IgnorePrintAreas:=False, OpenAfterPublish:=False
+    wsCsv.ExportAsFixedFormat Type:=xlTypePDF, fileName:=pdfFullPath, Quality:=xlQualityMinimum, IncludeDocProperties:=False, IgnorePrintAreas:=False, OpenAfterPublish:=False
 
 ExitSub:
     If blnPageSetupBatchStarted Then
