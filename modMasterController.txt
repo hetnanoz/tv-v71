@@ -3,6 +3,8 @@ Option Explicit
 Private Const CLASS_NAME As String = "modMasterController"
 Private Const LAST_TRANSACTION_COLUMN As Long = 110
 Private Const ARCHIVE_INPUT_FILES_AFTER_LOAD As Boolean = False ' Set to True after testing.
+Private Const POWER_PDF_CLIENT_WAIT_TIMEOUT_SECONDS As Long = 900
+Private Const EMAIL_FILE_TIMESTAMP_TOLERANCE_SECONDS As Long = 5
 
 Private gblnDeferredCompletionPending As Boolean
 Private gblnDeferredRunAll As Boolean
@@ -32,7 +34,9 @@ Public Sub executeMasterProcess()
     Dim blnApplicationStateCaptured As Boolean
     Dim clientDict As Object
     Dim clientResult As String
+    Dim currentClientName As String
     Dim destFolder As String
+    Dim emailNotBefore As Date
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
@@ -132,12 +136,16 @@ Public Sub executeMasterProcess()
 
         Call progressStartKvg(1, targetKvg)
 
+        currentClientName = CStr(wsMacro.Range("results_file_name").Value)
+        emailNotBefore = DateAdd("s", -EMAIL_FILE_TIMESTAMP_TOLERANCE_SECONDS, Now)
+
         batchSummary = runProcessForClient( _
-            CStr(wsMacro.Range("results_file_name").Value), _
+            currentClientName, _
             inputDataArr, _
             clientDict, _
             sendAfter, _
-            fondslisteArr)
+            fondslisteArr, _
+            emailNotBefore)
 
         If batchSummary = "ERROR" Then
             If glngLastClientErrorNumber = 0 Then
@@ -157,7 +165,8 @@ Public Sub executeMasterProcess()
                     GoTo NextRow
                 End If
 
-                wsMacro.Range("results_file_name").Value = wsMap.Cells(rowIndex, "A").Value
+                currentClientName = Trim$(CStr(wsMap.Cells(rowIndex, "A").Value))
+                wsMacro.Range("results_file_name").Value = currentClientName
 
                 Application.Calculate
                 Call WaitForCalculationComplete(METHOD_NAME)
@@ -169,23 +178,49 @@ Public Sub executeMasterProcess()
                     kvgProcessedIndex = kvgProcessedIndex + 1
                     Call progressStartKvg(kvgProcessedIndex, targetKvg)
 
+                    emailNotBefore = DateAdd("s", -EMAIL_FILE_TIMESTAMP_TOLERANCE_SECONDS, Now)
+
                     clientResult = runProcessForClient( _
-                        CStr(wsMap.Cells(rowIndex, "A").Value), _
+                        currentClientName, _
                         inputDataArr, _
                         clientDict, _
                         sendAfter, _
-                        fondslisteArr)
+                        fondslisteArr, _
+                        emailNotBefore)
 
                     batchSummary = batchSummary & _
-                                   CStr(wsMap.Cells(rowIndex, "A").Value) & ": " & _
+                                   currentClientName & ": " & _
                                    clientResult & _
                                    vbCrLf
 
                     If clientResult = "ERROR" Then
-                        If glngLastClientErrorNumber = 1015 _
+                        If sendAfter Then
+                            If glngLastClientErrorNumber = 0 Then
+                                glngLastClientErrorNumber = 1001
+                            End If
+
+                            Err.Raise _
+                                glngLastClientErrorNumber, _
+                                METHOD_NAME, _
+                                "SAFETY ABORT for client '" & currentClientName & "': " & _
+                                gstrLastClientErrorDescription
+                        ElseIf glngLastClientErrorNumber = 1015 _
                             Or (glngLastClientErrorNumber >= 1020 And glngLastClientErrorNumber <= 1029) Then
                             Err.Raise glngLastClientErrorNumber, METHOD_NAME, gstrLastClientErrorDescription
                         End If
+                    ElseIf sendAfter Then
+                        ' Never let a global completion callback fire while one KVG is isolated.
+                        Call SetPowerPdfCompletionCallback(vbNullString)
+
+                        If Not WaitForPowerPdfBatchComplete(POWER_PDF_CLIENT_WAIT_TIMEOUT_SECONDS) Then
+                            Err.Raise _
+                                1072, _
+                                METHOD_NAME, _
+                                "SAFETY ABORT: Power PDF files for client '" & currentClientName & _
+                                "' were not fully completed within the timeout. No e-mail was created and the next KVG was not started."
+                        End If
+
+                        Call SendCurrentKvgEmailRequest(currentClientName)
                     End If
                 End If
 
@@ -245,9 +280,10 @@ ErrorHandler:
         METHOD_NAME, _
         errNumber, _
         errDescription, _
-        "runAll;targetKvg;processedKvgCount", _
+        "runAll;targetKvg;currentClientName;processedKvgCount", _
         runAll, _
         targetKvg, _
+        currentClientName, _
         kvgProcessedIndex
     errorManager.save
     errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
@@ -321,7 +357,8 @@ End Sub
 Private Sub QueueClientEmailRequest(ByVal blnHasChild As Boolean, _
                                     ByVal strClientName As String, _
                                     ByVal strChildName As String, _
-                                    ByVal blnUseChildOwnPaths As Boolean)
+                                    ByVal blnUseChildOwnPaths As Boolean, _
+                                    Optional ByVal dtNotBefore As Date = 0)
     Const METHOD_NAME As String = "QueueClientEmailRequest"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -337,7 +374,8 @@ Private Sub QueueClientEmailRequest(ByVal blnHasChild As Boolean, _
         blnHasChild, _
         strClientName, _
         strChildName, _
-        blnUseChildOwnPaths)
+        blnUseChildOwnPaths, _
+        dtNotBefore)
 
 ExitSub:
     Exit Sub
@@ -351,10 +389,11 @@ ErrorHandler:
         METHOD_NAME, _
         errNumber, _
         errDescription, _
-        "clientName;childName;useChildOwnPaths", _
+        "clientName;childName;useChildOwnPaths;notBefore", _
         strClientName, _
         strChildName, _
-        blnUseChildOwnPaths
+        blnUseChildOwnPaths, _
+        dtNotBefore
     errorManager.save
     Resume ExitSub
 End Sub
@@ -371,6 +410,7 @@ Private Sub SendDeferredEmailRequests()
     Dim errorManager As New ErrorManager
     Dim errDescription As String
     Dim errNumber As Long
+    Dim strEmailError As String
     Dim strPreviousResultsFileName As String
     Dim varRequest As Variant
     Dim wksConfig As Excel.Worksheet
@@ -391,23 +431,55 @@ Private Sub SendDeferredEmailRequests()
     For Each varRequest In gcolPendingEmailRequests
         wksConfig.Range("results_file_name").Value = CStr(varRequest(1))
         Application.Calculate
-        DoEvents
+        Call WaitForCalculationComplete(METHOD_NAME)
+
+        If StrComp(Trim$(CStr(wksConfig.Range("results_file_name").Value)), _
+                   Trim$(CStr(varRequest(1))), _
+                   vbTextCompare) <> 0 Then
+            Err.Raise _
+                1073, _
+                METHOD_NAME, _
+                "SAFETY ABORT: e-mail configuration could not be switched to expected client '" & _
+                CStr(varRequest(1)) & "'."
+        End If
 
         If CBool(varRequest(0)) Then
             Call processAndSendTradeversand_withChild( _
                 CStr(varRequest(1)), _
                 CStr(varRequest(2)), _
-                CBool(varRequest(3)))
+                CBool(varRequest(3)), _
+                CDate(varRequest(4)))
         Else
-            Call processAndSendTradeversand
+            Call processAndSendTradeversand( _
+                CStr(varRequest(1)), _
+                CDate(varRequest(4)))
+        End If
+
+        If Not WasLastTradeversandEmailPreparationSuccessful() Then
+            strEmailError = GetLastTradeversandEmailPreparationError()
+
+            If Len(Trim$(strEmailError)) = 0 Then
+                strEmailError = "Unknown e-mail preparation error."
+            End If
+
+            Err.Raise _
+                1074, _
+                METHOD_NAME, _
+                "SAFETY ABORT while preparing e-mail for client '" & _
+                CStr(varRequest(1)) & "': " & strEmailError
         End If
     Next varRequest
+
+    ' Clear only after all requested draft(s) were prepared successfully.
+    Set gcolPendingEmailRequests = Nothing
 
 ExitSub:
     If Len(strPreviousResultsFileName) > 0 Then
         Call RestoreTradeversandResultsFileNameSafe(strPreviousResultsFileName, METHOD_NAME)
     End If
+
     Set wksConfig = Nothing
+
     If errNumber <> 0 Then
         VBA.Err.Raise errNumber, METHOD_NAME, errDescription
     End If
@@ -425,6 +497,71 @@ ErrorHandler:
     errorManager.save
     GoTo ExitSub
 End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-04
+' Parameters:    expectedClientName As String
+' Returns:       ---
+' Description:   Sends exactly one queued request for the KVG that has just completed.
+'-------------------------------------------------------------------------------
+Private Sub SendCurrentKvgEmailRequest(ByVal expectedClientName As String)
+    Const METHOD_NAME As String = "SendCurrentKvgEmailRequest"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim varRequest As Variant
+
+    On Error GoTo ErrorHandler
+
+    If gcolPendingEmailRequests Is Nothing Then
+        Err.Raise _
+            1075, _
+            METHOD_NAME, _
+            "SAFETY ABORT: no e-mail request was queued for client '" & expectedClientName & "'."
+    End If
+
+    If gcolPendingEmailRequests.Count <> 1 Then
+        Err.Raise _
+            1076, _
+            METHOD_NAME, _
+            "SAFETY ABORT: expected exactly one current-KVG e-mail request for client '" & _
+            expectedClientName & "' but found " & CStr(gcolPendingEmailRequests.Count) & "."
+    End If
+
+    varRequest = gcolPendingEmailRequests.Item(1)
+
+    If StrComp(Trim$(CStr(varRequest(1))), Trim$(expectedClientName), vbTextCompare) <> 0 Then
+        Err.Raise _
+            1077, _
+            METHOD_NAME, _
+            "SAFETY ABORT: queued e-mail client '" & CStr(varRequest(1)) & _
+            "' does not match the KVG that just finished ('" & expectedClientName & "')."
+    End If
+
+    Call SendDeferredEmailRequests
+
+ExitSub:
+    If errNumber <> 0 Then
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "expectedClientName", _
+        expectedClientName
+    errorManager.save
+    GoTo ExitSub
+End Sub
+
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
@@ -468,7 +605,7 @@ End Sub
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-05
-' Parameters:    clientName As String, inArr As Variant, cDict As Object, sendNow As Boolean, fondsArr As Variant
+' Parameters:    clientName As String, inArr As Variant, cDict As Object, sendNow As Boolean, fondsArr As Variant, emailNotBefore As Date, optional
 ' Returns:       String
 ' Description:   Generates reports and optional e-mails for one parent client and its configured child.
 '-------------------------------------------------------------------------------
@@ -476,7 +613,8 @@ Private Function runProcessForClient(ByVal clientName As String, _
                                      ByRef inArr As Variant, _
                                      ByRef cDict As Object, _
                                      ByVal sendNow As Boolean, _
-                                     ByRef fondsArr As Variant) As String
+                                     ByRef fondsArr As Variant, _
+                                     Optional ByVal emailNotBefore As Date = 0) As String
     Const METHOD_NAME As String = "runProcessForClient"
     Dim blnPreviousScreenUpdating As Boolean
     Dim blnScreenUpdatingCaptured As Boolean
@@ -534,7 +672,7 @@ Private Function runProcessForClient(ByVal clientName As String, _
         Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
 
         If sendNow Then
-            Call QueueClientEmailRequest(False, clientName, vbNullString, False)
+            Call QueueClientEmailRequest(False, clientName, vbNullString, False, emailNotBefore)
         End If
 
         runProcessForClient = totalCsv & " CSV, " & totalPdf & " PDF"
@@ -723,7 +861,7 @@ Private Function runProcessForClient(ByVal clientName As String, _
     End If
 
     If sendNow Then
-        Call QueueClientEmailRequest(True, clientName, childFileName, ownPaths)
+        Call QueueClientEmailRequest(True, clientName, childFileName, ownPaths, emailNotBefore)
     End If
 
     runProcessForClient = totalCsv & " CSV, " & totalPdf & " PDF"
