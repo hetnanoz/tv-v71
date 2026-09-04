@@ -392,6 +392,92 @@ End Sub
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
+' Creation date: 2026-09-04
+' Parameters:    lngTimeoutSeconds As Long
+' Returns:       Boolean
+' Description:   Waits synchronously until the currently registered Power PDF
+'                queue is empty. Used to isolate one KVG before its e-mail is
+'                created. On timeout, asynchronous queue processing is resumed.
+'-------------------------------------------------------------------------------
+Public Function WaitForPowerPdfBatchComplete(ByVal lngTimeoutSeconds As Long) As Boolean
+    Const METHOD_NAME As String = "WaitForPowerPdfBatchComplete"
+    Dim dblStartTime As Double
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+
+    On Error GoTo ErrorHandler
+
+    WaitForPowerPdfBatchComplete = False
+
+    If lngTimeoutSeconds <= 0 Then
+        Err.Raise 1070, METHOD_NAME, "Power PDF wait timeout must be greater than zero seconds."
+    End If
+
+    If Not gblnBatchActive Then
+        WaitForPowerPdfBatchComplete = (GetPowerPdfPendingCount() = 0)
+        GoTo ExitFunction
+    End If
+
+    Call CancelScheduledPowerPdfPump
+    dblStartTime = Timer
+
+    Do
+        Call ProcessCompletedPowerPdfJobs
+        Call LogDelayedPowerPdfQueue
+
+        If GetPowerPdfPendingCount() = 0 Then
+            Call CompletePowerPdfBatch
+            WaitForPowerPdfBatchComplete = True
+            GoTo ExitFunction
+        End If
+
+        If GetElapsedSeconds(dblStartTime) >= lngTimeoutSeconds Then
+            glngLastPowerPdfErrorNumber = 1071
+            gstrLastPowerPdfErrorDescription = _
+                "Timed out while waiting for the current KVG Power PDF queue. " & _
+                "No e-mail was created for this KVG."
+
+            If gblnBatchActive Then
+                Call SchedulePowerPdfPump
+            End If
+
+            GoTo ExitFunction
+        End If
+
+        DoEvents
+        Application.Wait DateAdd("s", 1, Now)
+    Loop
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    glngLastPowerPdfErrorNumber = errNumber
+    gstrLastPowerPdfErrorDescription = errDescription
+    WaitForPowerPdfBatchComplete = False
+
+    If gblnBatchActive Then
+        Call SchedulePowerPdfPump
+    End If
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "timeoutSeconds;pendingCount", _
+        lngTimeoutSeconds, _
+        GetPowerPdfPendingCount()
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
 ' Creation date: 2026-08-05
 ' Parameters:    ByVal strProcedureName As String
 ' Returns:       ---
