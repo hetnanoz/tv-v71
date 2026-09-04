@@ -139,7 +139,7 @@ Public Sub executeMasterProcess()
         currentClientName = CStr(wsMacro.Range("results_file_name").Value)
         emailNotBefore = DateAdd("s", -EMAIL_FILE_TIMESTAMP_TOLERANCE_SECONDS, Now)
 
-        batchSummary = runProcessForClient( _
+        clientResult = runProcessForClient( _
             currentClientName, _
             inputDataArr, _
             clientDict, _
@@ -147,11 +147,15 @@ Public Sub executeMasterProcess()
             fondslisteArr, _
             emailNotBefore)
 
-        If batchSummary = "ERROR" Then
+        If clientResult = "ERROR" Then
             If glngLastClientErrorNumber = 0 Then
                 glngLastClientErrorNumber = 1001
             End If
             Err.Raise glngLastClientErrorNumber, METHOD_NAME, gstrLastClientErrorDescription
+        ElseIf clientResult = "NO TRANSACTIONS" Then
+            batchSummary = currentClientName & ": NO TRANSACTIONS"
+        Else
+            batchSummary = clientResult
         End If
     Else
         lastRow = wsMap.Cells(wsMap.Rows.Count, "A").End(xlUp).Row
@@ -208,6 +212,9 @@ Public Sub executeMasterProcess()
                             Or (glngLastClientErrorNumber >= 1020 And glngLastClientErrorNumber <= 1029) Then
                             Err.Raise glngLastClientErrorNumber, METHOD_NAME, gstrLastClientErrorDescription
                         End If
+                    ElseIf clientResult = "NO TRANSACTIONS" Then
+                        ' Informational result only. Do not queue or create an empty e-mail.
+                        Debug.Print currentClientName & ": NO TRANSACTIONS"
                     ElseIf sendAfter Then
                         ' Never let a global completion callback fire while one KVG is isolated.
                         Call SetPowerPdfCompletionCallback(vbNullString)
@@ -317,6 +324,11 @@ Public Sub CompleteTradeversandAfterPowerPdf()
             "Process finished." & vbCrLf & vbCrLf & "Summary:" & vbCrLf & gstrDeferredBatchSummary, _
             vbInformation, _
             "Batch Summary"
+    ElseIf InStr(1, gstrDeferredBatchSummary, "NO TRANSACTIONS", vbTextCompare) > 0 Then
+        MsgBox _
+            "Process finished." & vbCrLf & gstrDeferredBatchSummary, _
+            vbInformation, _
+            "No Transactions"
     Else
         MsgBox _
             "Process finished." & vbCrLf & "Generated: " & gstrDeferredBatchSummary, _
@@ -633,6 +645,8 @@ Private Function runProcessForClient(ByVal clientName As String, _
     Dim errNumber As Long
     Dim hasFfy As Boolean
     Dim hasXlsx As Boolean
+    Dim inclFreeOfPayment As Boolean
+    Dim eligibilityDict As Object
     Dim originalFileName As String
     Dim ownCsvName As Boolean
     Dim ownCsvNr As Boolean
@@ -664,10 +678,16 @@ Private Function runProcessForClient(ByVal clientName As String, _
 
     Set wsMacro = ThisWorkbook.Worksheets("Tradeversand")
     Set wsMap = ThisWorkbook.Worksheets("Mapping")
+    inclFreeOfPayment = readChildBoolean(wsMacro, "incl_free_of_payment")
 
     childRow = findChildRowForParent(wsMap, clientName)
 
     If childRow = 0 Then
+        If Not HasEligibleTransactionsForDictionary(inArr, cDict, inclFreeOfPayment) Then
+            runProcessForClient = "NO TRANSACTIONS"
+            GoTo ExitFunction
+        End If
+
         Call generatePerfectReportsV3(inArr, cDict, clientStats, fondsArr:=fondsArr)
         Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
 
@@ -710,6 +730,14 @@ Private Function runProcessForClient(ByVal clientName As String, _
     DoEvents
 
     Set childDict = buildClientDictFromArray(fondsArr, childKvg)
+    Set eligibilityDict = mergeDictionaries(cDict, childDict)
+
+    If Not HasEligibleTransactionsForDictionary(inArr, eligibilityDict, inclFreeOfPayment) Then
+        runProcessForClient = "NO TRANSACTIONS"
+        GoTo ExitFunction
+    End If
+
+    Set eligibilityDict = Nothing
 
     If separateCsv And Not ownCsvName And Not ownCsvNr Then
         Err.Raise _
@@ -882,6 +910,7 @@ ExitFunction:
     If blnScreenUpdatingCaptured Then
         Call RestoreApplicationScreenUpdatingSafe(blnPreviousScreenUpdating, METHOD_NAME)
     End If
+    Set eligibilityDict = Nothing
     Set combinedDict = Nothing
     Set childDict = Nothing
     Set wsMap = Nothing
@@ -907,6 +936,70 @@ ErrorHandler:
         ownPaths
     errorManager.save
     Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-04
+' Parameters:    inputArr As Variant, fundDict As Object, includeFreeOfPayment As Boolean
+' Returns:       Boolean
+' Description:   Returns whether at least one input transaction is eligible for the supplied KVG fund set.
+'                Uses the same Free of Payment and L/B eligibility conditions as the report generation path.
+'-------------------------------------------------------------------------------
+Private Function HasEligibleTransactionsForDictionary(ByRef inputArr As Variant, _
+                                                      ByRef fundDict As Object, _
+                                                      ByVal includeFreeOfPayment As Boolean) As Boolean
+    Const METHOD_NAME As String = "HasEligibleTransactionsForDictionary"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fundId As String
+    Dim rowIndex As Long
+
+    On Error GoTo ErrorHandler
+
+    HasEligibleTransactionsForDictionary = False
+
+    If fundDict Is Nothing Then
+        GoTo ExitFunction
+    End If
+
+    If fundDict.Count = 0 Or Not IsArray(inputArr) Then
+        GoTo ExitFunction
+    End If
+
+    For rowIndex = 2 To UBound(inputArr, 1)
+        If includeFreeOfPayment Or extractNumber(inputArr(rowIndex, 52)) <> 0 Then
+            fundId = Right$(safeString(inputArr(rowIndex, 4)), 11)
+
+            If Len(fundId) > 0 And fundDict.Exists(fundId) Then
+                If UCase$(Trim$(safeString(inputArr(rowIndex, 15)))) <> "L/B" Then
+                    HasEligibleTransactionsForDictionary = True
+                    GoTo ExitFunction
+                End If
+            End If
+        End If
+    Next rowIndex
+
+ExitFunction:
+    If errNumber <> 0 Then
+        VBA.Err.Raise errNumber, CLASS_NAME & "." & METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "includeFreeOfPayment", _
+        includeFreeOfPayment
+    errorManager.save
+    GoTo ExitFunction
 End Function
 
 '-------------------------------------------------------------------------------
