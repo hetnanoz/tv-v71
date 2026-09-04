@@ -92,7 +92,7 @@ Public Sub processAndSendTradeversand(Optional ByVal expectedClientName As Strin
         attachHarmonizedCsv = getSafeBoolean(.Range("attach_harmonized_csv_to_email").Value)
         onlyFfy = getSafeBoolean(.Range("attach_only_ffy_csv").Value)
         maxAtt = getSafeLong(.Range("max_attachments_per_mail").Value)
-        maxTotalAttachmentMb = getSafeDouble(.Range("max_total_attachment_size_mb").Value)
+        maxTotalAttachmentMb = getAttachmentSizeLimitMb(wsConfig)
     End With
 
     If maxTotalAttachmentMb <= 0 Then
@@ -319,7 +319,7 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
         attachHarmonizedCsv = getSafeBoolean(.Range("attach_harmonized_csv_to_email").Value)
         onlyFfy = getSafeBoolean(.Range("attach_only_ffy_csv").Value)
         maxAtt = getSafeLong(.Range("max_attachments_per_mail").Value)
-        maxTotalAttachmentMb = getSafeDouble(.Range("max_total_attachment_size_mb").Value)
+        maxTotalAttachmentMb = getAttachmentSizeLimitMb(wsConfig)
     End With
 
     If maxTotalAttachmentMb <= 0 Then
@@ -1005,12 +1005,23 @@ End Function
 ' Returns:       Long
 ' Description:   Archives only the exact files attached to one completed e-mail batch.
 '-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-04
+' Parameters:    fsoObj As Object, batchFiles As Collection
+' Returns:       Long
+' Description:   Archives only exact files attached to one completed e-mail batch.
+'                Non-collision files are moved in exact-name robocopy batches for performance.
+'-------------------------------------------------------------------------------
 Private Function archiveBatchFiles(ByRef fsoObj As Object, ByRef batchFiles As Collection) As Long
     Const METHOD_NAME As String = "archiveBatchFiles"
+    Const GROUP_KEY_SEPARATOR As String = "|#|"
     Dim archiveRoot As String
     Dim baseName As String
+    Dim bulkGroup As Collection
+    Dim bulkGroups As Object
     Dim collisionIndex As Long
     Dim dest As String
+    Dim destinationFolder As String
     Dim dynamicArchivePath As String
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -1019,8 +1030,12 @@ Private Function archiveBatchFiles(ByRef fsoObj As Object, ByRef batchFiles As C
     Dim fileEntry As Variant
     Dim fileName As String
     Dim filePath As String
-    Dim moveSucceeded As Boolean
+    Dim groupKey As String
+    Dim groupKeyParts As Variant
     Dim movedCounter As Long
+    Dim moveSucceeded As Boolean
+    Dim sourceFolder As String
+    Dim varGroupKey As Variant
 
     On Error GoTo ErrorHandler
 
@@ -1030,6 +1045,8 @@ Private Function archiveBatchFiles(ByRef fsoObj As Object, ByRef batchFiles As C
     If batchFiles Is Nothing Then
         GoTo ExitFunction
     End If
+
+    Set bulkGroups = CreateObject("Scripting.Dictionary")
 
     For Each fileEntry In batchFiles
         filePath = CStr(fileEntry(0))
@@ -1042,36 +1059,64 @@ Private Function archiveBatchFiles(ByRef fsoObj As Object, ByRef batchFiles As C
                 Call ensureFolderExists(fsoObj, dynamicArchivePath)
 
                 fileName = fsoObj.GetFileName(filePath)
-                baseName = fsoObj.GetBaseName(fileName)
-                extensionName = fsoObj.GetExtensionName(fileName)
+                sourceFolder = fsoObj.GetParentFolderName(filePath)
+                destinationFolder = Left$(dynamicArchivePath, Len(dynamicArchivePath) - 1)
                 dest = dynamicArchivePath & fileName
-                collisionIndex = 0
 
-                Do While fsoObj.FileExists(dest)
-                    collisionIndex = collisionIndex + 1
-                    dest = dynamicArchivePath & baseName & "_" & Format$(Now, "hhmmss") & _
-                           "_" & CStr(collisionIndex)
-                    If Len(extensionName) > 0 Then
-                        dest = dest & "." & extensionName
+                If fsoObj.FileExists(dest) Then
+                    baseName = fsoObj.GetBaseName(fileName)
+                    extensionName = fsoObj.GetExtensionName(fileName)
+                    collisionIndex = 0
+
+                    Do While fsoObj.FileExists(dest)
+                        collisionIndex = collisionIndex + 1
+                        dest = dynamicArchivePath & baseName & "_" & Format$(Now, "hhmmss") & _
+                               "_" & CStr(collisionIndex)
+
+                        If Len(extensionName) > 0 Then
+                            dest = dest & "." & extensionName
+                        End If
+                    Loop
+
+                    moveSucceeded = tryRename(filePath, dest)
+
+                    If Not moveSucceeded Then
+                        moveSucceeded = tryMoveFile(fsoObj, filePath, dest)
                     End If
-                Loop
 
-                moveSucceeded = tryRename(filePath, dest)
+                    If moveSucceeded Then
+                        movedCounter = movedCounter + 1
+                    End If
+                Else
+                    groupKey = sourceFolder & GROUP_KEY_SEPARATOR & destinationFolder
 
-                If Not moveSucceeded Then
-                    moveSucceeded = tryMoveFile(fsoObj, filePath, dest)
-                End If
+                    If Not bulkGroups.Exists(groupKey) Then
+                        Set bulkGroup = New Collection
+                        bulkGroups.Add groupKey, bulkGroup
+                    End If
 
-                If moveSucceeded Then
-                    movedCounter = movedCounter + 1
+                    Set bulkGroup = bulkGroups(groupKey)
+                    bulkGroup.Add fileName
                 End If
             End If
         End If
     Next fileEntry
 
+    For Each varGroupKey In bulkGroups.Keys
+        groupKeyParts = Split(CStr(varGroupKey), GROUP_KEY_SEPARATOR)
+        Set bulkGroup = bulkGroups(CStr(varGroupKey))
+        movedCounter = movedCounter + MoveExactFilesBulk( _
+            fsoObj, _
+            CStr(groupKeyParts(0)), _
+            CStr(groupKeyParts(1)), _
+            bulkGroup)
+    Next varGroupKey
+
     archiveBatchFiles = movedCounter
 
 ExitFunction:
+    Set bulkGroup = Nothing
+    Set bulkGroups = Nothing
     Exit Function
 
 ErrorHandler:
@@ -1079,10 +1124,184 @@ ErrorHandler:
     errDescription = VBA.Err.Description
     archiveBatchFiles = movedCounter
 
-    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "filePath;archiveRoot;movedCount", filePath, archiveRoot, movedCounter
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, _
+                          "filePath;archiveRoot;movedCount", _
+                          filePath, archiveRoot, movedCounter
     errorManager.save
     Resume ExitFunction
 End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-04
+' Parameters:    fsoObj As Object, sourceFolder As String, destinationFolder As String, fileNames As Collection
+' Returns:       Long
+' Description:   Moves only exact selected attachment names in small robocopy batches.
+'-------------------------------------------------------------------------------
+Private Function MoveExactFilesBulk(ByRef fsoObj As Object, _
+                                    ByVal sourceFolder As String, _
+                                    ByVal destinationFolder As String, _
+                                    ByRef fileNames As Collection) As Long
+    Const METHOD_NAME As String = "MoveExactFilesBulk"
+    Const MAX_FILES_PER_ROBOCOPY As Long = 25
+    Const MAX_COMMAND_LENGTH As Long = 7000
+    Dim chunkFiles As Collection
+    Dim commandLength As Long
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fileName As Variant
+    Dim movedCounter As Long
+    Dim quotedLength As Long
+
+    On Error GoTo ErrorHandler
+
+    MoveExactFilesBulk = 0
+    movedCounter = 0
+
+    If fileNames Is Nothing Then
+        GoTo ExitFunction
+    End If
+
+    If fileNames.Count = 0 Then
+        GoTo ExitFunction
+    End If
+
+    Set chunkFiles = New Collection
+    commandLength = Len(sourceFolder) + Len(destinationFolder) + 160
+
+    For Each fileName In fileNames
+        quotedLength = Len(CStr(fileName)) + 3
+
+        If chunkFiles.Count > 0 Then
+            If chunkFiles.Count >= MAX_FILES_PER_ROBOCOPY _
+                Or commandLength + quotedLength > MAX_COMMAND_LENGTH Then
+
+                movedCounter = movedCounter + ExecuteExactRobocopyMove( _
+                    fsoObj, sourceFolder, destinationFolder, chunkFiles)
+                Set chunkFiles = New Collection
+                commandLength = Len(sourceFolder) + Len(destinationFolder) + 160
+            End If
+        End If
+
+        chunkFiles.Add CStr(fileName)
+        commandLength = commandLength + quotedLength
+    Next fileName
+
+    If chunkFiles.Count > 0 Then
+        movedCounter = movedCounter + ExecuteExactRobocopyMove( _
+            fsoObj, sourceFolder, destinationFolder, chunkFiles)
+    End If
+
+    MoveExactFilesBulk = movedCounter
+
+ExitFunction:
+    Set chunkFiles = Nothing
+
+    If errNumber <> 0 Then
+        VBA.Err.Raise errNumber, CLASS_NAME & "." & METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    MoveExactFilesBulk = movedCounter
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, _
+                          "sourceFolder;destinationFolder;movedCount", _
+                          sourceFolder, destinationFolder, movedCounter
+    errorManager.save
+    GoTo ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-04
+' Parameters:    fsoObj As Object, sourceFolder As String, destinationFolder As String, fileNames As Collection
+' Returns:       Long
+' Description:   Executes one exact-file robocopy /MOV call and verifies every selected file afterwards.
+'-------------------------------------------------------------------------------
+Private Function ExecuteExactRobocopyMove(ByRef fsoObj As Object, _
+                                          ByVal sourceFolder As String, _
+                                          ByVal destinationFolder As String, _
+                                          ByRef fileNames As Collection) As Long
+    Const METHOD_NAME As String = "ExecuteExactRobocopyMove"
+    Dim commandText As String
+    Dim destinationPath As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim exitCode As Long
+    Dim fileName As Variant
+    Dim movedCounter As Long
+    Dim shellObj As Object
+    Dim sourcePath As String
+
+    On Error GoTo ErrorHandler
+
+    ExecuteExactRobocopyMove = 0
+    movedCounter = 0
+
+    If fileNames Is Nothing Then
+        GoTo ExitFunction
+    End If
+
+    If fileNames.Count = 0 Then
+        GoTo ExitFunction
+    End If
+
+    commandText = "robocopy """ & sourceFolder & """ """ & destinationFolder & """"
+
+    For Each fileName In fileNames
+        commandText = commandText & " """ & CStr(fileName) & """"
+    Next fileName
+
+    commandText = commandText & " /MOV /R:1 /W:1 /NFL /NDL /NJH /NJS /NP"
+
+    Set shellObj = CreateObject("WScript.Shell")
+    exitCode = shellObj.Run(commandText, 0, True)
+
+    If exitCode >= 8 Then
+        Debug.Print "Robocopy exact archive returned exit code " & CStr(exitCode) & _
+                    ". Falling back only for files still present in source."
+    End If
+
+    For Each fileName In fileNames
+        sourcePath = fsoObj.BuildPath(sourceFolder, CStr(fileName))
+        destinationPath = fsoObj.BuildPath(destinationFolder, CStr(fileName))
+
+        If Not fsoObj.FileExists(sourcePath) And fsoObj.FileExists(destinationPath) Then
+            movedCounter = movedCounter + 1
+        ElseIf fsoObj.FileExists(sourcePath) Then
+            If tryMoveFile(fsoObj, sourcePath, destinationPath) Then
+                movedCounter = movedCounter + 1
+            End If
+        End If
+    Next fileName
+
+    ExecuteExactRobocopyMove = movedCounter
+
+ExitFunction:
+    Set shellObj = Nothing
+
+    If errNumber <> 0 Then
+        VBA.Err.Raise errNumber, CLASS_NAME & "." & METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    ExecuteExactRobocopyMove = movedCounter
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, _
+                          "sourceFolder;destinationFolder;exitCode", _
+                          sourceFolder, destinationFolder, exitCode
+    errorManager.save
+    GoTo ExitFunction
+End Function
+
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
@@ -1382,6 +1601,49 @@ ErrorHandler:
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
     errorManager.save
     Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-04
+' Parameters:    wsConfig As Excel.Worksheet
+' Returns:       Double
+' Description:   Reads the configured total attachment-size limit in MB and reports a clear configuration error if the named range is missing or invalid.
+'-------------------------------------------------------------------------------
+Private Function getAttachmentSizeLimitMb(ByRef wsConfig As Excel.Worksheet) As Double
+    Const METHOD_NAME As String = "getAttachmentSizeLimitMb"
+    Const RANGE_NAME As String = "max_total_attachment_size_mb"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim rngConfig As Excel.Range
+
+    On Error GoTo ErrorHandler
+
+    Set rngConfig = wsConfig.Range(RANGE_NAME)
+    getAttachmentSizeLimitMb = getSafeDouble(rngConfig.Value)
+
+ExitFunction:
+    Set rngConfig = Nothing
+
+    If errNumber <> 0 Then
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    If errNumber = 1004 Then
+        errNumber = 1055
+        errDescription = "Required named range '" & RANGE_NAME & _
+                         "' is missing or invalid. Create the named range and point it to the Tradeversand cell containing the maximum total attachment size in MB, e.g. 25."
+    End If
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "rangeName", RANGE_NAME
+    errorManager.save
+    GoTo ExitFunction
 End Function
 
 '-------------------------------------------------------------------------------
