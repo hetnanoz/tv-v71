@@ -213,8 +213,12 @@ Public Sub executeMasterProcess()
                             Err.Raise glngLastClientErrorNumber, METHOD_NAME, gstrLastClientErrorDescription
                         End If
                     ElseIf clientResult = "NO TRANSACTIONS" Then
-                        ' Informational result only. Do not queue or create an empty e-mail.
                         Debug.Print currentClientName & ": NO TRANSACTIONS"
+
+                        If sendAfter Then
+                            ' Keep run-all client isolation: consume the one explicitly queued no-transactions request now.
+                            Call SendCurrentKvgEmailRequest(currentClientName)
+                        End If
                     ElseIf sendAfter Then
                         ' Never let a global completion callback fire while one KVG is isolated.
                         Call SetPowerPdfCompletionCallback(vbNullString)
@@ -362,15 +366,16 @@ End Sub
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-05
-' Parameters:    ByVal blnHasChild As Boolean, ByVal strClientName As String, ByVal strChildName As String, ByVal blnUseChildOwnPaths As Boolean
+' Parameters:    blnHasChild As Boolean, strClientName As String, strChildName As String, blnUseChildOwnPaths As Boolean, dtNotBefore As Date, optional, blnNoTransactions As Boolean, optional
 ' Returns:       ---
-' Description:   Adds one client e-mail request to the post-PDF completion queue.
+' Description:   Adds one client e-mail request to the post-PDF completion queue, including the explicit no-transactions mail state.
 '-------------------------------------------------------------------------------
 Private Sub QueueClientEmailRequest(ByVal blnHasChild As Boolean, _
                                     ByVal strClientName As String, _
                                     ByVal strChildName As String, _
                                     ByVal blnUseChildOwnPaths As Boolean, _
-                                    Optional ByVal dtNotBefore As Date = 0)
+                                    Optional ByVal dtNotBefore As Date = 0, _
+                                    Optional ByVal blnNoTransactions As Boolean = False)
     Const METHOD_NAME As String = "QueueClientEmailRequest"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -387,7 +392,8 @@ Private Sub QueueClientEmailRequest(ByVal blnHasChild As Boolean, _
         strClientName, _
         strChildName, _
         blnUseChildOwnPaths, _
-        dtNotBefore)
+        dtNotBefore, _
+        blnNoTransactions)
 
 ExitSub:
     Exit Sub
@@ -401,11 +407,12 @@ ErrorHandler:
         METHOD_NAME, _
         errNumber, _
         errDescription, _
-        "clientName;childName;useChildOwnPaths;notBefore", _
+        "clientName;childName;useChildOwnPaths;notBefore;noTransactions", _
         strClientName, _
         strChildName, _
         blnUseChildOwnPaths, _
-        dtNotBefore
+        dtNotBefore, _
+        blnNoTransactions
     errorManager.save
     Resume ExitSub
 End Sub
@@ -455,7 +462,9 @@ Private Sub SendDeferredEmailRequests()
                 CStr(varRequest(1)) & "'."
         End If
 
-        If CBool(varRequest(0)) Then
+        If CBool(varRequest(5)) Then
+            Call processAndCreateNoTransactionsEmail(CStr(varRequest(1)))
+        ElseIf CBool(varRequest(0)) Then
             Call processAndSendTradeversand_withChild( _
                 CStr(varRequest(1)), _
                 CStr(varRequest(2)), _
@@ -684,6 +693,10 @@ Private Function runProcessForClient(ByVal clientName As String, _
 
     If childRow = 0 Then
         If Not HasEligibleTransactionsForDictionary(inArr, cDict, inclFreeOfPayment) Then
+            If sendNow Then
+                Call QueueClientEmailRequest(False, clientName, vbNullString, False, emailNotBefore, True)
+            End If
+
             runProcessForClient = "NO TRANSACTIONS"
             GoTo ExitFunction
         End If
@@ -733,6 +746,10 @@ Private Function runProcessForClient(ByVal clientName As String, _
     Set eligibilityDict = mergeDictionaries(cDict, childDict)
 
     If Not HasEligibleTransactionsForDictionary(inArr, eligibilityDict, inclFreeOfPayment) Then
+        If sendNow Then
+            Call QueueClientEmailRequest(True, clientName, childFileName, ownPaths, emailNotBefore, True)
+        End If
+
         runProcessForClient = "NO TRANSACTIONS"
         GoTo ExitFunction
     End If
@@ -2104,3 +2121,4 @@ ErrorHandler:
     errorManager.save
     Resume ExitFunction
 End Function
+
