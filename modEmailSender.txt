@@ -223,6 +223,107 @@ End Sub
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
+' Creation date: 2026-09-07
+' Parameters:    expectedClientName As String
+' Returns:       ---
+' Description:   Creates and displays one no-transactions Outlook draft for the explicitly expected client.
+'                Uses the normal client sender, recipients and subject, but the body comes only from
+'                the named range 'email_body_no_transactions'. No report files are attached or archived.
+'-------------------------------------------------------------------------------
+Public Sub processAndCreateNoTransactionsEmail(ByVal expectedClientName As String)
+    Const METHOD_NAME As String = "processAndCreateNoTransactionsEmail"
+    Dim bodyText As String
+    Dim clientName As String
+    Dim emailTitle As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim mailItem As Object
+    Dim outApp As Object
+    Dim recipCc As String
+    Dim recipTo As String
+    Dim senderEmail As String
+    Dim wsConfig As Excel.Worksheet
+
+    On Error GoTo ErrorHandler
+
+    mblnLastEmailOperationSucceeded = False
+    mstrLastEmailOperationErrorDescription = vbNullString
+    mlngLastCreatedMailCount = 0
+
+    Set wsConfig = ThisWorkbook.Worksheets("Tradeversand")
+    wsConfig.Calculate
+    DoEvents
+
+    With wsConfig
+        clientName = Trim$(CStr(.Range("results_file_name").Value))
+        emailTitle = Trim$(CStr(.Range("email_title").Value))
+        bodyText = CStr(.Range("email_body_no_transactions").Value)
+        senderEmail = Trim$(CStr(.Range("sender_email").Value))
+        recipTo = Trim$(CStr(.Range("recipient_email").Value))
+        recipCc = Trim$(CStr(.Range("recipient_cc").Value))
+    End With
+
+    If Len(clientName) = 0 Then
+        Err.Raise 1001, METHOD_NAME, "Client name is missing in 'results_file_name'."
+    End If
+
+    If Len(Trim$(expectedClientName)) = 0 Then
+        Err.Raise 1078, METHOD_NAME, "Expected client name is required for a no-transactions e-mail."
+    End If
+
+    If StrComp(clientName, Trim$(expectedClientName), vbTextCompare) <> 0 Then
+        Err.Raise 1079, METHOD_NAME, _
+                  "SAFETY ABORT: current no-transactions e-mail configuration belongs to '" & clientName & _
+                  "' but the expected client is '" & Trim$(expectedClientName) & "'."
+    End If
+
+    If Len(Trim$(bodyText)) = 0 Then
+        Err.Raise 1080, METHOD_NAME, _
+                  "Named range 'email_body_no_transactions' is empty. No e-mail was created."
+    End If
+
+    Set outApp = CreateObject("Outlook.Application")
+    Set mailItem = createBaseMail(outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText)
+
+    If mailItem Is Nothing Then
+        Err.Raise 1064, METHOD_NAME, "Outlook mail item was not created."
+    End If
+
+    If mailItem.Attachments.Count <> 0 Then
+        Err.Raise 1081, METHOD_NAME, _
+                  "SAFETY ABORT: the no-transactions draft unexpectedly contains an attachment before display."
+    End If
+
+    If Not finalizeNoTransactionsMail(mailItem, bodyText) Then
+        Err.Raise 1082, METHOD_NAME, _
+                  "SAFETY ABORT: the no-transactions Outlook draft could not be prepared."
+    End If
+
+    mlngLastCreatedMailCount = 1
+    mblnLastEmailOperationSucceeded = True
+
+ExitSub:
+    Set mailItem = Nothing
+    Set outApp = Nothing
+    Set wsConfig = Nothing
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    mblnLastEmailOperationSucceeded = False
+    mstrLastEmailOperationErrorDescription = errDescription
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, _
+                          "clientName;expectedClientName", clientName, expectedClientName
+    errorManager.save
+    errorManager.display "Error " & CStr(errNumber) & " in " & METHOD_NAME & ": " & errDescription
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
 ' Creation date: 2026-08-05
 ' Parameters:    parentName As String, childName As String, useChildOwnPaths As Boolean, optional, notBefore As Date, optional
 ' Returns:       ---
@@ -1430,6 +1531,47 @@ End Function
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
+' Creation date: 2026-09-07
+' Parameters:    mailObj As Object, bodyText As String
+' Returns:       Boolean
+' Description:   Displays a no-transactions draft and prepends the supplied body while preserving the Outlook signature.
+'-------------------------------------------------------------------------------
+Private Function finalizeNoTransactionsMail(ByRef mailObj As Object, ByVal bodyText As String) As Boolean
+    Const METHOD_NAME As String = "finalizeNoTransactionsMail"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim formattedBody As String
+
+    On Error GoTo ErrorHandler
+
+    If mailObj Is Nothing Then
+        Err.Raise 1064, METHOD_NAME, "Outlook mail item was not created."
+    End If
+
+    formattedBody = Replace$(bodyText, vbCrLf, vbLf)
+    formattedBody = Replace$(formattedBody, vbCr, vbLf)
+    formattedBody = Replace$(formattedBody, vbLf, "<br>")
+
+    mailObj.Display
+    mailObj.HTMLBody = "<p style='font-family:Arial; font-size:11pt;'>" & formattedBody & "</p><br>" & mailObj.HTMLBody
+    finalizeNoTransactionsMail = True
+
+ExitFunction:
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    finalizeNoTransactionsMail = False
+
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
 ' Creation date: 2026-09-04
 ' Parameters:    sourcePath As String, destinationPath As String
 ' Returns:       Boolean
@@ -1810,3 +1952,4 @@ ErrorHandler:
     errorManager.save
     Resume ExitFunction
 End Function
+
