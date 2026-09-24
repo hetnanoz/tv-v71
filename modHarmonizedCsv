@@ -506,8 +506,17 @@ Private Function formatHarmonizedNumber(ByVal value As Double, _
 
     On Error GoTo ErrorHandler
 
-    result = Format$(value, "0.###############")
+    If value = Fix(value) Then
+        result = Format$(value, "0")
+    Else
+        result = Format$(value, "0.###############")
+    End If
+
     result = Replace$(result, ",", ".")
+
+    Do While Len(result) > 0 And Right$(result, 1) = "."
+        result = Left$(result, Len(result) - 1)
+    Loop
 
     If useDecimalComma Then
         result = Replace$(result, ".", ",")
