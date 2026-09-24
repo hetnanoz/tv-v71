@@ -188,7 +188,7 @@ Public Function CreateTradeversandFilteredInputAttachment(ByRef arrInput As Vari
 
     fullPath = buildTargetFilePath( _
                     outputRoot, _
-                    sanitizeFileName(clientName) & "-FilteredInput_" & Format$(Date, "yyyymmdd"))
+                    sanitizeFileName(clientName) & "_" & Format$(Date, "yyyymmdd"))
 
     Call saveTargetWorkbook( _
             arrInput, _
