@@ -1050,10 +1050,12 @@ Private Sub addRegisteredFilteredInputJob(ByRef jobs As Collection, _
     Dim errDescription As String
     Dim errNumber As Long
     Dim exactFilePath As String
-    Dim expectedFilePrefix As String
+    Dim expectedFileBase As String
+    Dim fileBaseLc As String
     Dim fileItem As Object
     Dim fileList As Collection
     Dim fileNameLc As String
+    Dim collisionSuffix As String
     Dim key As String
     Dim parentFolder As String
     Dim registration As Variant
@@ -1092,10 +1094,22 @@ Private Sub addRegisteredFilteredInputJob(ByRef jobs As Collection, _
     End If
 
     fileNameLc = LCase$(fileItem.Name)
-    expectedFilePrefix = LCase$(safeFilteredInputPrefix(clientName) & "-FilteredInput_")
-    If Left$(fileNameLc, Len(expectedFilePrefix)) <> expectedFilePrefix Then
-        Err.Raise 1096, METHOD_NAME, _
-                  "SAFETY ABORT: filtered-input filename does not match client '" & clientName & "'."
+    fileBaseLc = LCase$(fsoObj.GetBaseName(fileItem.Name))
+    expectedFileBase = LCase$(safeFilteredInputPrefix(clientName) & "_" & _
+                       Format$(CDate(fileItem.DateLastModified), "yyyymmdd"))
+
+    If fileBaseLc <> expectedFileBase Then
+        If Left$(fileBaseLc, Len(expectedFileBase) + 1) <> expectedFileBase & "_" Or _
+           Len(fileBaseLc) <> Len(expectedFileBase) + 7 Then
+            Err.Raise 1096, METHOD_NAME, _
+                      "SAFETY ABORT: filtered-input filename does not match client/date pattern for '" & clientName & "'."
+        End If
+
+        collisionSuffix = Right$(fileBaseLc, 6)
+        If Not collisionSuffix Like "######" Then
+            Err.Raise 1096, METHOD_NAME, _
+                      "SAFETY ABORT: filtered-input collision suffix is invalid for client '" & clientName & "'."
+        End If
     End If
 
     If notBefore > 0 Then
@@ -1148,8 +1162,11 @@ Private Function safeFilteredInputPrefix(ByVal clientName As String) As String
     badChars = Array("\", "/", ":", "*", "?", Chr$(34), "<", ">", "|")
 
     For Each item In badChars
-        result = Replace$(result, CStr(item), "_")
+        result = Replace$(result, CStr(item), vbNullString)
     Next item
+
+    result = Replace$(result, " ", "_")
+    If result = vbNullString Then result = "InvalidName"
 
     safeFilteredInputPrefix = result
 End Function
