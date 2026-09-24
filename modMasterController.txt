@@ -600,6 +600,7 @@ Private Sub ResetDeferredCompletionState()
     On Error GoTo ErrorHandler
 
     Set gcolPendingEmailRequests = Nothing
+    Call ClearTradeversandFilteredInputAttachments
     gblnDeferredCompletionPending = False
     gblnDeferredRunAll = False
     glngLastClientErrorNumber = 0
@@ -654,6 +655,13 @@ Private Function runProcessForClient(ByVal clientName As String, _
     Dim errNumber As Long
     Dim hasFfy As Boolean
     Dim hasXlsx As Boolean
+    Dim attachFilteredParent As Boolean
+    Dim attachFilteredChild As Boolean
+    Dim filteredInputPath As String
+    Dim parentResultsXlsxPath As String
+    Dim parentArchiveXlsxPath As String
+    Dim childResultsXlsxPath As String
+    Dim childArchiveXlsxPath As String
     Dim inclFreeOfPayment As Boolean
     Dim eligibilityDict As Object
     Dim originalFileName As String
@@ -688,6 +696,9 @@ Private Function runProcessForClient(ByVal clientName As String, _
     Set wsMacro = ThisWorkbook.Worksheets("Tradeversand")
     Set wsMap = ThisWorkbook.Worksheets("Mapping")
     inclFreeOfPayment = readChildBoolean(wsMacro, "incl_free_of_payment")
+    attachFilteredParent = readChildBoolean(wsMacro, "attach_filtered_input_to_email")
+    parentResultsXlsxPath = CStr(wsMacro.Range("results_path_xlsx").Value)
+    parentArchiveXlsxPath = CStr(wsMacro.Range("archive_path_xlsx").Value)
 
     childRow = findChildRowForParent(wsMap, clientName)
 
@@ -703,6 +714,21 @@ Private Function runProcessForClient(ByVal clientName As String, _
 
         Call generatePerfectReportsV3(inArr, cDict, clientStats, fondsArr:=fondsArr)
         Call accumulateStats(clientStats, totalCsv, totalPdf, totalXlsx, hasXlsx, totalFfy, hasFfy)
+
+        If sendNow And attachFilteredParent Then
+            filteredInputPath = CreateTradeversandFilteredInputAttachment( _
+                                    inArr, _
+                                    cDict, _
+                                    clientName, _
+                                    parentResultsXlsxPath)
+
+            If Len(filteredInputPath) > 0 Then
+                Call RegisterTradeversandFilteredInputAttachment( _
+                        clientName, _
+                        filteredInputPath, _
+                        parentArchiveXlsxPath)
+            End If
+        End If
 
         If sendNow Then
             Call QueueClientEmailRequest(False, clientName, vbNullString, False, emailNotBefore)
@@ -736,11 +762,19 @@ Private Function runProcessForClient(ByVal clientName As String, _
     ownCsvNr = readChildBoolean(wsMacro, "child_use_own_csv_nr")
     ownPaths = readChildBoolean(wsMacro, "child_use_own_paths")
     childCsvNr = CStr(wsMacro.Range("csv_name_nr").Value)
+    attachFilteredChild = readChildBoolean(wsMacro, "attach_filtered_input_to_email")
+    childResultsXlsxPath = CStr(wsMacro.Range("results_path_xlsx").Value)
+    childArchiveXlsxPath = CStr(wsMacro.Range("archive_path_xlsx").Value)
 
     wsMacro.Range("results_file_name").Value = originalFileName
     resultsNameTouched = False
     Application.Calculate
     DoEvents
+
+    If Not ownPaths Then
+        childResultsXlsxPath = parentResultsXlsxPath
+        childArchiveXlsxPath = parentArchiveXlsxPath
+    End If
 
     Set childDict = buildClientDictFromArray(fondsArr, childKvg)
     Set eligibilityDict = mergeDictionaries(cDict, childDict)
@@ -902,6 +936,36 @@ Private Function runProcessForClient(ByVal clientName As String, _
             resultsNameTouched = False
             Application.Calculate
             DoEvents
+        End If
+    End If
+
+    If sendNow And attachFilteredParent Then
+        filteredInputPath = CreateTradeversandFilteredInputAttachment( _
+                                inArr, _
+                                cDict, _
+                                clientName, _
+                                parentResultsXlsxPath)
+
+        If Len(filteredInputPath) > 0 Then
+            Call RegisterTradeversandFilteredInputAttachment( _
+                    clientName, _
+                    filteredInputPath, _
+                    parentArchiveXlsxPath)
+        End If
+    End If
+
+    If sendNow And attachFilteredChild Then
+        filteredInputPath = CreateTradeversandFilteredInputAttachment( _
+                                inArr, _
+                                childDict, _
+                                childFileName, _
+                                childResultsXlsxPath)
+
+        If Len(filteredInputPath) > 0 Then
+            Call RegisterTradeversandFilteredInputAttachment( _
+                    childFileName, _
+                    filteredInputPath, _
+                    childArchiveXlsxPath)
         End If
     End If
 
