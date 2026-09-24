@@ -62,6 +62,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     Dim logoFullPath As String
     Dim tradesPerPage As Long
     Dim createXlsxFlag As Boolean
+    Dim createPdfFlag As Boolean
     Dim createCsvFlag As Boolean
     Dim inclFreeFlag As Boolean
     Dim inclNotFoundFlag As Boolean
@@ -170,6 +171,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     If tradesPerPage <= 0 Then tradesPerPage = 99999
 
     createXlsxFlag = UCase(Trim(safeString(wsMacro.Range("create_xlsx_file").Value))) = "TRUE"
+    createPdfFlag = UCase(Trim(safeString(wsMacro.Range("create_pdf_file").Value))) = "TRUE"
     inclFreeFlag = UCase(Trim(safeString(wsMacro.Range("incl_free_of_payment").Value))) = "TRUE"
     createCsvFlag = UCase(Trim(safeString(wsMacro.Range("create_csv_file").Value))) = "TRUE"
     inclNotFoundFlag = UCase(Trim(safeString(wsMacro.Range("include_not_found_funds").Value))) = "TRUE"
@@ -179,7 +181,7 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     createHarmonizedCsvFlag = UCase(Trim(safeString(wsMacro.Range("create_harmonized_csv_file").Value))) = "TRUE"
     blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wsMacro)
 
-    If blnRawOraclePdfEnabled And Not skipPdfXlsx Then
+    If createPdfFlag And blnRawOraclePdfEnabled And Not skipPdfXlsx Then
         Call ResetKeyValuePdfClientCache
     End If
 
@@ -323,11 +325,11 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
             fundCounter = fundCounter + 1
             progressStartFund fundCounter, CStr(dictMapping(fundIdStr))
 
-            If Not skipPdfXlsx Then
+            If Not skipPdfXlsx And (createPdfFlag Or createXlsxFlag) Then
                 Call processFundZeroTemplate(fundIdStr, inputDataArr, inputLastRow, tempXlsx, pdfOutputPath, _
                                              dictMapping, effectivePdfXlsxPrefix, tradesPerPage, _
                                              createXlsxFlag, inclFreeFlag, logoFullPath, missingFundsList, _
-                                             cachedPrevBizDay, dictFondsbez, lngResolvedWknInputColumn)
+                                             cachedPrevBizDay, dictFondsbez, lngResolvedWknInputColumn, createPdfFlag)
             End If
             countSuccess = countSuccess + 1
 
@@ -362,8 +364,13 @@ Public Sub generatePerfectReportsV3(ByRef inputDataArr As Variant, ByRef dictMap
     ffyCount = 0
     If hasFfyOutput Then ffyCount = 1
 
-    outStats = csvCount & " CSV, " & fundCounter & " PDF"
-    If createXlsxFlag Then outStats = outStats & ", " & fundCounter & " XLSX"
+    If createPdfFlag And Not skipPdfXlsx Then
+        outStats = csvCount & " CSV, " & fundCounter & " PDF"
+    Else
+        outStats = csvCount & " CSV, 0 PDF"
+    End If
+
+    If createXlsxFlag And Not skipPdfXlsx Then outStats = outStats & ", " & fundCounter & " XLSX"
     If ffyCount > 0 Then outStats = outStats & ", " & ffyCount & " FFY"
 
 ExitSub:
@@ -515,7 +522,7 @@ End Function
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
 ' Creation date: 2026-08-04
-' Parameters:    fundId As String, ByRef inputArr As Variant, ByVal lastInRow As Long, pXlsx As String, pPdf As String, dictMap As Object, prefix As String, limitPerPage As Long, saveXlsx As Boolean, inclFree As Boolean, logoPath As String, ByRef missingFundsList As String, ByVal prevBizDay As Date, ByRef dictFondsbez As Object
+' Parameters:    fundId As String, ByRef inputArr As Variant, ByVal lastInRow As Long, pXlsx As String, pPdf As String, dictMap As Object, prefix As String, limitPerPage As Long, saveXlsx As Boolean, inclFree As Boolean, logoPath As String, ByRef missingFundsList As String, ByVal prevBizDay As Date, ByRef dictFondsbez As Object, Optional ByVal resolvedWknInputColumn As Long = -1, Optional ByVal savePdf As Boolean = True
 ' Returns:       ---
 ' Description:   Builds and exports one fund report from the transaction array.
 '-------------------------------------------------------------------------------
@@ -523,7 +530,8 @@ Public Sub processFundZeroTemplate(fundId As String, ByRef inputArr As Variant, 
                             pXlsx As String, pPdf As String, dictMap As Object, _
                             prefix As String, limitPerPage As Long, saveXlsx As Boolean, inclFree As Boolean, _
                             logoPath As String, ByRef missingFundsList As String, ByVal prevBizDay As Date, _
-                            ByRef dictFondsbez As Object, Optional ByVal resolvedWknInputColumn As Long = -1)
+                            ByRef dictFondsbez As Object, Optional ByVal resolvedWknInputColumn As Long = -1, _
+                            Optional ByVal savePdf As Boolean = True)
     Const METHOD_NAME As String = "processFundZeroTemplate"
     Dim errorManager As New ErrorManager
     Dim errDescription As String
@@ -564,7 +572,7 @@ Public Sub processFundZeroTemplate(fundId As String, ByRef inputArr As Variant, 
 
     Set wksMacro = ThisWorkbook.Worksheets("Tradeversand")
     blnRawOraclePdfEnabled = IsRawOraclePdfEnabled(wksMacro)
-    blnMinimalKeyValueWorksheet = blnRawOraclePdfEnabled And Not saveXlsx
+    blnMinimalKeyValueWorksheet = savePdf And blnRawOraclePdfEnabled And Not saveXlsx
 
     Set wbOut = createWorkbookSafe()
     Set wsOut = wbOut.Sheets(1)
@@ -693,15 +701,17 @@ nextRow:
         wbOut.SaveAs fileName:=pXlsx & xlsxName & ".xlsx", FileFormat:=xlOpenXMLWorkbook
     End If
 
-    fullPdfPath = pPdf & pdfName & ".pdf"
+    If savePdf Then
+        fullPdfPath = pPdf & pdfName & ".pdf"
 
-    If blnRawOraclePdfEnabled Then
-        If Not GenerateKeyValuePdfFromWorksheet(fullPdfPath, wsOut, logoPath) Then
-            Err.Raise 1026, METHOD_NAME, _
-                      "The key-value RAW PDF could not be generated for fund " & fundId & "."
+        If blnRawOraclePdfEnabled Then
+            If Not GenerateKeyValuePdfFromWorksheet(fullPdfPath, wsOut, logoPath) Then
+                Err.Raise 1026, METHOD_NAME, _
+                          "The key-value RAW PDF could not be generated for fund " & fundId & "."
+            End If
+        Else
+            wsOut.ExportAsFixedFormat Type:=xlTypePDF, fileName:=fullPdfPath, Quality:=xlQualityMinimum, IncludeDocProperties:=False, IgnorePrintAreas:=False, OpenAfterPublish:=False
         End If
-    Else
-        wsOut.ExportAsFixedFormat Type:=xlTypePDF, fileName:=fullPdfPath, Quality:=xlQualityMinimum, IncludeDocProperties:=False, IgnorePrintAreas:=False, OpenAfterPublish:=False
     End If
 
 ExitSub:
