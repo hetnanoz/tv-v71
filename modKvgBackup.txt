@@ -103,6 +103,139 @@ End Sub
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
+' Creation date: 2026-09-15
+' Parameters:    arrInput As Variant, fundDict As Object, clientName As String, outputFolder As String
+' Returns:       String
+' Description:   Creates one exact filtered-input XLSX for the current Tradeversand client.
+'                This path is independent of root_kvg_backup and is intended only for
+'                the current client's e-mail attachment flow.
+'-------------------------------------------------------------------------------
+Public Function CreateTradeversandFilteredInputAttachment(ByRef arrInput As Variant, _
+                                                          ByRef fundDict As Object, _
+                                                          ByVal clientName As String, _
+                                                          ByVal outputFolder As String) As String
+    Const METHOD_NAME As String = "CreateTradeversandFilteredInputAttachment"
+    Dim arrRowBucket() As Long
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim fso As Object
+    Dim fundKey As String
+    Dim fullPath As String
+    Dim lastCol As Long
+    Dim lastRow As Long
+    Dim matchCount As Long
+    Dim outputRoot As String
+    Dim rowIndex As Long
+    Dim skippedRows As Long
+
+    On Error GoTo ErrorHandler
+
+    CreateTradeversandFilteredInputAttachment = vbNullString
+
+    If Len(Trim$(clientName)) = 0 Then
+        Err.Raise 1080, METHOD_NAME, "Client name is empty. Filtered input was not created."
+    End If
+
+    If fundDict Is Nothing Then
+        Err.Raise 1081, METHOD_NAME, "Fund dictionary is not initialized for client '" & clientName & "'."
+    End If
+
+    If fundDict.Count = 0 Then GoTo ExitFunction
+    If Not IsArray(arrInput) Then
+        Err.Raise 1082, METHOD_NAME, "Input array is not available for client '" & clientName & "'."
+    End If
+
+    lastRow = UBound(arrInput, 1)
+    lastCol = UBound(arrInput, 2)
+    If lastRow < 2 Or lastCol < INPUT_FUND_COL Then
+        Err.Raise 1083, METHOD_NAME, "Input array does not contain the expected report structure."
+    End If
+
+    ReDim arrRowBucket(1 To lastRow)
+    matchCount = 0
+    skippedRows = 0
+
+    For rowIndex = 2 To lastRow
+        If isSkippedLabelRow(arrInput, rowIndex) Then
+            arrRowBucket(rowIndex) = SKIPPED_KVG_INDEX
+            skippedRows = skippedRows + 1
+        Else
+            fundKey = Right$(toSafeString(arrInput(rowIndex, INPUT_FUND_COL)), FUND_KEY_LEN)
+
+            If Len(fundKey) > 0 And fundDict.Exists(fundKey) Then
+                arrRowBucket(rowIndex) = 1
+                matchCount = matchCount + 1
+            Else
+                arrRowBucket(rowIndex) = 0
+            End If
+        End If
+    Next rowIndex
+
+    ' No client rows means there is nothing to attach. Do not create an empty workbook.
+    If matchCount = 0 Then GoTo ExitFunction
+
+    outputRoot = withTrailingSeparator(Trim$(outputFolder))
+    If outputRoot = vbNullString Or outputRoot = "\" Then
+        Err.Raise 1084, METHOD_NAME, "results_path_xlsx is empty for client '" & clientName & "'."
+    End If
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Call ensureFolderPath(fso, outputRoot)
+    If Not fso.FolderExists(outputRoot) Then
+        Err.Raise 1085, METHOD_NAME, "Cannot create filtered-input output folder: " & outputRoot
+    End If
+
+    fullPath = buildTargetFilePath( _
+                    outputRoot, _
+                    sanitizeFileName(clientName) & "-FilteredInput_" & Format$(Date, "yyyymmdd"))
+
+    Call saveTargetWorkbook( _
+            arrInput, _
+            lastRow, _
+            lastCol, _
+            arrRowBucket, _
+            1, _
+            matchCount, _
+            skippedRows, _
+            fullPath)
+
+    If Not fso.FileExists(fullPath) Then
+        Err.Raise 1086, METHOD_NAME, "Filtered-input workbook was not created: " & fullPath
+    End If
+
+    If CDbl(fso.GetFile(fullPath).Size) <= 0 Then
+        Err.Raise 1087, METHOD_NAME, "Filtered-input workbook is empty: " & fullPath
+    End If
+
+    CreateTradeversandFilteredInputAttachment = fullPath
+
+ExitFunction:
+    Set fso = Nothing
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, METHOD_NAME, errDescription
+    End If
+    Exit Function
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+
+    errorManager.addError _
+        CLASS_NAME, _
+        METHOD_NAME, _
+        errNumber, _
+        errDescription, _
+        "clientName;outputFolder", _
+        clientName, _
+        outputFolder
+    errorManager.save
+    Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
 ' Creation date: 2026-08-05
 ' Parameters:    ByVal strInputPath As String, ByRef strShortSummary As String
 ' Returns:       String
