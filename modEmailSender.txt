@@ -5,6 +5,87 @@ Private Const CLASS_NAME As String = "modEmailSender"
 Private mblnLastEmailOperationSucceeded As Boolean
 Private mstrLastEmailOperationErrorDescription As String
 Private mlngLastCreatedMailCount As Long
+Private mobjFilteredInputAttachments As Object
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-15
+' Parameters:    clientName As String, exactFilePath As String, archiveRoot As String
+' Returns:       ---
+' Description:   Registers exactly one filtered-input attachment for one client.
+'                No wildcard or folder scan is used for this attachment type.
+'-------------------------------------------------------------------------------
+Public Sub RegisterTradeversandFilteredInputAttachment(ByVal clientName As String, _
+                                                       ByVal exactFilePath As String, _
+                                                       ByVal archiveRoot As String)
+    Const METHOD_NAME As String = "RegisterTradeversandFilteredInputAttachment"
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim key As String
+
+    On Error GoTo ErrorHandler
+
+    key = LCase$(Trim$(clientName))
+    If Len(key) = 0 Then Err.Raise 1088, METHOD_NAME, "Client name is empty."
+    If Len(Trim$(exactFilePath)) = 0 Then Err.Raise 1089, METHOD_NAME, "Exact filtered-input path is empty."
+    If Len(Trim$(archiveRoot)) = 0 Then Err.Raise 1090, METHOD_NAME, "Filtered-input archive path is empty."
+
+    If mobjFilteredInputAttachments Is Nothing Then
+        Set mobjFilteredInputAttachments = CreateObject("Scripting.Dictionary")
+    End If
+
+    If mobjFilteredInputAttachments.Exists(key) Then
+        Err.Raise 1091, METHOD_NAME, _
+                  "SAFETY ABORT: a filtered-input attachment is already registered for client '" & clientName & "'."
+    End If
+
+    mobjFilteredInputAttachments.Add key, Array(Trim$(exactFilePath), formatFolderPath(archiveRoot))
+
+ExitSub:
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, CLASS_NAME & "." & METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, _
+                          "clientName;exactFilePath;archiveRoot", clientName, exactFilePath, archiveRoot
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-15
+' Parameters:    ---
+' Returns:       ---
+' Description:   Clears exact filtered-input registrations between Tradeversand runs.
+'-------------------------------------------------------------------------------
+Public Sub ClearTradeversandFilteredInputAttachments()
+    Set mobjFilteredInputAttachments = Nothing
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-15
+' Parameters:    clientName As String
+' Returns:       Boolean
+' Description:   Returns whether one exact filtered-input file is registered for the client.
+'-------------------------------------------------------------------------------
+Private Function hasRegisteredFilteredInputAttachment(ByVal clientName As String) As Boolean
+    Dim key As String
+
+    hasRegisteredFilteredInputAttachment = False
+    If mobjFilteredInputAttachments Is Nothing Then Exit Function
+
+    key = LCase$(Trim$(clientName))
+    If Len(key) = 0 Then Exit Function
+    hasRegisteredFilteredInputAttachment = mobjFilteredInputAttachments.Exists(key)
+End Function
 
 '-------------------------------------------------------------------------------
 ' Author:        Pawel Ligezka
@@ -33,6 +114,7 @@ Public Sub processAndSendTradeversand(Optional ByVal expectedClientName As Strin
     Dim inclFfy As Boolean
     Dim inclPdf As Boolean
     Dim inclXlsx As Boolean
+    Dim hasFilteredInput As Boolean
     Dim jobs As Collection
     Dim maxAtt As Long
     Dim maxTotalAttachmentMb As Double
@@ -119,6 +201,7 @@ Public Sub processAndSendTradeversand(Optional ByVal expectedClientName As Strin
 
     Set fso = CreateObject("Scripting.FileSystemObject")
     Set outApp = CreateObject("Outlook.Application")
+    hasFilteredInput = hasRegisteredFilteredInputAttachment(clientName)
 
     csvRequireSubstring = vbNullString
     csvExcludeSubstring = vbNullString
@@ -157,7 +240,11 @@ Public Sub processAndSendTradeversand(Optional ByVal expectedClientName As Strin
         End If
 
         If inclXlsx Then
-            jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", clientName, vbNullString, vbNullString, notBefore)
+            jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", clientName, vbNullString, "-filteredinput_", notBefore)
+        End If
+
+        If hasFilteredInput Then
+            Call addRegisteredFilteredInputJob(jobs, fso, clientName, pathXlsxRes, pathXlsxArch, notBefore)
         End If
 
         totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt, maxTotalAttachmentMb)
@@ -176,7 +263,7 @@ Public Sub processAndSendTradeversand(Optional ByVal expectedClientName As Strin
             totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt, maxTotalAttachmentMb)
         End If
 
-        If inclPdf Or inclXlsx Or attachFfyPdf Then
+        If inclPdf Or inclXlsx Or attachFfyPdf Or hasFilteredInput Then
             Set jobs = New Collection
 
             If inclPdf Or attachFfyPdf Then
@@ -184,7 +271,11 @@ Public Sub processAndSendTradeversand(Optional ByVal expectedClientName As Strin
             End If
 
             If inclXlsx Then
-                jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", clientName, vbNullString, vbNullString, notBefore)
+                jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", clientName, vbNullString, "-filteredinput_", notBefore)
+            End If
+
+            If hasFilteredInput Then
+                Call addRegisteredFilteredInputJob(jobs, fso, clientName, pathXlsxRes, pathXlsxArch, notBefore)
             End If
 
             totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt, maxTotalAttachmentMb)
@@ -358,6 +449,8 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
     Dim inclFfy As Boolean
     Dim inclPdf As Boolean
     Dim inclXlsx As Boolean
+    Dim hasParentFilteredInput As Boolean
+    Dim hasChildFilteredInput As Boolean
     Dim jobs As Collection
     Dim maxAtt As Long
     Dim maxTotalAttachmentMb As Double
@@ -506,6 +599,8 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
 
     Set fso = CreateObject("Scripting.FileSystemObject")
     Set outApp = CreateObject("Outlook.Application")
+    hasParentFilteredInput = hasRegisteredFilteredInputAttachment(parentName)
+    hasChildFilteredInput = hasRegisteredFilteredInputAttachment(childName)
 
     If Not separateMails Then
         Set jobs = New Collection
@@ -524,7 +619,7 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
             End If
 
             If inclXlsx Then
-                jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", parentOnlyPrefix, vbNullString, vbNullString, notBefore)
+                jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", parentOnlyPrefix, vbNullString, "-filteredinput_", notBefore)
             End If
 
             If inclCsv Then
@@ -540,7 +635,7 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
             End If
 
             If inclXlsx Then
-                jobs.Add makeJob(fso, childPathXlsxRes, childPathXlsxArch, "xlsx", childOnlyPrefix, vbNullString, vbNullString, notBefore)
+                jobs.Add makeJob(fso, childPathXlsxRes, childPathXlsxArch, "xlsx", childOnlyPrefix, vbNullString, "-filteredinput_", notBefore)
             End If
         Else
             If inclCsv Then
@@ -556,7 +651,19 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
             End If
 
             If inclXlsx Then
-                jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", allowedPrefixes, vbNullString, vbNullString, notBefore)
+                jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", allowedPrefixes, vbNullString, "-filteredinput_", notBefore)
+            End If
+        End If
+
+        If hasParentFilteredInput Then
+            Call addRegisteredFilteredInputJob(jobs, fso, parentName, pathXlsxRes, pathXlsxArch, notBefore)
+        End If
+
+        If hasChildFilteredInput Then
+            If useChildOwnPaths Then
+                Call addRegisteredFilteredInputJob(jobs, fso, childName, childPathXlsxRes, childPathXlsxArch, notBefore)
+            Else
+                Call addRegisteredFilteredInputJob(jobs, fso, childName, pathXlsxRes, pathXlsxArch, notBefore)
             End If
         End If
 
@@ -591,7 +698,7 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
             totalMoved = totalMoved + sendFilesBatched(fso, outApp, senderEmail, recipTo, recipCc, emailTitle, bodyText, jobs, maxAtt, maxTotalAttachmentMb)
         End If
 
-        If inclPdf Or inclXlsx Or attachFfyPdf Then
+        If inclPdf Or inclXlsx Or attachFfyPdf Or hasParentFilteredInput Or hasChildFilteredInput Then
             Set jobs = New Collection
 
             If useChildOwnPaths Then
@@ -600,7 +707,7 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
                 End If
 
                 If inclXlsx Then
-                    jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", parentOnlyPrefix, vbNullString, vbNullString, notBefore)
+                    jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", parentOnlyPrefix, vbNullString, "-filteredinput_", notBefore)
                 End If
 
                 If inclPdf Or attachFfyPdf Then
@@ -608,7 +715,7 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
                 End If
 
                 If inclXlsx Then
-                    jobs.Add makeJob(fso, childPathXlsxRes, childPathXlsxArch, "xlsx", childOnlyPrefix, vbNullString, vbNullString, notBefore)
+                    jobs.Add makeJob(fso, childPathXlsxRes, childPathXlsxArch, "xlsx", childOnlyPrefix, vbNullString, "-filteredinput_", notBefore)
                 End If
             Else
                 If inclPdf Or attachFfyPdf Then
@@ -616,7 +723,19 @@ Public Sub processAndSendTradeversand_withChild(ByVal parentName As String, ByVa
                 End If
 
                 If inclXlsx Then
-                    jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", allowedPrefixes, vbNullString, vbNullString, notBefore)
+                    jobs.Add makeJob(fso, pathXlsxRes, pathXlsxArch, "xlsx", allowedPrefixes, vbNullString, "-filteredinput_", notBefore)
+                End If
+            End If
+
+            If hasParentFilteredInput Then
+                Call addRegisteredFilteredInputJob(jobs, fso, parentName, pathXlsxRes, pathXlsxArch, notBefore)
+            End If
+
+            If hasChildFilteredInput Then
+                If useChildOwnPaths Then
+                    Call addRegisteredFilteredInputJob(jobs, fso, childName, childPathXlsxRes, childPathXlsxArch, notBefore)
+                Else
+                    Call addRegisteredFilteredInputJob(jobs, fso, childName, pathXlsxRes, pathXlsxArch, notBefore)
                 End If
             End If
 
@@ -908,6 +1027,131 @@ ErrorHandler:
     errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, "sourcePath;extension;clientName;notBefore", sPath, ext, clientName, notBefore
     errorManager.save
     Resume ExitFunction
+End Function
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-15
+' Parameters:    jobs As Collection, fsoObj As Object, clientName As String,
+'                expectedResultsPath As String, expectedArchivePath As String, notBefore As Date
+' Returns:       ---
+' Description:   Adds the exact registered filtered-input file after validating client,
+'                location, type, timestamp and archive destination.
+'-------------------------------------------------------------------------------
+Private Sub addRegisteredFilteredInputJob(ByRef jobs As Collection, _
+                                          ByRef fsoObj As Object, _
+                                          ByVal clientName As String, _
+                                          ByVal expectedResultsPath As String, _
+                                          ByVal expectedArchivePath As String, _
+                                          ByVal notBefore As Date)
+    Const METHOD_NAME As String = "addRegisteredFilteredInputJob"
+    Dim archiveRoot As String
+    Dim errorManager As New ErrorManager
+    Dim errDescription As String
+    Dim errNumber As Long
+    Dim exactFilePath As String
+    Dim expectedFilePrefix As String
+    Dim fileItem As Object
+    Dim fileList As Collection
+    Dim fileNameLc As String
+    Dim key As String
+    Dim parentFolder As String
+    Dim registration As Variant
+
+    On Error GoTo ErrorHandler
+
+    If Not hasRegisteredFilteredInputAttachment(clientName) Then GoTo ExitSub
+    If jobs Is Nothing Then Set jobs = New Collection
+
+    key = LCase$(Trim$(clientName))
+    registration = mobjFilteredInputAttachments.Item(key)
+    exactFilePath = CStr(registration(0))
+    archiveRoot = formatFolderPath(CStr(registration(1)))
+    expectedResultsPath = formatFolderPath(expectedResultsPath)
+    expectedArchivePath = formatFolderPath(expectedArchivePath)
+
+    If Not fsoObj.FileExists(exactFilePath) Then
+        Err.Raise 1092, METHOD_NAME, _
+                  "SAFETY ABORT: registered filtered-input file no longer exists for client '" & clientName & "'."
+    End If
+
+    Set fileItem = fsoObj.GetFile(exactFilePath)
+    If LCase$(fsoObj.GetExtensionName(fileItem.Name)) <> "xlsx" Then
+        Err.Raise 1093, METHOD_NAME, "SAFETY ABORT: filtered-input attachment is not an XLSX file."
+    End If
+
+    parentFolder = formatFolderPath(fsoObj.GetParentFolderName(exactFilePath))
+    If StrComp(parentFolder, expectedResultsPath, vbTextCompare) <> 0 Then
+        Err.Raise 1094, METHOD_NAME, _
+                  "SAFETY ABORT: filtered-input file is outside the current client's results_path_xlsx."
+    End If
+
+    If StrComp(archiveRoot, expectedArchivePath, vbTextCompare) <> 0 Then
+        Err.Raise 1095, METHOD_NAME, _
+                  "SAFETY ABORT: filtered-input archive path does not match the current client's archive_path_xlsx."
+    End If
+
+    fileNameLc = LCase$(fileItem.Name)
+    expectedFilePrefix = LCase$(safeFilteredInputPrefix(clientName) & "-FilteredInput_")
+    If Left$(fileNameLc, Len(expectedFilePrefix)) <> expectedFilePrefix Then
+        Err.Raise 1096, METHOD_NAME, _
+                  "SAFETY ABORT: filtered-input filename does not match client '" & clientName & "'."
+    End If
+
+    If notBefore > 0 Then
+        If CDate(fileItem.DateLastModified) < notBefore Then
+            Err.Raise 1097, METHOD_NAME, _
+                      "SAFETY ABORT: filtered-input file predates the current client run."
+        End If
+    End If
+
+    If CDbl(fileItem.Size) <= 0 Then
+        Err.Raise 1098, METHOD_NAME, "SAFETY ABORT: filtered-input attachment is empty."
+    End If
+
+    Set fileList = New Collection
+    fileList.Add exactFilePath
+    jobs.Add Array(expectedResultsPath, expectedArchivePath, "xlsx", fileList)
+
+ExitSub:
+    Set fileList = Nothing
+    Set fileItem = Nothing
+    If errNumber <> 0 Then
+        On Error GoTo 0
+        VBA.Err.Raise errNumber, CLASS_NAME & "." & METHOD_NAME, errDescription
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errNumber = VBA.Err.Number
+    errDescription = VBA.Err.Description
+    errorManager.addError CLASS_NAME, METHOD_NAME, errNumber, errDescription, _
+                          "clientName;expectedResultsPath;expectedArchivePath;notBefore", _
+                          clientName, expectedResultsPath, expectedArchivePath, notBefore
+    errorManager.save
+    Resume ExitSub
+End Sub
+
+'-------------------------------------------------------------------------------
+' Author:        Pawel Ligezka
+' Creation date: 2026-09-15
+' Parameters:    clientName As String
+' Returns:       String
+' Description:   Produces the same filesystem-safe client prefix used by filtered-input creation.
+'-------------------------------------------------------------------------------
+Private Function safeFilteredInputPrefix(ByVal clientName As String) As String
+    Dim badChars As Variant
+    Dim item As Variant
+    Dim result As String
+
+    result = Trim$(clientName)
+    badChars = Array("\", "/", ":", "*", "?", Chr$(34), "<", ">", "|")
+
+    For Each item In badChars
+        result = Replace$(result, CStr(item), "_")
+    Next item
+
+    safeFilteredInputPrefix = result
 End Function
 
 '-------------------------------------------------------------------------------
