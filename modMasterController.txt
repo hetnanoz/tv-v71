@@ -2,7 +2,7 @@ Option Explicit
 
 Private Const CLASS_NAME As String = "modMasterController"
 Private Const LAST_TRANSACTION_COLUMN As Long = 110
-Private Const ARCHIVE_INPUT_FILES_AFTER_LOAD As Boolean = False ' Set to True after testing.
+Private Const ARCHIVE_INPUT_FILES_AFTER_LOAD As Boolean = True ' Set to True after testing.
 Private Const POWER_PDF_CLIENT_WAIT_TIMEOUT_SECONDS As Long = 900
 Private Const EMAIL_FILE_TIMESTAMP_TOLERANCE_SECONDS As Long = 5
 
