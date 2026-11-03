@@ -207,7 +207,7 @@ Private Function buildHarmonizedHeader() As String
     headers(7) = "ISIN"
     headers(8) = "Wertpapierbezeichnung"
     headers(9) = "Nominale/Stuecke"
-    headers(10) = "Quantity Type"
+    headers(10) = "Nominal / Stück"
     headers(11) = "Kurs"
     headers(12) = "Stueckzinsen"
     headers(13) = "Transaktionsnr."
@@ -427,7 +427,7 @@ Private Function readHarmonizedDate(ByRef targetCell As Excel.Range) As String
     ElseIf Len(CStr(value)) = 0 Then
         readHarmonizedDate = vbNullString
     ElseIf IsDate(value) Then
-        readHarmonizedDate = Format$(CDate(value), "dd-mm-yy")
+        readHarmonizedDate = Format$(CDate(value), "dd.mm.yy")
     Else
         readHarmonizedDate = CStr(value)
     End If
