@@ -932,7 +932,7 @@ ErrorHandler:
         lngBucketIndex, _
         lngRowCount, _
         lngSkippedRows, _
-        strFilePath
+        strFullPath
     errorManager.save
     Resume ExitSub
 End Sub
